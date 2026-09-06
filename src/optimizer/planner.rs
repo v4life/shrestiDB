@@ -32,6 +32,12 @@ pub enum LogicalPlanNode {
         rows: usize,
     },
     Join {
+        right_table: String,
+        /// The `ON` condition, flattened to a string (see `sql::parser`'s
+        /// `JoinClause`). `None` means an unconditional join (`CROSS JOIN`,
+        /// or a `USING`/`NATURAL` join — those aren't specially resolved,
+        /// so they degrade to the same thing as `CROSS JOIN`).
+        condition: Option<String>,
         left_rows: usize,
         right_rows: usize,
         join_type: String,
@@ -110,7 +116,7 @@ impl QueryPlanner {
             rows,
         }];
 
-        for _joined_table in &select.join_tables {
+        for join in &select.joins {
             let (left_rows, right_rows) = (rows, Self::ASSUMED_TABLE_ROWS);
             rows = self.join_orderer.estimate_join_cardinality(
                 left_rows,
@@ -118,6 +124,8 @@ impl QueryPlanner {
                 Self::DEFAULT_JOIN_SELECTIVITY,
             );
             nodes.push(LogicalPlanNode::Join {
+                right_table: join.table.clone(),
+                condition: join.condition.clone(),
                 left_rows,
                 right_rows,
                 join_type: "inner".to_string(),

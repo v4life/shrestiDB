@@ -27,16 +27,25 @@ pub enum SQLStatement {
     CreateTable(CreateTableStatement),
 }
 
+/// One `JOIN` clause: the joined table and its `ON` condition, rendered as
+/// a flattened string like `where_clause` (e.g. `"users.id = orders.user_id"`)
+/// — there's no expression tree kept around, just like everywhere else in
+/// this AST. `USING`/`NATURAL` joins aren't specially handled: their
+/// condition comes through as `None`, same as an explicit `CROSS JOIN`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinClause {
+    pub table: String,
+    pub condition: Option<String>,
+}
+
 /// SELECT statement
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectStatement {
     /// Column expressions as written, or `["*"]` for `SELECT *`.
     pub columns: Vec<String>,
     pub from: String,
-    /// Names of any tables joined to `from` (in `JOIN` order). Join
-    /// conditions/types aren't captured yet — there's no operator that
-    /// consumes them downstream.
-    pub join_tables: Vec<String>,
+    /// Any tables joined to `from`, in `JOIN` order.
+    pub joins: Vec<JoinClause>,
     pub where_clause: Option<String>,
     pub order_by: Option<String>,
     pub limit: Option<usize>,
@@ -140,10 +149,18 @@ impl SQLParser {
             .first()
             .map(|t| Self::table_factor_name(&t.relation))
             .unwrap_or_default();
-        let join_tables = select
+        let joins = select
             .from
             .first()
-            .map(|t| t.joins.iter().map(|j| Self::table_factor_name(&j.relation)).collect())
+            .map(|t| {
+                t.joins
+                    .iter()
+                    .map(|j| JoinClause {
+                        table: Self::table_factor_name(&j.relation),
+                        condition: Self::join_condition(&j.join_operator),
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
         let where_clause = select.selection.as_ref().map(|e| e.to_string());
@@ -153,11 +170,27 @@ impl SQLParser {
         Ok(SQLStatement::Select(SelectStatement {
             columns,
             from,
-            join_tables,
+            joins,
             where_clause,
             order_by,
             limit,
         }))
+    }
+
+    /// Extract the `ON <expr>` condition from a join operator, regardless
+    /// of join type (`INNER`/`LEFT`/`RIGHT`/...). `None` for `USING`,
+    /// `NATURAL`, or no constraint (`CROSS JOIN`).
+    fn join_condition(op: &ast::JoinOperator) -> Option<String> {
+        use ast::JoinOperator::*;
+        let constraint = match op {
+            Join(c) | Inner(c) | Left(c) | LeftOuter(c) | Right(c) | RightOuter(c) | FullOuter(c)
+            | CrossJoin(c) | Semi(c) | LeftSemi(c) => Some(c),
+            _ => None,
+        }?;
+        match constraint {
+            ast::JoinConstraint::On(expr) => Some(expr.to_string()),
+            _ => None,
+        }
     }
 
     fn table_factor_name(factor: &ast::TableFactor) -> String {
