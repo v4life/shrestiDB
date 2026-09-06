@@ -1,16 +1,18 @@
 //! Query execution engine
 //!
 //! `execute_sql` is the real end-to-end entry point: parse -> bind -> (for
-//! SELECT) plan -> execute against the OLTP engine, or (for INSERT) write
-//! rows directly. `execute(&PhysicalPlan)` compiles a `Scan`/`Filter` plan
-//! into operators that actually read through `OLTPEngine`'s MVCC snapshot —
-//! previously this was `Ok(Vec::new())` regardless of the plan.
+//! SELECT) plan -> execute against the OLTP engine, or (for INSERT/UPDATE/
+//! DELETE) write rows directly. `execute(&PhysicalPlan)` compiles a
+//! `Scan`/`Filter` plan into operators that actually read through
+//! `OLTPEngine`'s MVCC snapshot. DML statements return the number of rows
+//! affected, as `Ok(vec![vec![n.to_string()]])`.
 //!
-//! What's still not wired up: `UPDATE`/`DELETE`/`CREATE TABLE` execution
-//! (they bind correctly but `execute_sql` rejects them), and `JOIN`/
-//! aggregate operators (the planner can emit those plan nodes, but there's
-//! no operator to run them yet, so `execute` errors rather than silently
-//! returning a wrong single-table result).
+//! What's still not wired up: `CREATE TABLE` execution (it binds correctly
+//! but `execute_sql` rejects it — nothing registers the parsed schema in
+//! the catalog or the OLTP store), and `JOIN`/aggregate operators (the
+//! planner can emit those plan nodes, but there's no operator to run them
+//! yet, so `execute` errors rather than silently returning a wrong
+//! single-table result).
 
 use crate::error::{DatabaseError, Result};
 use crate::execution::catalog::{Catalog, TableSchema};
@@ -21,7 +23,7 @@ use crate::execution::row_codec;
 use crate::execution::transaction::TransactionId;
 use crate::optimizer::planner::{LogicalPlanNode, PhysicalPlan, QueryPlanner};
 use crate::sql::binder::Binder;
-use crate::sql::parser::{InsertStatement, SQLParser, SQLStatement};
+use crate::sql::parser::{DeleteStatement, InsertStatement, SQLParser, SQLStatement, UpdateStatement};
 
 /// Query executor: owns the catalog, the OLTP engine, and a query planner,
 /// and ties them together into a real (if still partial) SQL execution
@@ -52,14 +54,20 @@ impl QueryExecutor {
                 self.execute(&plan)
             }
             SQLStatement::Insert(insert) => {
-                self.execute_insert(insert)?;
-                Ok(Vec::new())
+                let affected = self.execute_insert(insert)?;
+                Ok(vec![vec![affected.to_string()]])
             }
-            SQLStatement::Update(_) | SQLStatement::Delete(_) | SQLStatement::CreateTable(_) => {
-                Err(DatabaseError::ExecutionError(
-                    "UPDATE/DELETE/CREATE TABLE execution is not wired up yet".to_string(),
-                ))
+            SQLStatement::Update(update) => {
+                let affected = self.execute_update(update)?;
+                Ok(vec![vec![affected.to_string()]])
             }
+            SQLStatement::Delete(delete) => {
+                let affected = self.execute_delete(delete)?;
+                Ok(vec![vec![affected.to_string()]])
+            }
+            SQLStatement::CreateTable(_) => Err(DatabaseError::ExecutionError(
+                "CREATE TABLE execution is not wired up yet".to_string(),
+            )),
         }
     }
 
@@ -116,11 +124,12 @@ impl QueryExecutor {
     }
 
     /// Execute an INSERT by writing rows directly to the OLTP engine.
+    /// Returns the number of rows inserted.
     ///
     /// The row id is derived from the table's primary-key column: nothing
     /// in this codebase allocates a surrogate row id, so a table without a
     /// primary key can't be inserted into through this path.
-    fn execute_insert(&self, insert: InsertStatement) -> Result<()> {
+    fn execute_insert(&self, insert: InsertStatement) -> Result<usize> {
         let schema = self.catalog.get_table(&insert.table).cloned().ok_or_else(|| {
             DatabaseError::ExecutionError(format!("Unknown table '{}'", insert.table))
         })?;
@@ -167,8 +176,119 @@ impl QueryExecutor {
                 return Err(e);
             }
         }
+        let affected = insert.values.len();
         self.oltp.commit(tx);
-        Ok(())
+        Ok(affected)
+    }
+
+    /// Execute an UPDATE: scans the table within one transaction, applies
+    /// the SET assignments to every row matching WHERE (all rows if there's
+    /// no WHERE), and writes each changed row back under its existing row
+    /// id — unlike INSERT, there's no id to derive here, `scan_table`
+    /// already hands back each row's real id. Returns the number of rows
+    /// updated.
+    fn execute_update(&self, update: UpdateStatement) -> Result<usize> {
+        let schema = self.catalog.get_table(&update.table).cloned().ok_or_else(|| {
+            DatabaseError::ExecutionError(format!("Unknown table '{}'", update.table))
+        })?;
+        let pk_index = schema.columns.iter().position(|c| c.primary_key);
+
+        // Resolve assignment targets up front so a typo, or an attempt to
+        // change the primary key's value, fails before any writes happen.
+        let mut assignments = Vec::with_capacity(update.assignments.len());
+        for (col_name, raw_value) in &update.assignments {
+            let idx = schema
+                .columns
+                .iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| DatabaseError::ExecutionError(format!("Unknown column '{col_name}'")))?;
+            if Some(idx) == pk_index {
+                return Err(DatabaseError::ExecutionError(
+                    "Updating the primary key column is not supported".to_string(),
+                ));
+            }
+            assignments.push((idx, row_codec::parse_value(raw_value, schema.columns[idx].data_type)));
+        }
+
+        let table_id = schema.table_id as u64;
+        self.oltp.create_table(table_id);
+
+        let tx = self.oltp.begin();
+        let rows = self.oltp.scan_table(tx, table_id);
+
+        let mut affected = 0usize;
+        for (row_id, bytes) in rows {
+            let Ok(mut tuple) = bincode::deserialize::<Tuple>(&bytes) else {
+                continue; // unreadable row: skip rather than fail the whole statement
+            };
+
+            let matches = match &update.where_clause {
+                Some(predicate) => row_codec::evaluate_predicate(predicate, &schema, &tuple).unwrap_or(true),
+                None => true,
+            };
+            if !matches {
+                continue;
+            }
+
+            for (idx, value) in &assignments {
+                tuple.values[*idx] = value.clone();
+            }
+
+            let data = match bincode::serialize(&tuple) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.oltp.abort(tx);
+                    return Err(DatabaseError::SerializationError(e.to_string()));
+                }
+            };
+
+            if let Err(e) = self.oltp.write(tx, WriteOp::Update { table_id, row_id, data }) {
+                self.oltp.abort(tx);
+                return Err(e);
+            }
+            affected += 1;
+        }
+
+        self.oltp.commit(tx);
+        Ok(affected)
+    }
+
+    /// Execute a DELETE: scans the table within one transaction and deletes
+    /// every row matching WHERE (all rows if there's no WHERE). Returns the
+    /// number of rows deleted.
+    fn execute_delete(&self, delete: DeleteStatement) -> Result<usize> {
+        let schema = self.catalog.get_table(&delete.table).cloned().ok_or_else(|| {
+            DatabaseError::ExecutionError(format!("Unknown table '{}'", delete.table))
+        })?;
+        let table_id = schema.table_id as u64;
+        self.oltp.create_table(table_id);
+
+        let tx = self.oltp.begin();
+        let rows = self.oltp.scan_table(tx, table_id);
+
+        let mut affected = 0usize;
+        for (row_id, bytes) in rows {
+            let Ok(tuple) = bincode::deserialize::<Tuple>(&bytes) else {
+                continue;
+            };
+
+            let matches = match &delete.where_clause {
+                Some(predicate) => row_codec::evaluate_predicate(predicate, &schema, &tuple).unwrap_or(true),
+                None => true,
+            };
+            if !matches {
+                continue;
+            }
+
+            if let Err(e) = self.oltp.write(tx, WriteOp::Delete { table_id, row_id }) {
+                self.oltp.abort(tx);
+                return Err(e);
+            }
+            affected += 1;
+        }
+
+        self.oltp.commit(tx);
+        Ok(affected)
     }
 
     /// Map one INSERT value row (raw strings, in either explicit-column or
@@ -352,5 +472,83 @@ mod tests {
         let executor = QueryExecutor::new(users_catalog());
         let rows = executor.execute_sql("SELECT * FROM users").unwrap();
         assert!(rows.is_empty());
+    }
+
+    fn seed_users(executor: &QueryExecutor) {
+        executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 15)")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_update_with_where_changes_matching_rows_only() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let result = executor
+            .execute_sql("UPDATE users SET age = 31 WHERE name = 'Alice'")
+            .unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]); // 1 row affected
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"31".to_string()));
+        let bob = rows.iter().find(|r| r.contains(&"Bob".to_string())).unwrap();
+        assert!(bob.contains(&"15".to_string())); // untouched
+    }
+
+    #[test]
+    fn test_update_without_where_changes_all_rows() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let result = executor.execute_sql("UPDATE users SET age = 0").unwrap();
+        assert_eq!(result, vec![vec!["2".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert!(rows.iter().all(|r| r.contains(&"0".to_string())));
+    }
+
+    #[test]
+    fn test_update_primary_key_column_is_rejected() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        assert!(executor.execute_sql("UPDATE users SET id = 99 WHERE id = 1").is_err());
+    }
+
+    #[test]
+    fn test_delete_with_where_removes_matching_rows_only() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let result = executor
+            .execute_sql("DELETE FROM users WHERE age < 18")
+            .unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+    }
+
+    #[test]
+    fn test_delete_without_where_removes_all_rows() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let result = executor.execute_sql("DELETE FROM users").unwrap();
+        assert_eq!(result, vec![vec!["2".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_update_unknown_table_errors() {
+        let executor = QueryExecutor::new(users_catalog());
+        assert!(executor.execute_sql("UPDATE ghosts SET x = 1").is_err());
     }
 }
