@@ -9,12 +9,15 @@
 //!
 //! `CREATE TABLE` registers the parsed schema into both the catalog and the
 //! OLTP store, so a table created this way can immediately be inserted
-//! into. What's still not wired up: `JOIN`/aggregate operators (the
-//! planner can emit those plan nodes, but there's no operator to run them
-//! yet, so `execute` errors rather than silently returning a wrong
-//! single-table result).
+//! into. `Aggregate` nodes (COUNT/SUM/AVG/MIN/MAX with no GROUP BY) execute
+//! for real too. What's still not wired up: `JOIN` — the planner emits a
+//! `Join` node for a `JOIN` query, but there's no join *condition* captured
+//! anywhere upstream (see `sql::parser`), so there's nothing honest for an
+//! operator to join on yet; `execute` errors rather than silently returning
+//! an uncontrolled cross product.
 
 use crate::error::{DatabaseError, Result};
+use crate::execution::aggregate;
 use crate::execution::catalog::{Catalog, Column, DataType, TableSchema};
 use crate::execution::mvcc_store::WriteOp;
 use crate::execution::oltp::OLTPEngine;
@@ -84,11 +87,10 @@ impl QueryExecutor {
         }
     }
 
-    /// Execute a query plan: compiles `Scan`/`Filter` nodes into operators
-    /// reading through the OLTP engine's MVCC snapshot. `Join`/`Aggregate`
-    /// nodes error rather than being silently skipped, since dropping them
-    /// would return a wrong (single-table, unaggregated) result without
-    /// saying so.
+    /// Execute a query plan: compiles `Scan`/`Filter`/`Aggregate` nodes into
+    /// operators reading through the OLTP engine's MVCC snapshot. A `Join`
+    /// node errors rather than being silently skipped, since dropping it
+    /// would return a wrong (single-table) result without saying so.
     pub fn execute(&self, plan: &PhysicalPlan) -> Result<Vec<Vec<String>>> {
         let mut current: Option<(TableSchema, Vec<Tuple>)> = None;
 
@@ -121,10 +123,19 @@ impl QueryExecutor {
                         "JOIN execution is not implemented yet".to_string(),
                     ));
                 }
-                LogicalPlanNode::Aggregate { .. } => {
-                    return Err(DatabaseError::ExecutionError(
-                        "Aggregate execution is not implemented yet".to_string(),
-                    ));
+                LogicalPlanNode::Aggregate { columns, .. } => {
+                    let (schema, tuples) = current
+                        .take()
+                        .ok_or_else(|| DatabaseError::ExecutionError("Aggregate with no input".to_string()))?;
+
+                    let mut output = Vec::with_capacity(columns.len());
+                    for col in columns {
+                        let (func, arg) = aggregate::parse_aggregate(col).ok_or_else(|| {
+                            DatabaseError::ExecutionError(format!("Not a recognized aggregate: '{col}'"))
+                        })?;
+                        output.push(aggregate::compute_aggregate(func, arg.as_deref(), &schema, &tuples));
+                    }
+                    current = Some((schema, vec![Tuple { values: output }]));
                 }
             }
         }
@@ -662,6 +673,60 @@ mod tests {
         let executor = QueryExecutor::new(users_catalog());
         assert!(executor
             .execute_sql("CREATE TABLE users (id INT PRIMARY KEY)")
+            .is_err());
+    }
+
+    #[test]
+    fn test_select_count_star() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let rows = executor.execute_sql("SELECT COUNT(*) FROM users").unwrap();
+        assert_eq!(rows, vec![vec!["2".to_string()]]);
+    }
+
+    #[test]
+    fn test_select_aggregate_respects_where_clause() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let rows = executor
+            .execute_sql("SELECT COUNT(*) FROM users WHERE age > 18")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_select_multiple_aggregates() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // ages 30, 15
+
+        let rows = executor
+            .execute_sql("SELECT COUNT(*), SUM(age), AVG(age), MIN(age), MAX(age) FROM users")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "2"); // count
+        assert_eq!(rows[0][1], "45"); // sum
+        assert_eq!(rows[0][3], "15"); // min
+        assert_eq!(rows[0][4], "30"); // max
+    }
+
+    #[test]
+    fn test_select_aggregate_on_empty_table() {
+        let executor = QueryExecutor::new(users_catalog());
+        let rows = executor.execute_sql("SELECT COUNT(*) FROM users").unwrap();
+        assert_eq!(rows, vec![vec!["0".to_string()]]);
+    }
+
+    #[test]
+    fn test_join_query_errors_rather_than_silently_wrong() {
+        let mut catalog = users_catalog();
+        let orders_schema = TableSchema::new(2, "orders".to_string());
+        catalog.register_table(orders_schema);
+        let executor = QueryExecutor::new(catalog);
+
+        assert!(executor
+            .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
             .is_err());
     }
 }
