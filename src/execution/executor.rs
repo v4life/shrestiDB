@@ -7,15 +7,15 @@
 //! `OLTPEngine`'s MVCC snapshot. DML statements return the number of rows
 //! affected, as `Ok(vec![vec![n.to_string()]])`.
 //!
-//! What's still not wired up: `CREATE TABLE` execution (it binds correctly
-//! but `execute_sql` rejects it — nothing registers the parsed schema in
-//! the catalog or the OLTP store), and `JOIN`/aggregate operators (the
+//! `CREATE TABLE` registers the parsed schema into both the catalog and the
+//! OLTP store, so a table created this way can immediately be inserted
+//! into. What's still not wired up: `JOIN`/aggregate operators (the
 //! planner can emit those plan nodes, but there's no operator to run them
 //! yet, so `execute` errors rather than silently returning a wrong
 //! single-table result).
 
 use crate::error::{DatabaseError, Result};
-use crate::execution::catalog::{Catalog, TableSchema};
+use crate::execution::catalog::{Catalog, Column, DataType, TableSchema};
 use crate::execution::mvcc_store::WriteOp;
 use crate::execution::oltp::OLTPEngine;
 use crate::execution::operators::{Tuple, Value};
@@ -23,13 +23,22 @@ use crate::execution::row_codec;
 use crate::execution::transaction::TransactionId;
 use crate::optimizer::planner::{LogicalPlanNode, PhysicalPlan, QueryPlanner};
 use crate::sql::binder::Binder;
-use crate::sql::parser::{DeleteStatement, InsertStatement, SQLParser, SQLStatement, UpdateStatement};
+use crate::sql::parser::{
+    CreateTableStatement, DeleteStatement, InsertStatement, SQLParser, SQLStatement, UpdateStatement,
+};
+use parking_lot::RwLock;
 
 /// Query executor: owns the catalog, the OLTP engine, and a query planner,
 /// and ties them together into a real (if still partial) SQL execution
 /// path.
+///
+/// `catalog` is behind a lock (unlike a plain field) so `CREATE TABLE` can
+/// register a new schema through `&self`, matching how everything else
+/// here (`OLTPEngine`, `LockManager`, `MVCCStore`) uses interior mutability
+/// rather than requiring `&mut self` — that keeps `QueryExecutor` usable
+/// the same way those are: shared behind an `Arc` across threads.
 pub struct QueryExecutor {
-    pub catalog: Catalog,
+    pub catalog: RwLock<Catalog>,
     pub oltp: OLTPEngine,
     pub planner: QueryPlanner,
 }
@@ -37,7 +46,7 @@ pub struct QueryExecutor {
 impl QueryExecutor {
     pub fn new(catalog: Catalog) -> Self {
         QueryExecutor {
-            catalog,
+            catalog: RwLock::new(catalog),
             oltp: OLTPEngine::new(),
             planner: QueryPlanner::new(),
         }
@@ -46,7 +55,10 @@ impl QueryExecutor {
     /// Parse, bind, and run a SQL statement end to end.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Vec<String>>> {
         let stmt = SQLParser::parse(sql)?;
-        Binder::new(&self.catalog).bind(&stmt)?;
+        {
+            let catalog = self.catalog.read();
+            Binder::new(&catalog).bind(&stmt)?;
+        }
 
         match stmt {
             SQLStatement::Select(_) => {
@@ -65,9 +77,10 @@ impl QueryExecutor {
                 let affected = self.execute_delete(delete)?;
                 Ok(vec![vec![affected.to_string()]])
             }
-            SQLStatement::CreateTable(_) => Err(DatabaseError::ExecutionError(
-                "CREATE TABLE execution is not wired up yet".to_string(),
-            )),
+            SQLStatement::CreateTable(create) => {
+                self.execute_create_table(create)?;
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -82,7 +95,7 @@ impl QueryExecutor {
         for node in &plan.nodes {
             match node {
                 LogicalPlanNode::Scan { table_name, .. } => {
-                    let schema = self.catalog.get_table(table_name).cloned().ok_or_else(|| {
+                    let schema = self.catalog.read().get_table(table_name).cloned().ok_or_else(|| {
                         DatabaseError::ExecutionError(format!("Unknown table '{table_name}'"))
                     })?;
                     let table_id = schema.table_id as u64;
@@ -130,7 +143,7 @@ impl QueryExecutor {
     /// in this codebase allocates a surrogate row id, so a table without a
     /// primary key can't be inserted into through this path.
     fn execute_insert(&self, insert: InsertStatement) -> Result<usize> {
-        let schema = self.catalog.get_table(&insert.table).cloned().ok_or_else(|| {
+        let schema = self.catalog.read().get_table(&insert.table).cloned().ok_or_else(|| {
             DatabaseError::ExecutionError(format!("Unknown table '{}'", insert.table))
         })?;
         let pk_index = schema.columns.iter().position(|c| c.primary_key).ok_or_else(|| {
@@ -188,7 +201,7 @@ impl QueryExecutor {
     /// already hands back each row's real id. Returns the number of rows
     /// updated.
     fn execute_update(&self, update: UpdateStatement) -> Result<usize> {
-        let schema = self.catalog.get_table(&update.table).cloned().ok_or_else(|| {
+        let schema = self.catalog.read().get_table(&update.table).cloned().ok_or_else(|| {
             DatabaseError::ExecutionError(format!("Unknown table '{}'", update.table))
         })?;
         let pk_index = schema.columns.iter().position(|c| c.primary_key);
@@ -257,7 +270,7 @@ impl QueryExecutor {
     /// every row matching WHERE (all rows if there's no WHERE). Returns the
     /// number of rows deleted.
     fn execute_delete(&self, delete: DeleteStatement) -> Result<usize> {
-        let schema = self.catalog.get_table(&delete.table).cloned().ok_or_else(|| {
+        let schema = self.catalog.read().get_table(&delete.table).cloned().ok_or_else(|| {
             DatabaseError::ExecutionError(format!("Unknown table '{}'", delete.table))
         })?;
         let table_id = schema.table_id as u64;
@@ -289,6 +302,60 @@ impl QueryExecutor {
 
         self.oltp.commit(tx);
         Ok(affected)
+    }
+
+    /// Execute a CREATE TABLE: registers the parsed schema in the catalog
+    /// and creates the matching (empty) table in the OLTP store, so an
+    /// INSERT against it works immediately without a separate step.
+    fn execute_create_table(&self, create: CreateTableStatement) -> Result<()> {
+        let mut catalog = self.catalog.write();
+        if catalog.get_table(&create.name).is_some() {
+            return Err(DatabaseError::ExecutionError(format!(
+                "Table '{}' already exists",
+                create.name
+            )));
+        }
+
+        let table_id = catalog.tables.keys().copied().max().unwrap_or(0) + 1;
+        let mut schema = TableSchema::new(table_id, create.name.clone());
+        for (i, col) in create.columns.iter().enumerate() {
+            schema.add_column(Column {
+                id: (i + 1) as u32,
+                name: col.name.clone(),
+                data_type: Self::map_ddl_type(&col.data_type),
+                nullable: col.nullable,
+                primary_key: col.primary_key,
+            });
+        }
+        catalog.register_table(schema);
+        drop(catalog);
+
+        self.oltp.create_table(table_id as u64);
+        Ok(())
+    }
+
+    /// Map a rendered DDL type string (e.g. `"VARCHAR(50)"`, `"BIGINT"`) onto
+    /// the catalog's coarser `DataType`. A heuristic substring match, since
+    /// `DataType` doesn't track length/precision at all — good enough given
+    /// the executor only branches on which of the 5 variants a column is.
+    fn map_ddl_type(raw: &str) -> DataType {
+        let upper = raw.to_uppercase();
+        if upper.contains("BOOL") {
+            DataType::Boolean
+        } else if upper.contains("TIMESTAMP") || upper.contains("DATE") {
+            DataType::Timestamp
+        } else if upper.contains("INT") {
+            DataType::Integer
+        } else if upper.contains("FLOAT")
+            || upper.contains("DOUBLE")
+            || upper.contains("DECIMAL")
+            || upper.contains("NUMERIC")
+            || upper.contains("REAL")
+        {
+            DataType::Float
+        } else {
+            DataType::String
+        }
     }
 
     /// Map one INSERT value row (raw strings, in either explicit-column or
@@ -356,7 +423,7 @@ mod tests {
     fn test_executor_creation() {
         let catalog = Catalog::new();
         let executor = QueryExecutor::new(catalog);
-        assert_eq!(executor.catalog.tables.len(), 0);
+        assert_eq!(executor.catalog.read().tables.len(), 0);
     }
 
     #[test]
@@ -550,5 +617,51 @@ mod tests {
     fn test_update_unknown_table_errors() {
         let executor = QueryExecutor::new(users_catalog());
         assert!(executor.execute_sql("UPDATE ghosts SET x = 1").is_err());
+    }
+
+    #[test]
+    fn test_create_table_then_insert_and_select_end_to_end() {
+        let executor = QueryExecutor::new(Catalog::new());
+
+        executor
+            .execute_sql("CREATE TABLE items (id INT PRIMARY KEY, label VARCHAR(50), price FLOAT)")
+            .unwrap();
+
+        assert!(executor.catalog.read().get_table("items").is_some());
+
+        executor
+            .execute_sql("INSERT INTO items (id, label, price) VALUES (1, 'Widget', 9.99)")
+            .unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM items").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Widget".to_string()));
+    }
+
+    #[test]
+    fn test_create_table_maps_column_types() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor
+            .execute_sql(
+                "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN, created TIMESTAMP, note TEXT)",
+            )
+            .unwrap();
+
+        let catalog = executor.catalog.read();
+        let schema = catalog.get_table("things").unwrap();
+        assert_eq!(schema.get_column("id").unwrap().data_type, DataType::Integer);
+        assert_eq!(schema.get_column("active").unwrap().data_type, DataType::Boolean);
+        assert_eq!(schema.get_column("created").unwrap().data_type, DataType::Timestamp);
+        assert_eq!(schema.get_column("note").unwrap().data_type, DataType::String);
+        assert!(schema.get_column("id").unwrap().primary_key);
+        assert!(!schema.get_column("active").unwrap().primary_key);
+    }
+
+    #[test]
+    fn test_create_table_duplicate_name_errors() {
+        let executor = QueryExecutor::new(users_catalog());
+        assert!(executor
+            .execute_sql("CREATE TABLE users (id INT PRIMARY KEY)")
+            .is_err());
     }
 }
