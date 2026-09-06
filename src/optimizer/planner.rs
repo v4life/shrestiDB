@@ -12,6 +12,7 @@
 //! so there's no honest way to build one without fabricating fake
 //! structured input.
 
+use crate::execution::aggregate;
 use crate::optimizer::cardinality::LearnedCardinalityEstimator;
 use crate::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
 use crate::optimizer::join_reorder::JoinOrderer;
@@ -36,6 +37,10 @@ pub enum LogicalPlanNode {
         join_type: String,
     },
     Aggregate {
+        /// The projected columns, each a recognized aggregate call (see
+        /// `execution::aggregate::parse_aggregate`) — re-parsed at
+        /// execution time rather than duplicating a typed spec here.
+        columns: Vec<String>,
         rows: usize,
     },
 }
@@ -124,6 +129,21 @@ impl QueryPlanner {
             nodes.push(LogicalPlanNode::Filter { predicate, rows });
         }
 
+        // Only treat this as an aggregate query when every projected column
+        // is a recognized aggregate call — a mix of aggregate and plain
+        // columns needs GROUP BY, which isn't supported, so it's left as a
+        // plain (if not fully correct) row-returning plan instead of
+        // pretending to aggregate.
+        if !select.columns.is_empty()
+            && select.columns.iter().all(|c| aggregate::parse_aggregate(c).is_some())
+        {
+            rows = 1; // no GROUP BY: aggregation always collapses to one row
+            nodes.push(LogicalPlanNode::Aggregate {
+                columns: select.columns.clone(),
+                rows,
+            });
+        }
+
         let estimated_cost = self.cost_model.estimate_total_cost(&Self::to_operator_costs(&nodes));
 
         PhysicalPlan {
@@ -149,7 +169,7 @@ impl QueryPlanner {
                         right_rows,
                         ..
                     } => (OperatorType::HashJoin, (*left_rows).max(*right_rows)),
-                    LogicalPlanNode::Aggregate { rows } => (OperatorType::Aggregate, *rows),
+                    LogicalPlanNode::Aggregate { rows, .. } => (OperatorType::Aggregate, *rows),
                 };
                 let cost = OperatorCost::new(
                     op_type,
@@ -218,6 +238,29 @@ mod tests {
         let planner = QueryPlanner::new();
         let plan = planner.plan("DELETE FROM users WHERE id = 1");
         assert_eq!(plan.estimated_rows, 0);
+    }
+
+    #[test]
+    fn test_plan_emits_aggregate_node_when_all_columns_are_aggregates() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT COUNT(*), AVG(age) FROM users");
+        assert!(plan
+            .nodes
+            .iter()
+            .any(|n| matches!(n, LogicalPlanNode::Aggregate { .. })));
+        assert_eq!(plan.estimated_rows, 1);
+    }
+
+    #[test]
+    fn test_plan_does_not_emit_aggregate_for_mixed_columns() {
+        let planner = QueryPlanner::new();
+        // "name" alongside COUNT(*) needs GROUP BY, which isn't supported;
+        // this must not be misdetected as a pure aggregate query.
+        let plan = planner.plan("SELECT name, COUNT(*) FROM users");
+        assert!(!plan
+            .nodes
+            .iter()
+            .any(|n| matches!(n, LogicalPlanNode::Aggregate { .. })));
     }
 
     #[test]
