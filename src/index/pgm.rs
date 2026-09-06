@@ -57,69 +57,81 @@ impl PGMIndex {
         }
     }
 
-    /// Build PGM index from sorted keys
+    /// Build PGM index from sorted keys in O(n) time.
+    ///
+    /// Streams through the keys once, keeping a fixed anchor at the start of the
+    /// current segment and maintaining the interval of slopes still consistent
+    /// with every point seen so far (each new point only tightens the interval,
+    /// since the anchor never moves). When the interval goes empty, the segment
+    /// is closed with the midpoint slope and a new segment starts at that key.
+    /// This avoids refitting OLS over the growing segment on every candidate
+    /// extension, which is what made the previous version quadratic.
     pub fn build(keys: Vec<f64>, error_bound: usize) -> Self {
-        let mut segments = Vec::new();
+        let n = keys.len();
 
-        if keys.is_empty() {
+        if n == 0 {
             return PGMIndex {
-                segments,
+                segments: Vec::new(),
                 keys,
                 error_bound,
             };
         }
 
-        let mut i = 0;
+        let eps = error_bound as f64;
+        let mut segments = Vec::new();
+        let mut seg_start = 0usize;
+        let mut min_slope = f64::NEG_INFINITY;
+        let mut max_slope = f64::INFINITY;
 
-        while i < keys.len() {
-            let start_pos = i;
-            let start_key = keys[i];
-            let mut j = (i + 1).min(keys.len());
+        let close_segment = |seg_start: usize,
+                              seg_end: usize,
+                              min_slope: f64,
+                              max_slope: f64,
+                              keys: &[f64]| {
+            let slope = if min_slope.is_finite() && max_slope.is_finite() {
+                (min_slope + max_slope) / 2.0
+            } else {
+                0.0
+            };
+            let origin_x = keys[seg_start];
+            let origin_y = seg_start as f64;
+            let model = LinearModel::new(slope, origin_y - slope * origin_x);
+            PGMSegment::new(model, keys[seg_start], keys[seg_end], seg_start, seg_end)
+        };
 
-            // Find segment end with bounded error
-            while j < keys.len() {
-                let segment_keys = &keys[i..=j];
-                let segment_positions: Vec<f64> = (0..=j - i).map(|x| x as f64).collect();
+        for i in 1..n {
+            let dx = keys[i] - keys[seg_start];
+            let dy = (i - seg_start) as f64;
 
-                if let Some(model) = LinearModel::fit(
-                    segment_keys,
-                    &segment_positions
-                        .iter()
-                        .map(|x| *x + start_pos as f64)
-                        .collect::<Vec<_>>(),
-                ) {
-                    // Check error
-                    let mut max_error = 0usize;
-                    for (k, pos) in segment_keys.iter().zip(&segment_positions) {
-                        let predicted = model.predict(*k) as usize;
-                        let actual = (*pos as usize) + start_pos;
-                        let error = (predicted as i32 - actual as i32).abs() as usize;
-                        max_error = max_error.max(error);
-                    }
-
-                    if max_error <= error_bound {
-                        j += 1;
-                        continue;
-                    }
+            if dx == 0.0 {
+                // Duplicate key: predicted position is always the anchor's
+                // position regardless of slope, so it only fits if dy <= eps.
+                if dy > eps {
+                    segments.push(close_segment(seg_start, i - 1, min_slope, max_slope, &keys));
+                    seg_start = i;
+                    min_slope = f64::NEG_INFINITY;
+                    max_slope = f64::INFINITY;
                 }
-                break;
+                continue;
             }
 
-            let end_pos = j - 1;
-            let end_key = keys[end_pos];
+            let s_lower = (dy - eps) / dx;
+            let s_upper = (dy + eps) / dx;
+            let new_min = min_slope.max(s_lower);
+            let new_max = max_slope.min(s_upper);
 
-            if let Some(model) = LinearModel::fit(
-                &keys[i..=end_pos],
-                &(0..=end_pos - i)
-                    .map(|x| (x + start_pos) as f64)
-                    .collect::<Vec<_>>(),
-            ) {
-                let segment = PGMSegment::new(model, start_key, end_key, start_pos, end_pos);
-                segments.push(segment);
+            if new_min > new_max {
+                segments.push(close_segment(seg_start, i - 1, min_slope, max_slope, &keys));
+                seg_start = i;
+                min_slope = f64::NEG_INFINITY;
+                max_slope = f64::INFINITY;
+            } else {
+                min_slope = new_min;
+                max_slope = new_max;
             }
-
-            i = end_pos + 1;
         }
+
+        segments.push(close_segment(seg_start, n - 1, min_slope, max_slope, &keys));
 
         PGMIndex {
             segments,

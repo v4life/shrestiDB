@@ -65,6 +65,18 @@ impl VersionChain {
             }
         }
     }
+
+    /// Drop every version that ended at or before `horizon` — the oldest
+    /// snapshot timestamp any currently active transaction could still be
+    /// reading from. No snapshot at or after `horizon` can ever see a
+    /// version whose `end_ts <= horizon` (see `RowVersion::visible_at`), so
+    /// this is safe regardless of why the caller chose to sweep now.
+    /// Returns the number of versions removed.
+    fn prune(&mut self, horizon: u64) -> usize {
+        let before = self.versions.len();
+        self.versions.retain(|v| v.end_ts > horizon);
+        before - self.versions.len()
+    }
 }
 
 // ── Buffered write ops (pending inside a transaction) ─────────────────────────
@@ -133,6 +145,23 @@ impl MVCCTable {
     /// Row count (for diagnostics / TPC-C data load verification).
     pub fn row_count(&self) -> usize {
         self.rows.read().len()
+    }
+
+    /// Number of versions (live + dead) currently held for one row (for
+    /// diagnostics and tests — e.g. verifying pruning actually bounds
+    /// chain growth).
+    pub fn version_count(&self, row_id: RowId) -> usize {
+        self.rows.read().get(&row_id).map(|c| c.versions.len()).unwrap_or(0)
+    }
+
+    /// Sweep dead versions out of one row's chain. See `VersionChain::prune`
+    /// for the safety argument. Returns the number removed.
+    pub(crate) fn prune_row(&self, row_id: RowId, horizon: u64) -> usize {
+        self.rows
+            .write()
+            .get_mut(&row_id)
+            .map(|chain| chain.prune(horizon))
+            .unwrap_or(0)
     }
 }
 

@@ -126,7 +126,7 @@ impl LockManager {
             if remaining.is_zero() {
                 let entry = table.entry(key.clone()).or_default();
                 entry.waiters.retain(|(id, _)| *id != tx_id);
-                return Err(DatabaseError::Other(format!(
+                return Err(DatabaseError::TransactionError(format!(
                     "Deadlock timeout: tx {:?} aborted while waiting for lock on ({}, {})",
                     tx_id, key.table_id, key.row_id
                 )));
@@ -136,7 +136,7 @@ impl LockManager {
             if r.timed_out() {
                 let entry = table.entry(key.clone()).or_default();
                 entry.waiters.retain(|(id, _)| *id != tx_id);
-                return Err(DatabaseError::Other(format!(
+                return Err(DatabaseError::TransactionError(format!(
                     "Deadlock timeout: tx {:?} aborted while waiting for lock on ({}, {})",
                     tx_id, key.table_id, key.row_id
                 )));
