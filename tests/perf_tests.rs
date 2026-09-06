@@ -2,10 +2,10 @@
 
 #[cfg(test)]
 mod perf_tests {
-    use learned_db_kernel::index::pgm::PGMIndex;
-    use learned_db_kernel::ml::regression::LinearRegression;
-    use learned_db_kernel::compute::simd_ops::SIMDSearch;
-    use learned_db_kernel::optimizer::cardinality::LearnedCardinalityEstimator;
+    use shresti::index::pgm::PGMIndex;
+    use shresti::ml::regression::LinearRegression;
+    use shresti::compute::simd_ops::SIMDSearch;
+    use shresti::optimizer::cardinality::LearnedCardinalityEstimator;
 
     #[test]
     fn test_pgm_lookup_latency() {
@@ -39,7 +39,7 @@ mod perf_tests {
 
     #[test]
     fn test_cardinality_estimation_speed() {
-        use learned_db_kernel::optimizer::cardinality::QueryPredicate;
+        use shresti::optimizer::cardinality::QueryPredicate;
         
         let estimator = LearnedCardinalityEstimator::new(10);
         let predicates = vec![

@@ -2,8 +2,8 @@
 
 #[cfg(test)]
 mod sql_tests {
-    use learned_db_kernel::execution::catalog::{Catalog, TableSchema, Column, DataType};
-    use learned_db_kernel::optimizer::planner::QueryPlanner;
+    use shresti::execution::catalog::{Catalog, TableSchema, Column, DataType};
+    use shresti::optimizer::planner::QueryPlanner;
 
     #[test]
     fn test_simple_select_parsing() {

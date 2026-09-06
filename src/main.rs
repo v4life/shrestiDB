@@ -2,7 +2,7 @@
 //!
 //! Entry point for the learned database kernel server.
 
-use learned_db_kernel::VERSION;
+use shresti::VERSION;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 

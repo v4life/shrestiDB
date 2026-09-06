@@ -2,14 +2,14 @@
 
 #[cfg(test)]
 mod tests {
-    use learned_db_kernel::index::pgm::PGMIndex;
-    use learned_db_kernel::index::btree::BTree;
-    use learned_db_kernel::index::rmi::{RMIIndex, RMIStage};
-    use learned_db_kernel::index::models::LinearModel;
-    use learned_db_kernel::optimizer::cardinality::LearnedCardinalityEstimator;
-    use learned_db_kernel::optimizer::cost_model::CostModel;
-    use learned_db_kernel::execution::catalog::Catalog;
-    use learned_db_kernel::execution::transaction::TransactionManager;
+    use shresti::index::pgm::PGMIndex;
+    use shresti::index::btree::BTree;
+    use shresti::index::rmi::{RMIIndex, RMIStage};
+    use shresti::index::models::LinearModel;
+    use shresti::optimizer::cardinality::LearnedCardinalityEstimator;
+    use shresti::optimizer::cost_model::CostModel;
+    use shresti::execution::catalog::Catalog;
+    use shresti::execution::transaction::TransactionManager;
 
     #[test]
     fn test_pgm_index_correctness() {
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn test_cost_model_comparison() {
-        use learned_db_kernel::optimizer::cost_model::{OperatorCost, OperatorType};
+        use shresti::optimizer::cost_model::{OperatorCost, OperatorType};
         
         let cost_model = CostModel::new();
         
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_catalog_schema_management() {
-        use learned_db_kernel::execution::catalog::{TableSchema, Column, DataType};
+        use shresti::execution::catalog::{TableSchema, Column, DataType};
         
         let mut catalog = Catalog::new();
         let mut schema = TableSchema::new(1, "test_table".to_string());

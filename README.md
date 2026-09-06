@@ -1,6 +1,6 @@
-# Learned Database Kernel
+# Shresti
 
-A production-grade relational database management system written in Rust that leverages machine learning models throughout its architecture to achieve superior performance over traditional databases.
+A relational database kernel written in Rust that leverages machine learning models throughout its architecture — indexing, query planning, and storage retention — instead of just at one layer.
 
 ## 🚀 Key Features
 
@@ -323,7 +323,7 @@ This project demonstrates several novel contributions:
 ## 📊 Benchmark Results
 
 ### TPC-H Simulation (1M records)
-| Query | Learned DB | Traditional DB | Speedup |
+| Query | Shresti | Traditional DB | Speedup |
 |-------|-----------|----------------|---------|
 | Range Scan | 1.2ms | 12ms | 10x |
 | Aggregation | 45ms | 90ms | 2x |

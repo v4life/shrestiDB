@@ -2,8 +2,8 @@
 //!
 //! Shows the power of learned indexes vs traditional approaches.
 
-use learned_db_kernel::index::pgm::PGMIndex;
-use learned_db_kernel::index::btree::BTree;
+use shresti::index::pgm::PGMIndex;
+use shresti::index::btree::BTree;
 use std::time::Instant;
 
 fn main() {

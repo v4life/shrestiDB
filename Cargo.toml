@@ -1,12 +1,12 @@
 [package]
-name = "learned-db-kernel"
+name = "shresti"
 version = "0.1.0"
 edition = "2021"
 authors = ["v4life"]
 description = "Full Database Kernel leveraging Learned Indexes and Machine Learning Engine Components."
 
 [lib]
-name = "learned_db_kernel"
+name = "shresti"
 path = "src/lib.rs"
 
 [[bin]]

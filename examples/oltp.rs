@@ -2,8 +2,8 @@
 //!
 //! Simulates online transaction processing workload.
 
-use learned_db_kernel::execution::transaction::TransactionManager;
-use learned_db_kernel::execution::catalog::{Catalog, TableSchema, Column, DataType};
+use shresti::execution::transaction::TransactionManager;
+use shresti::execution::catalog::{Catalog, TableSchema, Column, DataType};
 use std::time::Instant;
 
 fn main() {
