@@ -65,11 +65,23 @@ pub struct DeleteStatement {
     pub where_clause: Option<String>,
 }
 
+/// One column definition in a CREATE TABLE statement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnDef {
+    pub name: String,
+    /// The declared type, rendered as written (e.g. `"INT"`, `"VARCHAR(50)"`)
+    /// — not parsed further here; see `execution::executor` for how this
+    /// gets mapped onto the catalog's coarser `DataType`.
+    pub data_type: String,
+    pub nullable: bool,
+    pub primary_key: bool,
+}
+
 /// CREATE TABLE statement
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTableStatement {
     pub name: String,
-    pub columns: Vec<(String, String)>, // (name, type)
+    pub columns: Vec<ColumnDef>,
 }
 
 /// SQL Parser
@@ -235,7 +247,27 @@ impl SQLParser {
         let columns = create
             .columns
             .into_iter()
-            .map(|c| (c.name.to_string(), c.data_type.to_string()))
+            .map(|c| {
+                let mut nullable = true;
+                let mut primary_key = false;
+                for opt in &c.options {
+                    match &opt.option {
+                        ast::ColumnOption::NotNull => nullable = false,
+                        ast::ColumnOption::Null => nullable = true,
+                        ast::ColumnOption::PrimaryKey(_) => {
+                            primary_key = true;
+                            nullable = false; // a primary key is implicitly NOT NULL
+                        }
+                        _ => {}
+                    }
+                }
+                ColumnDef {
+                    name: c.name.to_string(),
+                    data_type: c.data_type.to_string(),
+                    nullable,
+                    primary_key,
+                }
+            })
             .collect();
 
         Ok(SQLStatement::CreateTable(CreateTableStatement { name, columns }))
@@ -334,13 +366,18 @@ mod tests {
 
     #[test]
     fn test_parse_create_table() {
-        let sql = "CREATE TABLE users (id INT, name VARCHAR(50), age INT)";
+        let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50), age INT NOT NULL)";
         let stmt = SQLParser::parse(sql).unwrap();
         match stmt {
             SQLStatement::CreateTable(c) => {
                 assert_eq!(c.name, "users");
                 assert_eq!(c.columns.len(), 3);
-                assert_eq!(c.columns[0].0, "id");
+                assert_eq!(c.columns[0].name, "id");
+                assert!(c.columns[0].primary_key);
+                assert!(!c.columns[0].nullable);
+                assert!(!c.columns[1].primary_key);
+                assert!(c.columns[1].nullable);
+                assert!(!c.columns[2].nullable);
             }
             _ => panic!("Expected CREATE TABLE statement"),
         }
