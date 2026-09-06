@@ -10,11 +10,11 @@
 //! `CREATE TABLE` registers the parsed schema into both the catalog and the
 //! OLTP store, so a table created this way can immediately be inserted
 //! into. `Aggregate` nodes (COUNT/SUM/AVG/MIN/MAX with no GROUP BY) execute
-//! for real too. What's still not wired up: `JOIN` — the planner emits a
-//! `Join` node for a `JOIN` query, but there's no join *condition* captured
-//! anywhere upstream (see `sql::parser`), so there's nothing honest for an
-//! operator to join on yet; `execute` errors rather than silently returning
-//! an uncontrolled cross product.
+//! for real, and so does `Join` — a nested-loop join whose `ON` condition
+//! must compare two real columns (see `merge_schemas`); anything it can't
+//! recognize that way errors rather than silently returning an unfiltered
+//! cross product. There is no `GROUP BY`, and a `JOIN` condition using a
+//! table alias (rather than the table's real name) won't resolve.
 
 use crate::error::{DatabaseError, Result};
 use crate::execution::aggregate;
@@ -87,26 +87,20 @@ impl QueryExecutor {
         }
     }
 
-    /// Execute a query plan: compiles `Scan`/`Filter`/`Aggregate` nodes into
-    /// operators reading through the OLTP engine's MVCC snapshot. A `Join`
-    /// node errors rather than being silently skipped, since dropping it
-    /// would return a wrong (single-table) result without saying so.
+    /// Execute a query plan: compiles `Scan`/`Filter`/`Aggregate`/`Join`
+    /// nodes into operators reading through the OLTP engine's MVCC
+    /// snapshot. `Join` does a nested-loop join with a single-comparison
+    /// `ON` condition into a merged row set — see `merge_schemas` for how
+    /// column names disambiguate. A condition this executor can't
+    /// recognize as comparing two real columns errors rather than silently
+    /// degrading to an unfiltered cross product.
     pub fn execute(&self, plan: &PhysicalPlan) -> Result<Vec<Vec<String>>> {
         let mut current: Option<(TableSchema, Vec<Tuple>)> = None;
 
         for node in &plan.nodes {
             match node {
                 LogicalPlanNode::Scan { table_name, .. } => {
-                    let schema = self.catalog.read().get_table(table_name).cloned().ok_or_else(|| {
-                        DatabaseError::ExecutionError(format!("Unknown table '{table_name}'"))
-                    })?;
-                    let table_id = schema.table_id as u64;
-                    let rows = self.oltp.with_read_snapshot(|tx| self.oltp.scan_table(tx, table_id));
-                    let tuples = rows
-                        .into_iter()
-                        .filter_map(|(_, bytes)| bincode::deserialize::<Tuple>(&bytes).ok())
-                        .collect();
-                    current = Some((schema, tuples));
+                    current = Some(self.scan_table_tuples(table_name)?);
                 }
                 LogicalPlanNode::Filter { predicate, .. } => {
                     let (schema, tuples) = current
@@ -118,10 +112,43 @@ impl QueryExecutor {
                         .collect();
                     current = Some((schema, filtered));
                 }
-                LogicalPlanNode::Join { .. } => {
-                    return Err(DatabaseError::ExecutionError(
-                        "JOIN execution is not implemented yet".to_string(),
-                    ));
+                LogicalPlanNode::Join { right_table, condition, .. } => {
+                    let (left_schema, left_tuples) = current
+                        .take()
+                        .ok_or_else(|| DatabaseError::ExecutionError("JOIN with no input".to_string()))?;
+                    let (right_schema, right_tuples) = self.scan_table_tuples(right_table)?;
+                    let merged_schema = Self::merge_schemas(&left_schema, &right_schema);
+
+                    if let Some(cond) = condition {
+                        let (left_tok, _, right_tok) = row_codec::split_comparison(cond).ok_or_else(|| {
+                            DatabaseError::ExecutionError(format!("Unsupported JOIN condition: '{cond}'"))
+                        })?;
+                        let is_column = |tok: &str| merged_schema.columns.iter().any(|c| c.name == tok);
+                        if !is_column(&left_tok) || !is_column(&right_tok) {
+                            return Err(DatabaseError::ExecutionError(format!(
+                                "JOIN condition must compare two columns (e.g. 'a.id = b.a_id'), got: '{cond}'"
+                            )));
+                        }
+                    }
+
+                    let mut merged_tuples = Vec::new();
+                    for l in &left_tuples {
+                        for r in &right_tuples {
+                            let mut values = l.values.clone();
+                            values.extend(r.values.clone());
+                            let merged = Tuple { values };
+                            let keep = match condition {
+                                Some(cond) => {
+                                    row_codec::evaluate_predicate(cond, &merged_schema, &merged).unwrap_or(true)
+                                }
+                                None => true, // CROSS JOIN (or USING/NATURAL, not specially resolved)
+                            };
+                            if keep {
+                                merged_tuples.push(merged);
+                            }
+                        }
+                    }
+                    current = Some((merged_schema, merged_tuples));
                 }
                 LogicalPlanNode::Aggregate { columns, .. } => {
                     let (schema, tuples) = current
@@ -145,6 +172,49 @@ impl QueryExecutor {
             .into_iter()
             .map(|t| t.values.iter().map(row_codec::value_to_string).collect())
             .collect())
+    }
+
+    /// Read a table's full row set at a fresh snapshot (used by `Scan` and,
+    /// for its right-hand side, `Join`).
+    fn scan_table_tuples(&self, table_name: &str) -> Result<(TableSchema, Vec<Tuple>)> {
+        let schema = self.catalog.read().get_table(table_name).cloned().ok_or_else(|| {
+            DatabaseError::ExecutionError(format!("Unknown table '{table_name}'"))
+        })?;
+        let table_id = schema.table_id as u64;
+        let rows = self.oltp.with_read_snapshot(|tx| self.oltp.scan_table(tx, table_id));
+        let tuples = rows
+            .into_iter()
+            .filter_map(|(_, bytes)| bincode::deserialize::<Tuple>(&bytes).ok())
+            .collect();
+        Ok((schema, tuples))
+    }
+
+    /// Build the schema for a joined row: `left`'s columns followed by
+    /// `right`'s, each renamed to `"<table>.<column>"` so (a) two tables
+    /// with a same-named column don't collide, and (b) an `ON` condition
+    /// like `"users.id = orders.user_id"` — rendered by `sql::parser`
+    /// exactly that way for a qualified reference — resolves directly
+    /// against these names. A condition using a table *alias* rather than
+    /// its real name won't resolve; there's no alias tracking here.
+    fn merge_schemas(left: &TableSchema, right: &TableSchema) -> TableSchema {
+        let mut merged = TableSchema::new(0, format!("{}_{}", left.name, right.name));
+        let mut next_id = 1u32;
+        for (table, col) in left
+            .columns
+            .iter()
+            .map(|c| (left, c))
+            .chain(right.columns.iter().map(|c| (right, c)))
+        {
+            merged.add_column(Column {
+                id: next_id,
+                name: format!("{}.{}", table.name, col.name),
+                data_type: col.data_type,
+                nullable: col.nullable,
+                primary_key: false,
+            });
+            next_id += 1;
+        }
+        merged
     }
 
     /// Execute an INSERT by writing rows directly to the OLTP engine.
@@ -719,14 +789,99 @@ mod tests {
     }
 
     #[test]
-    fn test_join_query_errors_rather_than_silently_wrong() {
+    fn test_join_condition_on_nonexistent_column_errors() {
         let mut catalog = users_catalog();
-        let orders_schema = TableSchema::new(2, "orders".to_string());
+        let orders_schema = TableSchema::new(2, "orders".to_string()); // no columns at all
         catalog.register_table(orders_schema);
         let executor = QueryExecutor::new(catalog);
 
         assert!(executor
             .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
             .is_err());
+    }
+
+    fn users_and_orders_catalog() -> Catalog {
+        let mut catalog = users_catalog();
+        let mut orders = TableSchema::new(2, "orders".to_string());
+        orders.add_column(Column {
+            id: 1,
+            name: "id".to_string(),
+            data_type: DataType::Integer,
+            nullable: false,
+            primary_key: true,
+        });
+        orders.add_column(Column {
+            id: 2,
+            name: "user_id".to_string(),
+            data_type: DataType::Integer,
+            nullable: false,
+            primary_key: false,
+        });
+        orders.add_column(Column {
+            id: 3,
+            name: "total".to_string(),
+            data_type: DataType::Float,
+            nullable: false,
+            primary_key: false,
+        });
+        catalog.register_table(orders);
+        catalog
+    }
+
+    #[test]
+    fn test_join_with_on_condition_matches_correct_rows() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_users(&executor); // ids 1 (Alice), 2 (Bob)
+
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 9.5)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (101, 2, 4.0)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (102, 1, 2.0)")
+            .unwrap();
+
+        let rows = executor
+            .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
+            .unwrap();
+
+        assert_eq!(rows.len(), 3); // Alice has 2 orders, Bob has 1
+        let alice_orders = rows.iter().filter(|r| r.contains(&"Alice".to_string())).count();
+        assert_eq!(alice_orders, 2);
+    }
+
+    #[test]
+    fn test_join_with_where_filters_after_joining() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_users(&executor);
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 9.5)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (101, 2, 4.0)")
+            .unwrap();
+
+        let rows = executor
+            .execute_sql(
+                "SELECT * FROM users JOIN orders ON users.id = orders.user_id WHERE users.age > 18",
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+    }
+
+    #[test]
+    fn test_join_with_no_matches_returns_empty() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_users(&executor);
+        // No orders inserted at all.
+
+        let rows = executor
+            .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
+            .unwrap();
+        assert!(rows.is_empty());
     }
 }
