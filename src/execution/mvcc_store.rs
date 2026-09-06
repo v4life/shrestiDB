@@ -187,6 +187,13 @@ impl MVCCStore {
             .unwrap_or_else(|| panic!("Table {} not created", table_id))
     }
 
+    /// Non-panicking table lookup, for callers (like a query executor) that
+    /// may legitimately be asked to read a table that's registered in the
+    /// catalog but has never had a row written to it yet in this store.
+    pub fn get_table(&self, table_id: u64) -> Option<Arc<MVCCTable>> {
+        self.tables.read().get(&table_id).cloned()
+    }
+
     /// Check if a row exists at a given snapshot (for write-write conflict detection).
     pub fn row_exists(&self, table_id: u64, row_id: u64, snap_ts: u64) -> bool {
         self.tables.read()

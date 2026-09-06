@@ -12,6 +12,7 @@ pub mod lock_manager;
 pub mod mvcc_store;
 pub mod oltp;
 pub mod learned_retention;
+pub mod row_codec;
 
 pub use catalog::Catalog;
 pub use executor::QueryExecutor;

@@ -60,6 +60,30 @@ impl OLTPEngine {
         tx_id
     }
 
+    /// Run `f` against a fresh read-only snapshot, then end the
+    /// transaction. A read-only caller can't forget to clean up this way —
+    /// an unended transaction's snapshot would sit in `min_active_snapshot`
+    /// forever, blocking the learned retention sweep from ever pruning
+    /// anything at or after it.
+    pub fn with_read_snapshot<T>(&self, f: impl FnOnce(TransactionId) -> T) -> T {
+        let tx_id = self.begin();
+        let result = f(tx_id);
+        self.abort(tx_id);
+        result
+    }
+
+    /// Full-table read at `tx_id`'s snapshot: every row visible to it. An
+    /// unknown table (registered in the catalog but never written to in
+    /// this store) reads as empty rather than erroring — that's a
+    /// legitimate state for a freshly created table.
+    pub fn scan_table(&self, tx_id: TransactionId, table_id: u64) -> Vec<(u64, Vec<u8>)> {
+        let snap_ts = *self.snapshots.lock().unwrap().get(&tx_id.0).unwrap_or(&0);
+        match self.store.get_table(table_id) {
+            Some(table) => table.scan(snap_ts),
+            None => Vec::new(),
+        }
+    }
+
     /// Transactional point read: checks the transaction's own uncommitted
     /// writes first, then falls back to the MVCC snapshot.
     ///

@@ -15,13 +15,15 @@ use crate::error::{DatabaseError, Result};
 use crate::execution::catalog::{Catalog, TableSchema};
 use crate::sql::parser::SQLStatement;
 
-/// Binder for semantic analysis
-pub struct Binder {
-    pub catalog: Catalog,
+/// Binder for semantic analysis. Borrows the catalog rather than owning it,
+/// so a caller that already owns a `Catalog` (e.g. `QueryExecutor`) can
+/// validate a statement against it without giving it up or cloning it.
+pub struct Binder<'a> {
+    pub catalog: &'a Catalog,
 }
 
-impl Binder {
-    pub fn new(catalog: Catalog) -> Self {
+impl<'a> Binder<'a> {
+    pub fn new(catalog: &'a Catalog) -> Self {
         Binder { catalog }
     }
 
@@ -138,28 +140,32 @@ mod tests {
 
     #[test]
     fn test_bind_select_success() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("SELECT id, name FROM users").unwrap();
         assert!(binder.bind(&stmt).is_ok());
     }
 
     #[test]
     fn test_bind_select_unknown_table() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("SELECT * FROM ghosts").unwrap();
         assert!(binder.bind(&stmt).is_err());
     }
 
     #[test]
     fn test_bind_select_unknown_column() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("SELECT nope FROM users").unwrap();
         assert!(binder.bind(&stmt).is_err());
     }
 
     #[test]
     fn test_bind_select_star_and_expressions_skip_column_check() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         assert!(binder.bind(&SQLParser::parse("SELECT * FROM users").unwrap()).is_ok());
         assert!(binder
             .bind(&SQLParser::parse("SELECT COUNT(*) FROM users").unwrap())
@@ -168,35 +174,40 @@ mod tests {
 
     #[test]
     fn test_bind_insert_arity_mismatch() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("INSERT INTO users (id, name) VALUES (1)").unwrap();
         assert!(binder.bind(&stmt).is_err());
     }
 
     #[test]
     fn test_bind_insert_success() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
         assert!(binder.bind(&stmt).is_ok());
     }
 
     #[test]
     fn test_bind_update_unknown_column() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("UPDATE users SET nope = 1 WHERE id = 1").unwrap();
         assert!(binder.bind(&stmt).is_err());
     }
 
     #[test]
     fn test_bind_create_table_duplicate() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("CREATE TABLE users (id INT)").unwrap();
         assert!(binder.bind(&stmt).is_err());
     }
 
     #[test]
     fn test_bind_create_table_new() {
-        let binder = Binder::new(catalog_with_users());
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("CREATE TABLE orders (id INT)").unwrap();
         assert!(binder.bind(&stmt).is_ok());
     }
