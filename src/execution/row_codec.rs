@@ -2,14 +2,21 @@
 //! `sql::parser` (literal values, WHERE-clause predicates) and the typed
 //! `Value`/`Tuple` rows the executor actually operates on.
 //!
-//! The predicate evaluator only understands a single `<column> <op>
-//! <literal>` comparison (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`) — there's no
-//! expression tree to walk for `AND`/`OR`/parenthesized conditions (see
+//! The predicate evaluator only understands a single `<left> <op> <right>`
+//! comparison (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`) — there's no expression
+//! tree to walk for `AND`/`OR`/parenthesized conditions (see
 //! `sql::parser`'s doc comment: a WHERE clause is still just a rendered
-//! string). `evaluate_predicate` returns `None` for anything it can't
-//! parse this way, and callers treat "can't evaluate" as "don't filter the
-//! row out" — a compound WHERE clause silently has no effect on results
-//! rather than than erroring or (worse) dropping rows it can't check.
+//! string). `right` is resolved against the schema first — if it names a
+//! real column, this is a column-to-column comparison (what a `JOIN`
+//! condition like `"users.id = orders.user_id"` needs, once the executor
+//! has merged both sides' columns into one schema); otherwise it's parsed
+//! as a literal, same as before. `evaluate_predicate` returns `None` for
+//! anything it can't evaluate this way, and callers treat "can't evaluate"
+//! as "don't filter the row out" — a compound WHERE clause silently has no
+//! effect on results rather than erroring or (worse) dropping rows it
+//! can't check. `execute_join` (in `execution::executor`) is the one
+//! exception: it treats an unrecognized join condition as an error rather
+//! than silently degrading to an unfiltered cross product.
 
 use crate::execution::catalog::{DataType, TableSchema};
 use crate::execution::operators::{Tuple, Value};
@@ -41,25 +48,36 @@ pub fn value_to_string(value: &Value) -> String {
     }
 }
 
-/// Evaluate a flattened WHERE-clause predicate against one row. `None`
-/// means "couldn't evaluate this" (unsupported shape, unknown column, type
-/// mismatch) — see module docs for how callers should treat that.
+/// Evaluate a flattened WHERE/JOIN-condition predicate against one row.
+/// `None` means "couldn't evaluate this" (unsupported shape, unknown
+/// column, type mismatch) — see module docs for how callers should treat
+/// that.
 pub fn evaluate_predicate(predicate: &str, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
+    let (left, op, right) = split_comparison(predicate)?;
+
+    let left_idx = schema.columns.iter().position(|c| c.name == left)?;
+    let left_value = tuple.values.get(left_idx)?;
+
+    let right_value = match schema.columns.iter().position(|c| c.name == right) {
+        Some(right_idx) => tuple.values.get(right_idx)?.clone(),
+        None => parse_value(&right, schema.columns[left_idx].data_type),
+    };
+
+    compare(left_value, &op, &right_value)
+}
+
+/// Split a flattened `<left> <op> <right>` comparison into its three
+/// tokens. `None` for anything else (a compound `AND`/`OR` condition, a
+/// bare boolean column, ...) — not a shape this evaluator understands.
+pub fn split_comparison(predicate: &str) -> Option<(String, String, String)> {
     let tokens = tokenize(predicate)?;
-    let [column, op, literal] = tokens.try_into().ok()?;
-
-    let idx = schema.columns.iter().position(|c| c.name == column)?;
-    let value = tuple.values.get(idx)?;
-    let literal_value = parse_value(&literal, schema.columns[idx].data_type);
-
-    compare(value, &op, &literal_value)
+    let [left, op, right]: [String; 3] = tokens.try_into().ok()?;
+    Some((left, op, right))
 }
 
 /// Split on whitespace, respecting single-quoted string literals (so
 /// `name = 'John Smith'` tokenizes to 3 tokens, not 4). Returns `None`
-/// unless it's exactly 3 tokens — anything else (a compound `AND`/`OR`
-/// condition, a bare boolean column, ...) isn't a shape this evaluator
-/// understands.
+/// unless it's exactly 3 tokens.
 fn tokenize(predicate: &str) -> Option<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -204,5 +222,14 @@ mod tests {
             evaluate_predicate("age > 18 AND id = 1", &schema, &row(1, "Bob", 30)),
             None
         );
+    }
+
+    #[test]
+    fn test_evaluate_column_to_column_comparison() {
+        // Needed for JOIN conditions: "id = age" compares two columns of
+        // the same row, not a column against a literal.
+        let schema = schema();
+        assert_eq!(evaluate_predicate("id = age", &schema, &row(30, "Bob", 30)), Some(true));
+        assert_eq!(evaluate_predicate("id = age", &schema, &row(1, "Bob", 30)), Some(false));
     }
 }
