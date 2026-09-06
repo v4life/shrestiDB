@@ -31,6 +31,9 @@ pub enum DatabaseError {
     #[error("Parsing error: {0}")]
     ParseError(String),
 
+    #[error("Binding error: {0}")]
+    BindingError(String),
+
     #[error("Constraint violation: {0}")]
     ConstraintViolation(String),
 
