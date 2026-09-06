@@ -4,7 +4,6 @@
 
 pub mod parser;
 pub mod binder;
-pub mod planner;
 pub mod types;
 
 pub use parser::SQLParser;
