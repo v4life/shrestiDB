@@ -13,6 +13,7 @@ pub mod mvcc_store;
 pub mod oltp;
 pub mod learned_retention;
 pub mod row_codec;
+pub mod aggregate;
 
 pub use catalog::Catalog;
 pub use executor::QueryExecutor;
