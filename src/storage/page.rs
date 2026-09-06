@@ -285,7 +285,7 @@ mod tests {
 
         let records = vec![b"record1", b"record2", b"record3"];
         for record in &records {
-            page.insert_record(record).expect("Insert failed");
+            page.insert_record(*record).expect("Insert failed");
         }
 
         assert_eq!(page.record_count(), 3);

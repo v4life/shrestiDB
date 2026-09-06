@@ -45,7 +45,7 @@ impl Transaction {
 /// Transaction manager
 pub struct TransactionManager {
     next_tx_id: Arc<AtomicU64>,
-    transactions: std::sync::RwLock<std::collections::HashMap<u64, Transaction>>,
+    pub transactions: std::sync::RwLock<std::collections::HashMap<u64, Transaction>>,
 }
 
 impl TransactionManager {

@@ -9,5 +9,5 @@ pub mod training;
 
 pub use regression::LinearRegression;
 pub use neural::NeuralNetwork;
-pub use time_series::TimeSeriesPredictor;
+pub use time_series::{ARModel, ARModel as TimeSeriesPredictor};
 pub use training::ModelTrainer;

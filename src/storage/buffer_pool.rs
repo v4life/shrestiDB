@@ -2,7 +2,7 @@
 //!
 //! Uses Markov chain models to predict future page accesses.
 
-use crate::error::{DatabaseError, Result};
+use crate::error::Result;
 use crate::storage::page::{PageId, SlottedPage, PAGE_SIZE};
 use crate::storage::disk_manager::DiskManager;
 use std::collections::HashMap;
@@ -174,7 +174,7 @@ impl LearnedBufferPool {
     }
 
     /// Flush all dirty pages to disk
-    pub fn flush_all(&self, file_id: u32) -> Result<()> {
+    pub fn flush_all(&self, _file_id: u32) -> Result<()> {
         let buffer = self.buffer.read();
         for (page_id, entry) in buffer.iter() {
             if entry.dirty {

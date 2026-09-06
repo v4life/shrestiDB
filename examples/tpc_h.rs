@@ -27,7 +27,7 @@ fn main() {
 
     // Simulate Q1: Simple range query
     println!("Query 1: SELECT * FROM orders WHERE orderkey BETWEEN 100000 AND 200000");
-    let mut estimator = LearnedCardinalityEstimator::new(10);
+    let estimator = LearnedCardinalityEstimator::new(10);
     let start = Instant::now();
     let estimated_rows = estimator.estimate_row_count(1_000_000, &vec![]);
     let est_time = start.elapsed();

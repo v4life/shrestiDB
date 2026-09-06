@@ -4,7 +4,6 @@
 mod sql_tests {
     use learned_db_kernel::execution::catalog::{Catalog, TableSchema, Column, DataType};
     use learned_db_kernel::optimizer::planner::QueryPlanner;
-    use learned_db_kernel::optimizer::cost_model::CostModel;
 
     #[test]
     fn test_simple_select_parsing() {

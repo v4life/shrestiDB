@@ -30,7 +30,7 @@ fn main() {
     users_schema.add_column(Column {
         id: 2,
         name: "name".to_string(),
-        data_type: DataType::String(255),
+        data_type: DataType::String,
         nullable: false,
         primary_key: false,
     });

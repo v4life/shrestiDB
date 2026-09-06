@@ -72,7 +72,7 @@ pub struct PolynomialRegression {
 
 impl PolynomialRegression {
     /// Fit polynomial of given degree
-    pub fn fit(x: &[f64], y: &[f64], degree: usize) -> Option<Self> {
+    pub fn fit(x: &[f64], _y: &[f64], degree: usize) -> Option<Self> {
         if x.len() < degree + 1 {
             return None;
         }

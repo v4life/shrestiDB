@@ -12,4 +12,4 @@ pub use cardinality::LearnedCardinalityEstimator;
 pub use cost_model::CostModel;
 pub use join_reorder::JoinOrderer;
 pub use planner::QueryPlanner;
-pub use statistics::Statistics;
+pub use statistics::{ColumnStatistics, StatisticsCollector, TableStats};

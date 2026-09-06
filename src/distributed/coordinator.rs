@@ -57,7 +57,7 @@ impl QueryCoordinator {
     }
 
     /// Select best worker for task execution
-    pub fn select_worker_for_task(&self, task_type: &str, data_size_mb: usize) -> Option<u32> {
+    pub fn select_worker_for_task(&self, task_type: &str, _data_size_mb: usize) -> Option<u32> {
         match task_type {
             "scan" => {
                 // Choose worker with most free memory

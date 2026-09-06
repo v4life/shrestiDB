@@ -100,7 +100,7 @@ impl DiskManager {
     /// Flush all writes to disk
     pub fn flush(&self) -> Result<()> {
         let files = self.files.read();
-        for (_, mut file) in files.iter() {
+        for (_, file) in files.iter() {
             file.sync_all()?;
         }
         Ok(())

@@ -9,5 +9,5 @@ pub mod pgm;
 pub mod rmi;
 
 pub use hybrid_router::HybridIndex;
-pub use pgm::PGMIndex;
+pub use pgm::{DynamicPGMIndex, PGMIndex, PGMSegment};
 pub use rmi::RMIIndex;

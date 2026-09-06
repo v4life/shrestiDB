@@ -53,11 +53,15 @@ proptest = "1.4"
 tempfile = "3.8"
 
 [[bench]]
-name = "index_bench"
+name = "index_benchmark"
 harness = false
 
 [[bench]]
-name = "optimizer_bench"
+name = "optimizer_benchmark"
+harness = false
+
+[[bench]]
+name = "query_benchmark"
 harness = false
 
 [profile.release]

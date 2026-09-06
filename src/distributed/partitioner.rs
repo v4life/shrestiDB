@@ -47,7 +47,7 @@ impl DataPartitioner {
             PartitionStrategy::Hash => {
                 // Hash-based: use key hash mod num_partitions
                 let hash = key.to_bits() as u32;
-                (hash % self.num_partitions as u32)
+                hash % self.num_partitions as u32
             }
             PartitionStrategy::Range => {
                 // Range-based: find partition by key range
