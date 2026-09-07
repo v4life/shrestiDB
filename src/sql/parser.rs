@@ -47,6 +47,10 @@ pub struct SelectStatement {
     /// Any tables joined to `from`, in `JOIN` order.
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<String>,
+    /// `GROUP BY` column names. Empty means no `GROUP BY` — `GROUP BY ALL`
+    /// (Snowflake/DuckDB/ClickHouse syntax) isn't recognized and also
+    /// comes through empty.
+    pub group_by: Vec<String>,
     pub order_by: Option<String>,
     pub limit: Option<usize>,
 }
@@ -164,6 +168,10 @@ impl SQLParser {
             .unwrap_or_default();
 
         let where_clause = select.selection.as_ref().map(|e| e.to_string());
+        let group_by = match &select.group_by {
+            ast::GroupByExpr::Expressions(exprs, _) => exprs.iter().map(|e| e.to_string()).collect(),
+            ast::GroupByExpr::All(_) => Vec::new(), // not recognized; see field docs
+        };
         let order_by = query.order_by.as_ref().map(|o| o.to_string());
         let limit = query.limit_clause.as_ref().and_then(Self::extract_limit);
 
@@ -172,6 +180,7 @@ impl SQLParser {
             from,
             joins,
             where_clause,
+            group_by,
             order_by,
             limit,
         }))
@@ -336,6 +345,28 @@ mod tests {
                 assert_eq!(s.limit, Some(10));
                 assert!(s.order_by.is_some());
             }
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_group_by() {
+        let sql = "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id";
+        let stmt = SQLParser::parse(sql).unwrap();
+        match stmt {
+            SQLStatement::Select(s) => {
+                assert_eq!(s.group_by, vec!["user_id".to_string()]);
+            }
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_without_group_by_is_empty() {
+        let sql = "SELECT * FROM users";
+        let stmt = SQLParser::parse(sql).unwrap();
+        match stmt {
+            SQLStatement::Select(s) => assert!(s.group_by.is_empty()),
             _ => panic!("Expected SELECT statement"),
         }
     }

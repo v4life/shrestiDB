@@ -43,10 +43,15 @@ pub enum LogicalPlanNode {
         join_type: String,
     },
     Aggregate {
-        /// The projected columns, each a recognized aggregate call (see
-        /// `execution::aggregate::parse_aggregate`) — re-parsed at
-        /// execution time rather than duplicating a typed spec here.
+        /// The projected columns: each is either a recognized aggregate
+        /// call (see `execution::aggregate::parse_aggregate`) or, when
+        /// `group_by` is non-empty, one of the grouping columns —
+        /// re-parsed/looked-up at execution time rather than duplicating a
+        /// typed spec here.
         columns: Vec<String>,
+        /// `GROUP BY` column names. Empty means a single ungrouped
+        /// aggregate — the whole input collapses to one output row.
+        group_by: Vec<String>,
         rows: usize,
     },
 }
@@ -137,17 +142,29 @@ impl QueryPlanner {
             nodes.push(LogicalPlanNode::Filter { predicate, rows });
         }
 
-        // Only treat this as an aggregate query when every projected column
-        // is a recognized aggregate call — a mix of aggregate and plain
-        // columns needs GROUP BY, which isn't supported, so it's left as a
-        // plain (if not fully correct) row-returning plan instead of
-        // pretending to aggregate.
+        // Treat this as an aggregate query when every projected column is
+        // either a recognized aggregate call or (with GROUP BY) one of the
+        // grouping columns -- anything else (a plain column that's neither)
+        // is left as a plain, if not fully correct, row-returning plan
+        // instead of pretending to aggregate.
         if !select.columns.is_empty()
-            && select.columns.iter().all(|c| aggregate::parse_aggregate(c).is_some())
+            && select
+                .columns
+                .iter()
+                .all(|c| aggregate::parse_aggregate(c).is_some() || select.group_by.contains(c))
         {
-            rows = 1; // no GROUP BY: aggregation always collapses to one row
+            rows = if select.group_by.is_empty() {
+                1 // no GROUP BY: aggregation always collapses to one row
+            } else {
+                // No real cardinality data to estimate distinct groups
+                // from; sqrt(rows) is a common rough heuristic, not a
+                // measurement -- good enough since nothing depends on it
+                // for correctness, only the cost estimate.
+                ((rows as f64).sqrt().ceil() as usize).max(1)
+            };
             nodes.push(LogicalPlanNode::Aggregate {
                 columns: select.columns.clone(),
+                group_by: select.group_by.clone(),
                 rows,
             });
         }
@@ -262,9 +279,34 @@ mod tests {
     #[test]
     fn test_plan_does_not_emit_aggregate_for_mixed_columns() {
         let planner = QueryPlanner::new();
-        // "name" alongside COUNT(*) needs GROUP BY, which isn't supported;
-        // this must not be misdetected as a pure aggregate query.
+        // "name" alongside COUNT(*) with no GROUP BY at all is invalid --
+        // must not be misdetected as a pure aggregate query.
         let plan = planner.plan("SELECT name, COUNT(*) FROM users");
+        assert!(!plan
+            .nodes
+            .iter()
+            .any(|n| matches!(n, LogicalPlanNode::Aggregate { .. })));
+    }
+
+    #[test]
+    fn test_plan_emits_aggregate_node_for_group_by() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id");
+        match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Aggregate { .. })) {
+            Some(LogicalPlanNode::Aggregate { columns, group_by, .. }) => {
+                assert_eq!(columns, &vec!["user_id".to_string(), "COUNT(*)".to_string()]);
+                assert_eq!(group_by, &vec!["user_id".to_string()]);
+            }
+            _ => panic!("expected an Aggregate node"),
+        }
+    }
+
+    #[test]
+    fn test_plan_rejects_group_by_with_ungrouped_plain_column() {
+        let planner = QueryPlanner::new();
+        // "name" is neither an aggregate call nor a GROUP BY column --
+        // still not a valid aggregate query shape even with GROUP BY present.
+        let plan = planner.plan("SELECT name, COUNT(*) FROM orders GROUP BY user_id");
         assert!(!plan
             .nodes
             .iter()
