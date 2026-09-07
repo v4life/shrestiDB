@@ -12,10 +12,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
+use crate::index::pgm::DynamicPGMIndex;
+
 pub const TS_INFINITY: u64 = u64::MAX;
+
+/// PGM error bound for a table's row-id index — how far off a predicted
+/// position can be before the bounded search around it must widen.
+const PK_INDEX_ERROR_BOUND: usize = 8;
+/// How many buffered inserts a table's row-id index absorbs before
+/// merging them into its base PGM segments (see `DynamicPGMIndex`).
+const PK_INDEX_BUFFER_CAPACITY: usize = 64;
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
@@ -104,9 +113,20 @@ impl WriteOp {
 pub type RowId = u64;
 
 /// One table's version-chain storage.
+///
+/// `pk_index` is a learned (PGM) index over this table's row ids — which
+/// are always a row's primary-key value (see `QueryExecutor::execute_insert`,
+/// the only place a row id is ever assigned), so this doubles as a PK
+/// index without needing a separate structure. It only ever grows: a
+/// deleted row's id is never removed from it, and `range_ids`'/`contains_id`'s
+/// callers must treat what it returns as *candidates* to be confirmed
+/// against the actual version chain (via `read`), not final answers — a
+/// stale or not-yet-committed-in-this-view id is simply filtered out at
+/// that point, same as a row a full scan would have also had to check.
 #[derive(Default)]
 pub struct MVCCTable {
     rows: RwLock<HashMap<RowId, VersionChain>>,
+    pk_index: Mutex<Option<DynamicPGMIndex>>,
 }
 
 impl MVCCTable {
@@ -123,9 +143,33 @@ impl MVCCTable {
             .collect()
     }
 
+    /// Row ids in `[min, max]` per the learned index — see the struct docs
+    /// for why these are candidates, not a final answer.
+    pub fn index_range(&self, min: f64, max: f64) -> Vec<RowId> {
+        match self.pk_index.lock().as_ref() {
+            Some(index) => index.range_search(min, max).into_iter().map(|k| k as RowId).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn index_insert(&self, row_id: RowId) {
+        let mut guard = self.pk_index.lock();
+        match guard.as_mut() {
+            Some(index) => index.insert(row_id as f64),
+            None => {
+                *guard = Some(DynamicPGMIndex::new(
+                    vec![row_id as f64],
+                    PK_INDEX_ERROR_BOUND,
+                    PK_INDEX_BUFFER_CAPACITY,
+                ))
+            }
+        }
+    }
+
     /// Apply a committed INSERT.
     pub(crate) fn apply_insert(&self, row_id: RowId, commit_ts: u64, data: Vec<u8>) {
         self.rows.write().entry(row_id).or_default().push_version(commit_ts, data);
+        self.index_insert(row_id);
     }
 
     /// Apply a committed UPDATE (expire old + push new).
@@ -216,5 +260,42 @@ impl MVCCStore {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_range_finds_inserted_rows() {
+        let table = MVCCTable::default();
+        for id in [10u64, 20, 30, 40, 50] {
+            table.apply_insert(id, 1, format!("row{id}").into_bytes());
+        }
+
+        let mut ids = table.index_range(15.0, 45.0);
+        ids.sort();
+        assert_eq!(ids, vec![20, 30, 40]);
+    }
+
+    #[test]
+    fn test_index_range_on_empty_table_is_empty() {
+        let table = MVCCTable::default();
+        assert!(table.index_range(0.0, 100.0).is_empty());
+    }
+
+    #[test]
+    fn test_index_range_includes_recently_inserted_unflushed_rows() {
+        // Fewer inserts than PK_INDEX_BUFFER_CAPACITY, so these all sit in
+        // the index's write buffer rather than its rebuilt base segments --
+        // range_search must still find them.
+        let table = MVCCTable::default();
+        table.apply_insert(1, 1, b"a".to_vec());
+        table.apply_insert(2, 1, b"b".to_vec());
+
+        let mut ids = table.index_range(0.0, 10.0);
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
     }
 }
