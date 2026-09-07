@@ -197,19 +197,55 @@ impl QueryExecutor {
                     }
                     current = Some((merged_schema, merged_tuples));
                 }
-                LogicalPlanNode::Aggregate { columns, .. } => {
+                LogicalPlanNode::Aggregate { columns, group_by, .. } => {
                     let (schema, tuples) = current
                         .take()
                         .ok_or_else(|| DatabaseError::ExecutionError("Aggregate with no input".to_string()))?;
 
-                    let mut output = Vec::with_capacity(columns.len());
-                    for col in columns {
-                        let (func, arg) = aggregate::parse_aggregate(col).ok_or_else(|| {
-                            DatabaseError::ExecutionError(format!("Not a recognized aggregate: '{col}'"))
-                        })?;
-                        output.push(aggregate::compute_aggregate(func, arg.as_deref(), &schema, &tuples));
+                    // Resolve each GROUP BY column to its position in the
+                    // row up front, then partition rows into groups by
+                    // their key values. No GROUP BY means one group
+                    // holding every row -- the pre-existing ungrouped
+                    // behavior.
+                    let group_indices = group_by
+                        .iter()
+                        .map(|g| {
+                            schema.columns.iter().position(|c| &c.name == g).ok_or_else(|| {
+                                DatabaseError::ExecutionError(format!("Unknown GROUP BY column '{g}'"))
+                            })
+                        })
+                        .collect::<Result<Vec<usize>>>()?;
+
+                    let groups: Vec<(Vec<Value>, Vec<Tuple>)> = if group_indices.is_empty() {
+                        vec![(Vec::new(), tuples)]
+                    } else {
+                        let mut groups: Vec<(Vec<Value>, Vec<Tuple>)> = Vec::new();
+                        for tuple in tuples {
+                            let key: Vec<Value> = group_indices.iter().map(|&i| tuple.values[i].clone()).collect();
+                            match groups.iter_mut().find(|(k, _)| k == &key) {
+                                Some((_, rows)) => rows.push(tuple),
+                                None => groups.push((key, vec![tuple])),
+                            }
+                        }
+                        groups
+                    };
+
+                    let mut output_rows = Vec::with_capacity(groups.len());
+                    for (key, group_tuples) in &groups {
+                        let mut output = Vec::with_capacity(columns.len());
+                        for col in columns {
+                            if let Some(pos) = group_by.iter().position(|g| g == col) {
+                                output.push(key[pos].clone());
+                            } else {
+                                let (func, arg) = aggregate::parse_aggregate(col).ok_or_else(|| {
+                                    DatabaseError::ExecutionError(format!("Not a recognized aggregate: '{col}'"))
+                                })?;
+                                output.push(aggregate::compute_aggregate(func, arg.as_deref(), &schema, group_tuples));
+                            }
+                        }
+                        output_rows.push(Tuple { values: output });
                     }
-                    current = Some((schema, vec![Tuple { values: output }]));
+                    current = Some((schema, output_rows));
                 }
             }
         }
@@ -1137,5 +1173,85 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].contains(&"Bob".to_string()));
+    }
+
+    fn seed_orders(executor: &QueryExecutor) {
+        // user 1: two orders (10.0, 5.0); user 2: one order (20.0)
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 10.0)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (101, 1, 5.0)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (102, 2, 20.0)")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_group_by_count() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let rows = executor
+            .execute_sql("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id")
+            .unwrap();
+        assert_eq!(rows.len(), 2); // two distinct user_ids
+
+        let user1_row = rows.iter().find(|r| r[0] == "1").unwrap();
+        assert_eq!(user1_row[1], "2");
+        let user2_row = rows.iter().find(|r| r[0] == "2").unwrap();
+        assert_eq!(user2_row[1], "1");
+    }
+
+    #[test]
+    fn test_group_by_sum() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let rows = executor
+            .execute_sql("SELECT user_id, SUM(total) FROM orders GROUP BY user_id")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let user1_row = rows.iter().find(|r| r[0] == "1").unwrap();
+        assert_eq!(user1_row[1], "15");
+        let user2_row = rows.iter().find(|r| r[0] == "2").unwrap();
+        assert_eq!(user2_row[1], "20");
+    }
+
+    #[test]
+    fn test_group_by_respects_where_clause() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let rows = executor
+            .execute_sql("SELECT user_id, COUNT(*) FROM orders WHERE total > 8 GROUP BY user_id")
+            .unwrap();
+        // Only the 10.0 and 20.0 orders qualify -- one per user.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r[1] == "1"));
+    }
+
+    #[test]
+    fn test_group_by_on_table_with_no_rows_is_empty() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        let rows = executor
+            .execute_sql("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id")
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_group_by_without_aggregate_acts_like_distinct() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let rows = executor
+            .execute_sql("SELECT user_id FROM orders GROUP BY user_id")
+            .unwrap();
+        let mut ids: Vec<&String> = rows.iter().map(|r| &r[0]).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["1", "2"]);
     }
 }
