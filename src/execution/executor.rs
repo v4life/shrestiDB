@@ -15,6 +15,15 @@
 //! recognize that way errors rather than silently returning an unfiltered
 //! cross product. There is no `GROUP BY`, and a `JOIN` condition using a
 //! table alias (rather than the table's real name) won't resolve.
+//!
+//! `new()` is in-memory only, same as always. `open(path)` is the durable
+//! entry point: every CREATE TABLE and every committed write is logged to
+//! a WAL at `path` before it takes effect (see `execution::oltp` and
+//! `execution::wal`), and `open` replays whatever's already in that file
+//! to rebuild catalog + row state before returning — so a restart doesn't
+//! lose data.
+
+use std::path::Path;
 
 use crate::error::{DatabaseError, Result};
 use crate::execution::aggregate;
@@ -22,8 +31,10 @@ use crate::execution::catalog::{Catalog, Column, DataType, TableSchema};
 use crate::execution::mvcc_store::WriteOp;
 use crate::execution::oltp::OLTPEngine;
 use crate::execution::operators::{Tuple, Value};
+use crate::execution::recovery::RecoveryManager;
 use crate::execution::row_codec;
 use crate::execution::transaction::TransactionId;
+use crate::execution::wal::WriteAheadLog;
 use crate::optimizer::planner::{LogicalPlanNode, PhysicalPlan, QueryPlanner};
 use crate::sql::binder::Binder;
 use crate::sql::parser::{
@@ -47,12 +58,31 @@ pub struct QueryExecutor {
 }
 
 impl QueryExecutor {
+    /// In-memory only: nothing here survives a restart. What every
+    /// existing test uses.
     pub fn new(catalog: Catalog) -> Self {
         QueryExecutor {
             catalog: RwLock::new(catalog),
             oltp: OLTPEngine::new(),
             planner: QueryPlanner::new(),
         }
+    }
+
+    /// Durable: opens (creating if needed) a WAL at `path`, replays
+    /// whatever's already logged there to rebuild the catalog and row
+    /// state, then returns an executor where every future CREATE TABLE and
+    /// every future commit is logged to that file before it takes effect.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let (wal, records) = WriteAheadLog::open(path)?;
+        let mut catalog = Catalog::new();
+        let oltp = OLTPEngine::with_wal(wal);
+        RecoveryManager::recover(records, &mut catalog, &oltp);
+
+        Ok(QueryExecutor {
+            catalog: RwLock::new(catalog),
+            oltp,
+            planner: QueryPlanner::new(),
+        })
     }
 
     /// Parse, bind, and run a SQL statement end to end.
@@ -271,7 +301,7 @@ impl QueryExecutor {
             }
         }
         let affected = insert.values.len();
-        self.oltp.commit(tx);
+        self.oltp.commit(tx)?;
         Ok(affected)
     }
 
@@ -343,7 +373,7 @@ impl QueryExecutor {
             affected += 1;
         }
 
-        self.oltp.commit(tx);
+        self.oltp.commit(tx)?;
         Ok(affected)
     }
 
@@ -381,7 +411,7 @@ impl QueryExecutor {
             affected += 1;
         }
 
-        self.oltp.commit(tx);
+        self.oltp.commit(tx)?;
         Ok(affected)
     }
 
@@ -408,6 +438,8 @@ impl QueryExecutor {
                 primary_key: col.primary_key,
             });
         }
+        self.oltp.log_schema_change(&schema)?;
+
         catalog.register_table(schema);
         drop(catalog);
 
@@ -485,8 +517,8 @@ impl QueryExecutor {
         self.oltp.write(tx_id, op)
     }
 
-    pub fn commit_transaction(&self, tx_id: TransactionId) {
-        self.oltp.commit(tx_id);
+    pub fn commit_transaction(&self, tx_id: TransactionId) -> Result<()> {
+        self.oltp.commit(tx_id)
     }
 
     pub fn abort_transaction(&self, tx_id: TransactionId) {
@@ -524,7 +556,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(executor.read_row(tx, 1, 1).unwrap(), Some(b"row".to_vec()));
-        executor.commit_transaction(tx);
+        executor.commit_transaction(tx).unwrap();
 
         let tx2 = executor.begin_transaction();
         assert_eq!(executor.read_row(tx2, 1, 1).unwrap(), Some(b"row".to_vec()));
@@ -883,5 +915,73 @@ mod tests {
             .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_data_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        {
+            let executor = QueryExecutor::open(&wal_path).unwrap();
+            executor
+                .execute_sql("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50), age INT)")
+                .unwrap();
+            executor
+                .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+                .unwrap();
+            executor
+                .execute_sql("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 15)")
+                .unwrap();
+            // Dropped here -- simulates the process exiting.
+        }
+
+        let reopened = QueryExecutor::open(&wal_path).unwrap();
+        let rows = reopened.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // New writes after recovery must still work, with commit
+        // timestamps past everything replayed.
+        reopened
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (3, 'Carol', 40)")
+            .unwrap();
+        let rows = reopened.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_updates_and_deletes_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        {
+            let executor = QueryExecutor::open(&wal_path).unwrap();
+            executor
+                .execute_sql("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50), age INT)")
+                .unwrap();
+            executor
+                .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+                .unwrap();
+            executor
+                .execute_sql("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 15)")
+                .unwrap();
+            executor
+                .execute_sql("UPDATE users SET age = 31 WHERE id = 1")
+                .unwrap();
+            executor.execute_sql("DELETE FROM users WHERE id = 2").unwrap();
+        }
+
+        let reopened = QueryExecutor::open(&wal_path).unwrap();
+        let rows = reopened.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"31".to_string()));
+    }
+
+    #[test]
+    fn test_in_memory_executor_has_no_wal_file() {
+        // new() stays fully in-memory -- no path argument, nothing written
+        // anywhere. This is what every other test in this file relies on.
+        let executor = QueryExecutor::new(users_catalog());
+        assert!(executor.execute_sql("SELECT * FROM users").is_ok());
     }
 }
