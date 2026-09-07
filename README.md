@@ -75,7 +75,7 @@ A relational database kernel written in Rust that leverages machine learning mod
 ## 📁 Project Structure
 
 ```
-learned-db-kernel/
+shresti/
 ├── Cargo.toml                          # Rust dependencies
 ├── README.md                           # This file
 ├── DESIGN.md                           # Comprehensive design document
@@ -380,8 +380,8 @@ For issues, questions, or suggestions:
 
 ```bash
 # Clone and build
-git clone https://github.com/v4life/learned-db-kernel.git
-cd learned-db-kernel
+git clone https://github.com/v4life/shresti.git
+cd shresti
 cargo build --release
 
 # Run example
