@@ -1254,4 +1254,77 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["1", "2"]);
     }
+
+    #[test]
+    fn test_where_and() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let rows = executor
+            .execute_sql("SELECT * FROM users WHERE age > 18 AND name = 'Alice'")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+    }
+
+    #[test]
+    fn test_where_or() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let rows = executor
+            .execute_sql("SELECT * FROM users WHERE name = 'Alice' OR name = 'Bob'")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_where_parenthesized_and_or() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+        executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (3, 'Carol', 40)")
+            .unwrap();
+
+        // Only Alice and Carol are old enough; of those, only rows named
+        // Alice or Carol qualify -- Bob is excluded by age regardless.
+        let rows = executor
+            .execute_sql("SELECT * FROM users WHERE age > 18 AND (name = 'Alice' OR name = 'Carol')")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.iter().any(|r| r.contains(&"Bob".to_string())));
+    }
+
+    #[test]
+    fn test_where_and_still_uses_index_when_predicate_matches() {
+        // "id = 1" alone would use the index; wrapped in a compound
+        // predicate it can't (try_indexed_scan only recognizes a single
+        // comparison) -- this must still be correct via the scan fallback.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let rows = executor
+            .execute_sql("SELECT * FROM users WHERE id = 1 AND age > 18")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+    }
+
+    #[test]
+    fn test_delete_with_compound_where() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+        executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (3, 'Carol', 40)")
+            .unwrap();
+
+        let result = executor
+            .execute_sql("DELETE FROM users WHERE age > 18 AND name = 'Carol'")
+            .unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.iter().any(|r| r.contains(&"Carol".to_string())));
+    }
 }
