@@ -2,21 +2,28 @@
 //! `sql::parser` (literal values, WHERE-clause predicates) and the typed
 //! `Value`/`Tuple` rows the executor actually operates on.
 //!
-//! The predicate evaluator only understands a single `<left> <op> <right>`
-//! comparison (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`) — there's no expression
-//! tree to walk for `AND`/`OR`/parenthesized conditions (see
-//! `sql::parser`'s doc comment: a WHERE clause is still just a rendered
-//! string). `right` is resolved against the schema first — if it names a
-//! real column, this is a column-to-column comparison (what a `JOIN`
-//! condition like `"users.id = orders.user_id"` needs, once the executor
-//! has merged both sides' columns into one schema); otherwise it's parsed
-//! as a literal, same as before. `evaluate_predicate` returns `None` for
-//! anything it can't evaluate this way, and callers treat "can't evaluate"
-//! as "don't filter the row out" — a compound WHERE clause silently has no
-//! effect on results rather than erroring or (worse) dropping rows it
+//! `evaluate_predicate` understands a full boolean expression over
+//! `<left> <op> <right>` comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`)
+//! combined with `AND`/`OR` and parentheses, at standard precedence (`AND`
+//! binds tighter than `OR`) — it parses the flattened string itself (see
+//! `parse_bool_expr`) rather than walking a real expression tree, since
+//! there isn't one to walk (see `sql::parser`'s doc comment: a WHERE
+//! clause is still just a rendered string). `right` in each comparison is
+//! resolved against the schema first — if it names a real column, this is
+//! a column-to-column comparison (what a `JOIN` condition like
+//! `"users.id = orders.user_id"` needs, once the executor has merged both
+//! sides' columns into one schema); otherwise it's parsed as a literal.
+//!
+//! `evaluate_predicate` returns `None` for anything it can't parse or
+//! evaluate this way (an unrecognized token shape, an unknown column, a
+//! type mismatch on some branch), and callers treat "can't evaluate" as
+//! "don't filter the row out" — an unparseable WHERE clause silently has
+//! no effect on results rather than erroring or (worse) dropping rows it
 //! can't check. `execute_join` (in `execution::executor`) is the one
 //! exception: it treats an unrecognized join condition as an error rather
-//! than silently degrading to an unfiltered cross product.
+//! than silently degrading to an unfiltered cross product — and it only
+//! ever hands `split_comparison` a single comparison, never a full
+//! boolean expression, since a JOIN's `ON` clause here is scoped that way.
 
 use crate::execution::catalog::{DataType, TableSchema};
 use crate::execution::operators::{Tuple, Value};
@@ -48,62 +55,168 @@ pub fn value_to_string(value: &Value) -> String {
     }
 }
 
-/// Evaluate a flattened WHERE/JOIN-condition predicate against one row.
-/// `None` means "couldn't evaluate this" (unsupported shape, unknown
-/// column, type mismatch) — see module docs for how callers should treat
-/// that.
+/// Evaluate a flattened WHERE/JOIN-condition predicate against one row —
+/// see the module docs for exactly what shapes this understands and how
+/// callers should treat `None`.
 pub fn evaluate_predicate(predicate: &str, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
-    let (left, op, right) = split_comparison(predicate)?;
+    let tokens = tokenize_expr(predicate);
+    let mut parser = ExprParser { tokens: &tokens, pos: 0 };
+    let expr = parser.parse_or()?;
+    if parser.pos != tokens.len() {
+        return None; // trailing tokens the parser couldn't consume
+    }
+    eval_bool_expr(&expr, schema, tuple)
+}
 
+/// Split a flattened `<left> <op> <right>` comparison into its three
+/// tokens. `None` for anything else (a compound `AND`/`OR` condition, a
+/// bare boolean column, ...) — used where only a single comparison makes
+/// sense structurally (a `JOIN` condition, the primary-key index scan),
+/// not the general boolean-expression case `evaluate_predicate` handles.
+pub fn split_comparison(predicate: &str) -> Option<(String, String, String)> {
+    let tokens = tokenize_expr(predicate);
+    let [left, op, right]: [String; 3] = tokens.try_into().ok()?;
+    Some((left, op, right))
+}
+
+// ── Boolean expression grammar over comparisons ───────────────────────────
+//
+//   or_expr  := and_expr ("OR" and_expr)*
+//   and_expr := atom ("AND" atom)*
+//   atom     := "(" or_expr ")" | <token> <op> <token>
+//
+// Standard precedence: AND binds tighter than OR, parens override.
+
+#[derive(Debug, Clone)]
+enum BoolExpr {
+    Comparison { left: String, op: String, right: String },
+    And(Box<BoolExpr>, Box<BoolExpr>),
+    Or(Box<BoolExpr>, Box<BoolExpr>),
+}
+
+struct ExprParser<'a> {
+    tokens: &'a [String],
+    pos: usize,
+}
+
+impl<'a> ExprParser<'a> {
+    fn parse_or(&mut self) -> Option<BoolExpr> {
+        let mut left = self.parse_and()?;
+        while self.peek_keyword("OR") {
+            self.pos += 1;
+            let right = self.parse_and()?;
+            left = BoolExpr::Or(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_and(&mut self) -> Option<BoolExpr> {
+        let mut left = self.parse_atom()?;
+        while self.peek_keyword("AND") {
+            self.pos += 1;
+            let right = self.parse_atom()?;
+            left = BoolExpr::And(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_atom(&mut self) -> Option<BoolExpr> {
+        if self.peek() == Some("(") {
+            self.pos += 1;
+            let inner = self.parse_or()?;
+            if self.peek() != Some(")") {
+                return None;
+            }
+            self.pos += 1;
+            return Some(inner);
+        }
+
+        let left = self.advance()?.clone();
+        let op = self.advance()?.clone();
+        if !is_comparison_op(&op) {
+            return None;
+        }
+        let right = self.advance()?.clone();
+        Some(BoolExpr::Comparison { left, op, right })
+    }
+
+    fn peek(&self) -> Option<&str> {
+        self.tokens.get(self.pos).map(String::as_str)
+    }
+
+    fn peek_keyword(&self, kw: &str) -> bool {
+        self.peek().is_some_and(|t| t.eq_ignore_ascii_case(kw))
+    }
+
+    fn advance(&mut self) -> Option<&String> {
+        let t = self.tokens.get(self.pos);
+        self.pos += 1;
+        t
+    }
+}
+
+fn is_comparison_op(s: &str) -> bool {
+    matches!(s, "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=")
+}
+
+fn eval_bool_expr(expr: &BoolExpr, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
+    match expr {
+        BoolExpr::Comparison { left, op, right } => eval_comparison(left, op, right, schema, tuple),
+        BoolExpr::And(l, r) => Some(eval_bool_expr(l, schema, tuple)? && eval_bool_expr(r, schema, tuple)?),
+        BoolExpr::Or(l, r) => Some(eval_bool_expr(l, schema, tuple)? || eval_bool_expr(r, schema, tuple)?),
+    }
+}
+
+fn eval_comparison(left: &str, op: &str, right: &str, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
     let left_idx = schema.columns.iter().position(|c| c.name == left)?;
     let left_value = tuple.values.get(left_idx)?;
 
     let right_value = match schema.columns.iter().position(|c| c.name == right) {
         Some(right_idx) => tuple.values.get(right_idx)?.clone(),
-        None => parse_value(&right, schema.columns[left_idx].data_type),
+        None => parse_value(right, schema.columns[left_idx].data_type),
     };
 
-    compare(left_value, &op, &right_value)
+    compare(left_value, op, &right_value)
 }
 
-/// Split a flattened `<left> <op> <right>` comparison into its three
-/// tokens. `None` for anything else (a compound `AND`/`OR` condition, a
-/// bare boolean column, ...) — not a shape this evaluator understands.
-pub fn split_comparison(predicate: &str) -> Option<(String, String, String)> {
-    let tokens = tokenize(predicate)?;
-    let [left, op, right]: [String; 3] = tokens.try_into().ok()?;
-    Some((left, op, right))
-}
-
-/// Split on whitespace, respecting single-quoted string literals (so
-/// `name = 'John Smith'` tokenizes to 3 tokens, not 4). Returns `None`
-/// unless it's exactly 3 tokens.
-fn tokenize(predicate: &str) -> Option<Vec<String>> {
+/// Tokenize a predicate: whitespace-separated words, with `'...'` string
+/// literals kept intact (so `name = 'John Smith'` yields one token for the
+/// literal, not two) and `(`/`)` always split into their own tokens even
+/// with no surrounding whitespace.
+fn tokenize_expr(predicate: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
 
     for c in predicate.chars() {
-        if c == '\'' {
-            in_quotes = !in_quotes;
-            current.push(c);
-        } else if c.is_whitespace() && !in_quotes {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
+        match c {
+            '\'' => {
+                current.push(c);
+                in_quotes = !in_quotes;
+                if !in_quotes {
+                    tokens.push(std::mem::take(&mut current));
+                }
             }
-        } else {
-            current.push(c);
+            _ if in_quotes => current.push(c),
+            '(' | ')' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(c.to_string());
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
         }
     }
     if !current.is_empty() {
         tokens.push(current);
     }
 
-    if tokens.len() == 3 {
-        Some(tokens)
-    } else {
-        None
-    }
+    tokens
 }
 
 fn strip_quotes(s: &str) -> &str {
@@ -162,15 +275,23 @@ mod tests {
             nullable: false,
             primary_key: false,
         });
+        schema.add_column(Column {
+            id: 4,
+            name: "active".to_string(),
+            data_type: DataType::Boolean,
+            nullable: false,
+            primary_key: false,
+        });
         schema
     }
 
-    fn row(id: i64, name: &str, age: i64) -> Tuple {
+    fn row(id: i64, name: &str, age: i64, active: bool) -> Tuple {
         Tuple {
             values: vec![
                 Value::Integer(id),
                 Value::String(name.to_string()),
                 Value::Integer(age),
+                Value::Boolean(active),
             ],
         }
     }
@@ -189,21 +310,30 @@ mod tests {
     #[test]
     fn test_evaluate_numeric_predicate() {
         let schema = schema();
-        assert_eq!(evaluate_predicate("age > 18", &schema, &row(1, "Bob", 30)), Some(true));
-        assert_eq!(evaluate_predicate("age > 18", &schema, &row(1, "Kid", 10)), Some(false));
-        assert_eq!(evaluate_predicate("age >= 30", &schema, &row(1, "Bob", 30)), Some(true));
+        assert_eq!(
+            evaluate_predicate("age > 18", &schema, &row(1, "Bob", 30, true)),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_predicate("age > 18", &schema, &row(1, "Kid", 10, true)),
+            Some(false)
+        );
+        assert_eq!(
+            evaluate_predicate("age >= 30", &schema, &row(1, "Bob", 30, true)),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_evaluate_string_predicate_with_spaces() {
         let schema = schema();
-        let matching = row(1, "John Smith", 40);
+        let matching = row(1, "John Smith", 40, true);
         assert_eq!(
             evaluate_predicate("name = 'John Smith'", &schema, &matching),
             Some(true)
         );
         assert_eq!(
-            evaluate_predicate("name = 'John Smith'", &schema, &row(2, "Nobody", 40)),
+            evaluate_predicate("name = 'John Smith'", &schema, &row(2, "Nobody", 40, true)),
             Some(false)
         );
     }
@@ -211,15 +341,8 @@ mod tests {
     #[test]
     fn test_evaluate_unknown_column_returns_none() {
         let schema = schema();
-        assert_eq!(evaluate_predicate("height > 100", &schema, &row(1, "Bob", 30)), None);
-    }
-
-    #[test]
-    fn test_evaluate_compound_predicate_returns_none() {
-        // AND/OR aren't a shape this evaluator understands.
-        let schema = schema();
         assert_eq!(
-            evaluate_predicate("age > 18 AND id = 1", &schema, &row(1, "Bob", 30)),
+            evaluate_predicate("height > 100", &schema, &row(1, "Bob", 30, true)),
             None
         );
     }
@@ -229,7 +352,93 @@ mod tests {
         // Needed for JOIN conditions: "id = age" compares two columns of
         // the same row, not a column against a literal.
         let schema = schema();
-        assert_eq!(evaluate_predicate("id = age", &schema, &row(30, "Bob", 30)), Some(true));
-        assert_eq!(evaluate_predicate("id = age", &schema, &row(1, "Bob", 30)), Some(false));
+        assert_eq!(
+            evaluate_predicate("id = age", &schema, &row(30, "Bob", 30, true)),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_predicate("id = age", &schema, &row(1, "Bob", 30, true)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_evaluate_and() {
+        let schema = schema();
+        assert_eq!(
+            evaluate_predicate("age > 18 AND active = true", &schema, &row(1, "Bob", 30, true)),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_predicate("age > 18 AND active = true", &schema, &row(1, "Bob", 30, false)),
+            Some(false)
+        );
+        assert_eq!(
+            evaluate_predicate("age > 18 AND active = true", &schema, &row(1, "Kid", 10, true)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_evaluate_or() {
+        let schema = schema();
+        assert_eq!(
+            evaluate_predicate("name = 'Bob' OR name = 'Alice'", &schema, &row(1, "Alice", 30, true)),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_predicate("name = 'Bob' OR name = 'Alice'", &schema, &row(1, "Carol", 30, true)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_evaluate_and_binds_tighter_than_or() {
+        // "age > 18 AND active = true OR name = 'Kid'" should parse as
+        // "(age > 18 AND active = true) OR name = 'Kid'" -- a young,
+        // inactive row named "Kid" still matches via the OR branch alone.
+        let schema = schema();
+        let predicate = "age > 18 AND active = true OR name = 'Kid'";
+        assert_eq!(evaluate_predicate(predicate, &schema, &row(1, "Kid", 5, false)), Some(true));
+        assert_eq!(
+            evaluate_predicate(predicate, &schema, &row(1, "Other", 5, false)),
+            Some(false)
+        );
+        assert_eq!(evaluate_predicate(predicate, &schema, &row(1, "Bob", 30, true)), Some(true));
+    }
+
+    #[test]
+    fn test_evaluate_parenthesized_or_inside_and() {
+        // Without the parens this reduces to (age > 18 AND name = 'Bob')
+        // OR name = 'Alice', matching a very different set of rows -- this
+        // proves the parens are actually honored, not just parsed and
+        // discarded.
+        let schema = schema();
+        let predicate = "age > 18 AND (name = 'Bob' OR name = 'Alice')";
+        assert_eq!(
+            evaluate_predicate(predicate, &schema, &row(1, "Alice", 30, true)),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_predicate(predicate, &schema, &row(1, "Alice", 10, true)),
+            Some(false) // fails the AND's left side despite matching the OR
+        );
+        assert_eq!(
+            evaluate_predicate(predicate, &schema, &row(1, "Carol", 30, true)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_evaluate_malformed_compound_returns_none() {
+        let schema = schema();
+        assert_eq!(
+            evaluate_predicate("age > 18 AND", &schema, &row(1, "Bob", 30, true)),
+            None
+        );
+        assert_eq!(
+            evaluate_predicate("age > 18 AND active = true )", &schema, &row(1, "Bob", 30, true)),
+            None
+        );
     }
 }
