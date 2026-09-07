@@ -78,6 +78,17 @@ impl OLTPEngine {
         }
     }
 
+    /// Log a CREATE INDEX, if a WAL is configured. Called by
+    /// `QueryExecutor::execute_create_index` — same reasoning as
+    /// `log_schema_change`: this is a catalog-level event, not part of any
+    /// transaction's write set, so it doesn't go through `commit()`.
+    pub fn log_index_change(&self, table_id: u64, column: &str) -> Result<()> {
+        match &self.wal {
+            Some(wal) => wal.append(&WalRecord::CreateIndex { table_id, column: column.to_string() }),
+            None => Ok(()),
+        }
+    }
+
     /// Advance the commit clock to at least `ts` (used after replaying a
     /// WAL on startup, so the first new commit gets a timestamp past
     /// everything already replayed).

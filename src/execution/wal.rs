@@ -26,11 +26,14 @@ use crate::error::Result;
 use crate::execution::catalog::TableSchema;
 use crate::execution::mvcc_store::WriteOp;
 
-/// One durable event: either a new table's schema, or a transaction's
-/// committed write set.
+/// One durable event: a new table's schema, a CREATE INDEX (just the fact
+/// that `column` should be indexed on `table_id` — the index structure
+/// itself isn't persisted, it's rebuilt by backfill scan on recovery, see
+/// `execution::recovery`), or a transaction's committed write set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalRecord {
     CreateTable(TableSchema),
+    CreateIndex { table_id: u64, column: String },
     Commit { commit_ts: u64, ops: Vec<WriteOp> },
 }
 

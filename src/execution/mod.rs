@@ -14,6 +14,7 @@ pub mod oltp;
 pub mod learned_retention;
 pub mod row_codec;
 pub mod aggregate;
+pub mod secondary_index;
 
 pub use catalog::Catalog;
 pub use executor::QueryExecutor;

@@ -11,8 +11,14 @@ impl RecoveryManager {
     /// into `catalog` and `oltp`. Restores the commit clock past the
     /// highest replayed timestamp, so a new transaction after recovery
     /// never reuses one.
-    pub fn recover(records: Vec<WalRecord>, catalog: &mut Catalog, oltp: &OLTPEngine) {
+    ///
+    /// Returns the (table id, column) pairs any `CREATE INDEX`es named —
+    /// rebuilding the actual index structure needs schema-aware
+    /// deserialization (see `QueryExecutor::rebuild_secondary_index`),
+    /// which this layer, deliberately, doesn't have.
+    pub fn recover(records: Vec<WalRecord>, catalog: &mut Catalog, oltp: &OLTPEngine) -> Vec<(u64, String)> {
         let mut max_commit_ts = 0u64;
+        let mut index_specs = Vec::new();
 
         for record in records {
             match record {
@@ -20,6 +26,9 @@ impl RecoveryManager {
                     let table_id = schema.table_id as u64;
                     oltp.create_table(table_id);
                     catalog.register_table(schema);
+                }
+                WalRecord::CreateIndex { table_id, column } => {
+                    index_specs.push((table_id, column));
                 }
                 WalRecord::Commit { commit_ts, ops } => {
                     oltp.store.apply_write_set(&ops, commit_ts);
@@ -29,5 +38,6 @@ impl RecoveryManager {
         }
 
         oltp.restore_commit_clock(max_commit_ts);
+        index_specs
     }
 }
