@@ -124,12 +124,29 @@ impl QueryExecutor {
     /// column names disambiguate. A condition this executor can't
     /// recognize as comparing two real columns errors rather than silently
     /// degrading to an unfiltered cross product.
+    ///
+    /// A `Scan` immediately followed by a `Filter` comparing the primary
+    /// key to a literal (`id = 5`, `id > 10`, ...) is compiled into an
+    /// index-accelerated lookup (see `try_indexed_scan`) instead of a full
+    /// table scan — this is the one place the learned PGM index built on
+    /// `MVCCTable` (see `execution::mvcc_store`) actually gets used by a
+    /// query, rather than sitting proven only by its own unit tests.
+    /// Anything else still scans the whole table; that's always correct,
+    /// just not accelerated.
     pub fn execute(&self, plan: &PhysicalPlan) -> Result<Vec<Vec<String>>> {
         let mut current: Option<(TableSchema, Vec<Tuple>)> = None;
+        let mut nodes = plan.nodes.iter().peekable();
 
-        for node in &plan.nodes {
+        while let Some(node) = nodes.next() {
             match node {
                 LogicalPlanNode::Scan { table_name, .. } => {
+                    if let Some(LogicalPlanNode::Filter { predicate, .. }) = nodes.peek() {
+                        if let Some(indexed) = self.try_indexed_scan(table_name, predicate)? {
+                            nodes.next(); // the Filter is already applied by the index lookup
+                            current = Some(indexed);
+                            continue;
+                        }
+                    }
                     current = Some(self.scan_table_tuples(table_name)?);
                 }
                 LogicalPlanNode::Filter { predicate, .. } => {
@@ -217,6 +234,64 @@ impl QueryExecutor {
             .filter_map(|(_, bytes)| bincode::deserialize::<Tuple>(&bytes).ok())
             .collect();
         Ok((schema, tuples))
+    }
+
+    /// If `predicate` is a recognized comparison of `table_name`'s primary
+    /// key against a literal (`id = 5`, `id > 10`, ...), use the learned
+    /// PGM index (`MVCCTable::index_range`) to fetch only the candidate
+    /// rows instead of scanning the whole table. Each candidate is still
+    /// confirmed with a real point read — the index can hand back ids for
+    /// since-deleted rows, and that read (not the index) is what actually
+    /// decides visibility. `Ok(None)` for anything not shaped this way
+    /// (non-PK column, `!=`, an unparseable predicate, ...): the caller
+    /// falls back to a full scan, which is always correct, just slower.
+    fn try_indexed_scan(&self, table_name: &str, predicate: &str) -> Result<Option<(TableSchema, Vec<Tuple>)>> {
+        let schema = self.catalog.read().get_table(table_name).cloned().ok_or_else(|| {
+            DatabaseError::ExecutionError(format!("Unknown table '{table_name}'"))
+        })?;
+        let Some(pk_col) = schema.columns.iter().find(|c| c.primary_key) else {
+            return Ok(None);
+        };
+        let Some((left, op, right)) = row_codec::split_comparison(predicate) else {
+            return Ok(None);
+        };
+        if left != pk_col.name {
+            return Ok(None);
+        }
+        let Value::Integer(pk_value) = row_codec::parse_value(&right, pk_col.data_type) else {
+            // This system only ever assigns integer primary keys (see
+            // execute_insert), so a non-integer literal here can't match
+            // anything -- but that's a scan-and-find-nothing answer, not
+            // a shape this index path is equipped to give directly.
+            return Ok(None);
+        };
+        let pk_value = pk_value as f64;
+
+        let (min, max) = match op.as_str() {
+            "=" => (pk_value, pk_value),
+            ">" => (pk_value + 1.0, f64::MAX),
+            ">=" => (pk_value, f64::MAX),
+            "<" => (f64::MIN, pk_value - 1.0),
+            "<=" => (f64::MIN, pk_value),
+            _ => return Ok(None), // e.g. "!=" has no useful index range
+        };
+
+        let table_id = schema.table_id as u64;
+        let candidates = match self.oltp.store.get_table(table_id) {
+            Some(table) => table.index_range(min, max),
+            None => return Ok(Some((schema, Vec::new()))), // registered but never written to
+        };
+        let candidates: std::collections::HashSet<u64> = candidates.into_iter().collect();
+
+        let tuples = self.oltp.with_read_snapshot(|tx| {
+            candidates
+                .into_iter()
+                .filter_map(|row_id| self.oltp.read(tx, table_id, row_id).ok().flatten())
+                .filter_map(|bytes| bincode::deserialize::<Tuple>(&bytes).ok())
+                .collect::<Vec<_>>()
+        });
+
+        Ok(Some((schema, tuples)))
     }
 
     /// Build the schema for a joined row: `left`'s columns followed by
@@ -983,5 +1058,84 @@ mod tests {
         // anywhere. This is what every other test in this file relies on.
         let executor = QueryExecutor::new(users_catalog());
         assert!(executor.execute_sql("SELECT * FROM users").is_ok());
+    }
+
+    #[test]
+    fn test_indexed_point_lookup_on_primary_key() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // id 1 = Alice, id 2 = Bob
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE id = 1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+
+        // No match: empty, not an error.
+        let rows = executor.execute_sql("SELECT * FROM users WHERE id = 999").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_indexed_range_lookup_on_primary_key() {
+        let executor = QueryExecutor::new(users_catalog());
+        executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'A', 10)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (2, 'B', 20)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (3, 'C', 30)")
+            .unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE id > 1").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.iter().any(|r| r.contains(&"A".to_string())));
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE id <= 2").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_indexed_lookup_after_delete_excludes_deleted_row() {
+        // The index never removes a deleted row's id -- correctness must
+        // come from the point-read visibility check the index path still
+        // does per candidate, not from the index itself being accurate.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        executor.execute_sql("DELETE FROM users WHERE id = 1").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE id = 1").unwrap();
+        assert!(rows.is_empty());
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE id >= 1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Bob".to_string()));
+    }
+
+    #[test]
+    fn test_indexed_lookup_sees_update() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        executor
+            .execute_sql("UPDATE users SET age = 99 WHERE id = 1")
+            .unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE id = 1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"99".to_string()));
+    }
+
+    #[test]
+    fn test_non_primary_key_predicate_still_correct_without_index() {
+        // "name = ..." isn't the PK, so this must fall back to a full
+        // scan -- proving that path is still wired correctly too.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let rows = executor
+            .execute_sql("SELECT * FROM users WHERE name = 'Bob'")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Bob".to_string()));
     }
 }
