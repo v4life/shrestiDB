@@ -116,8 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### From Source
 
 ```bash
-git clone https://github.com/v4life/learned-db-kernel.git
-cd learned-db-kernel
+git clone https://github.com/v4life/shresti.git
+cd shresti
 cargo build --release
 ```
 

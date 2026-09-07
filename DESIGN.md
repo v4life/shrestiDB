@@ -1,8 +1,8 @@
-# Learned Database Kernel - Design Document
+# Shresti - Design Document
 
 ## Executive Summary
 
-The Learned Database Kernel is a production-grade relational database management system that leverages machine learning models throughout its architecture to achieve superior performance over traditional databases. By replacing rule-based heuristics with learned models, the system adapts to workload characteristics and data distributions for optimal performance.
+Shresti is a relational database kernel that leverages machine learning models throughout its architecture — indexing, query planning, and storage retention — rather than at a single layer. By replacing rule-based heuristics with learned models, the system adapts to workload characteristics and data distributions.
 
 ## 1. Architecture Overview
 
@@ -282,6 +282,6 @@ Entropy(data) -> Selector
 
 ## Conclusion
 
-The Learned Database Kernel demonstrates that integrating machine learning throughout a database system can deliver significant performance improvements over traditional approaches. By learning from data and workload characteristics, the system adapts to diverse scenarios while maintaining ACID compliance and ease of use.
+Shresti demonstrates that integrating machine learning throughout a database system can deliver significant performance improvements over traditional approaches. By learning from data and workload characteristics, the system adapts to diverse scenarios while maintaining ACID compliance and ease of use.
 
 The architecture is production-ready for OLTP and analytical workloads, with clear paths for further optimization and feature enhancement.

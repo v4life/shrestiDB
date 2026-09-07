@@ -1,6 +1,6 @@
-//! Database kernel CLI server
+//! Shresti CLI server
 //!
-//! Entry point for the learned database kernel server.
+//! Entry point for the Shresti database kernel server.
 
 use shresti::VERSION;
 use tracing::{info, Level};
@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(Level::INFO)
         .init();
 
-    info!("Starting Learned Database Kernel v{}", VERSION);
+    info!("Starting Shresti v{}", VERSION);
 
     // TODO: Initialize server components
     // - Storage manager

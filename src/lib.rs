@@ -1,7 +1,7 @@
-//! Learned Database Kernel
+//! Shresti
 //!
-//! A production-grade database kernel with ML-driven indexing, query optimization,
-//! and adaptive buffer management.
+//! A database kernel with ML-driven indexing, query optimization, and
+//! adaptive buffer management.
 
 pub mod compute;
 pub mod distributed;
