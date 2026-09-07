@@ -25,6 +25,7 @@ pub enum SQLStatement {
     Update(UpdateStatement),
     Delete(DeleteStatement),
     CreateTable(CreateTableStatement),
+    CreateIndex(CreateIndexStatement),
 }
 
 /// One `JOIN` clause: the joined table and its `ON` condition, rendered as
@@ -97,6 +98,17 @@ pub struct CreateTableStatement {
     pub columns: Vec<ColumnDef>,
 }
 
+/// `CREATE INDEX <name> ON <table>(<column>)`. Only a single indexed
+/// column is supported — if the statement names more than one, every
+/// column after the first is silently dropped rather than rejected; this
+/// is a deliberate MVP scope boundary, not an oversight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateIndexStatement {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+}
+
 /// SQL Parser
 pub struct SQLParser;
 
@@ -121,6 +133,7 @@ impl SQLParser {
             AstStatement::Update(update) => Self::convert_update(update),
             AstStatement::Delete(delete) => Self::convert_delete(delete),
             AstStatement::CreateTable(create) => Self::convert_create_table(create),
+            AstStatement::CreateIndex(create) => Self::convert_create_index(create),
             other => Err(DatabaseError::ParseError(format!(
                 "Unsupported statement: {other}"
             ))),
@@ -314,6 +327,21 @@ impl SQLParser {
 
         Ok(SQLStatement::CreateTable(CreateTableStatement { name, columns }))
     }
+
+    fn convert_create_index(create: ast::CreateIndex) -> Result<SQLStatement> {
+        let name = create
+            .name
+            .map(|n| n.to_string())
+            .ok_or_else(|| DatabaseError::ParseError("CREATE INDEX requires a name".to_string()))?;
+        let table = create.table_name.to_string();
+        let column = create
+            .columns
+            .first()
+            .map(|c| c.column.expr.to_string())
+            .ok_or_else(|| DatabaseError::ParseError("CREATE INDEX requires a column".to_string()))?;
+
+        Ok(SQLStatement::CreateIndex(CreateIndexStatement { name, table, column }))
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +472,20 @@ mod tests {
                 assert!(!c.columns[2].nullable);
             }
             _ => panic!("Expected CREATE TABLE statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_index() {
+        let sql = "CREATE INDEX idx_users_name ON users (name)";
+        let stmt = SQLParser::parse(sql).unwrap();
+        match stmt {
+            SQLStatement::CreateIndex(c) => {
+                assert_eq!(c.name, "idx_users_name");
+                assert_eq!(c.table, "users");
+                assert_eq!(c.column, "name");
+            }
+            _ => panic!("Expected CREATE INDEX statement"),
         }
     }
 

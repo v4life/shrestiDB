@@ -23,6 +23,7 @@
 //! to rebuild catalog + row state before returning — so a restart doesn't
 //! lose data.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{DatabaseError, Result};
@@ -33,12 +34,14 @@ use crate::execution::oltp::OLTPEngine;
 use crate::execution::operators::{Tuple, Value};
 use crate::execution::recovery::RecoveryManager;
 use crate::execution::row_codec;
+use crate::execution::secondary_index::SecondaryIndex;
 use crate::execution::transaction::TransactionId;
 use crate::execution::wal::WriteAheadLog;
 use crate::optimizer::planner::{LogicalPlanNode, PhysicalPlan, QueryPlanner};
 use crate::sql::binder::Binder;
 use crate::sql::parser::{
-    CreateTableStatement, DeleteStatement, InsertStatement, SQLParser, SQLStatement, UpdateStatement,
+    CreateIndexStatement, CreateTableStatement, DeleteStatement, InsertStatement, SQLParser, SQLStatement,
+    UpdateStatement,
 };
 use parking_lot::RwLock;
 
@@ -55,6 +58,13 @@ pub struct QueryExecutor {
     pub catalog: RwLock<Catalog>,
     pub oltp: OLTPEngine,
     pub planner: QueryPlanner,
+    /// Secondary indexes created via `CREATE INDEX`, keyed by (table id,
+    /// indexed column name). Live at this layer rather than inside
+    /// `MVCCTable`/`OLTPEngine` because building and maintaining one needs
+    /// schema knowledge (which byte offset in a deserialized `Tuple` holds
+    /// the indexed column) that those lower, byte-oriented layers
+    /// deliberately don't have.
+    secondary_indexes: RwLock<HashMap<(u64, String), SecondaryIndex>>,
 }
 
 impl QueryExecutor {
@@ -65,6 +75,7 @@ impl QueryExecutor {
             catalog: RwLock::new(catalog),
             oltp: OLTPEngine::new(),
             planner: QueryPlanner::new(),
+            secondary_indexes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -72,17 +83,28 @@ impl QueryExecutor {
     /// whatever's already logged there to rebuild the catalog and row
     /// state, then returns an executor where every future CREATE TABLE and
     /// every future commit is logged to that file before it takes effect.
+    /// Any `CREATE INDEX`es logged in the WAL are rebuilt by backfill-
+    /// scanning their table's now-recovered rows (see
+    /// `rebuild_secondary_index`) — the index structure itself isn't what
+    /// gets persisted, just the fact that it should exist.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let (wal, records) = WriteAheadLog::open(path)?;
         let mut catalog = Catalog::new();
         let oltp = OLTPEngine::with_wal(wal);
-        RecoveryManager::recover(records, &mut catalog, &oltp);
+        let index_specs = RecoveryManager::recover(records, &mut catalog, &oltp);
 
-        Ok(QueryExecutor {
+        let executor = QueryExecutor {
             catalog: RwLock::new(catalog),
             oltp,
             planner: QueryPlanner::new(),
-        })
+            secondary_indexes: RwLock::new(HashMap::new()),
+        };
+
+        for (table_id, column) in index_specs {
+            executor.rebuild_secondary_index(table_id, &column)?;
+        }
+
+        Ok(executor)
     }
 
     /// Parse, bind, and run a SQL statement end to end.
@@ -112,6 +134,10 @@ impl QueryExecutor {
             }
             SQLStatement::CreateTable(create) => {
                 self.execute_create_table(create)?;
+                Ok(Vec::new())
+            }
+            SQLStatement::CreateIndex(create) => {
+                self.execute_create_index(create)?;
                 Ok(Vec::new())
             }
         }
@@ -285,16 +311,36 @@ impl QueryExecutor {
         let schema = self.catalog.read().get_table(table_name).cloned().ok_or_else(|| {
             DatabaseError::ExecutionError(format!("Unknown table '{table_name}'"))
         })?;
-        let Some(pk_col) = schema.columns.iter().find(|c| c.primary_key) else {
+        let Some((left, op, right)) = row_codec::split_comparison(predicate) else {
             return Ok(None);
         };
-        let Some((left, op, right)) = row_codec::split_comparison(predicate) else {
+
+        if let Some(result) = self.try_pk_index_scan(&schema, &left, &op, &right)? {
+            return Ok(Some(result));
+        }
+        self.try_secondary_index_scan(&schema, &left, &op, &right, predicate)
+    }
+
+    /// Primary-key path: uses `MVCCTable::index_range` (the learned PGM
+    /// index over row ids, which — because a row id is always its
+    /// primary-key value — doubles as a PK index). No re-verification of
+    /// candidates against the predicate is needed here: a row's PK can
+    /// never change (`execute_update` rejects that), so a candidate row id
+    /// in `[min, max]` is definitionally correct, not just probably so.
+    fn try_pk_index_scan(
+        &self,
+        schema: &TableSchema,
+        left: &str,
+        op: &str,
+        right: &str,
+    ) -> Result<Option<(TableSchema, Vec<Tuple>)>> {
+        let Some(pk_col) = schema.columns.iter().find(|c| c.primary_key) else {
             return Ok(None);
         };
         if left != pk_col.name {
             return Ok(None);
         }
-        let Value::Integer(pk_value) = row_codec::parse_value(&right, pk_col.data_type) else {
+        let Value::Integer(pk_value) = row_codec::parse_value(right, pk_col.data_type) else {
             // This system only ever assigns integer primary keys (see
             // execute_insert), so a non-integer literal here can't match
             // anything -- but that's a scan-and-find-nothing answer, not
@@ -303,7 +349,7 @@ impl QueryExecutor {
         };
         let pk_value = pk_value as f64;
 
-        let (min, max) = match op.as_str() {
+        let (min, max) = match op {
             "=" => (pk_value, pk_value),
             ">" => (pk_value + 1.0, f64::MAX),
             ">=" => (pk_value, f64::MAX),
@@ -315,7 +361,7 @@ impl QueryExecutor {
         let table_id = schema.table_id as u64;
         let candidates = match self.oltp.store.get_table(table_id) {
             Some(table) => table.index_range(min, max),
-            None => return Ok(Some((schema, Vec::new()))), // registered but never written to
+            None => return Ok(Some((schema.clone(), Vec::new()))), // registered but never written to
         };
         let candidates: std::collections::HashSet<u64> = candidates.into_iter().collect();
 
@@ -327,7 +373,58 @@ impl QueryExecutor {
                 .collect::<Vec<_>>()
         });
 
-        Ok(Some((schema, tuples)))
+        Ok(Some((schema.clone(), tuples)))
+    }
+
+    /// Secondary-index path: uses a `SecondaryIndex` registered via
+    /// `CREATE INDEX`, if one exists for `left`'s column on this table.
+    /// Unlike the PK path, a candidate here genuinely can be stale — an
+    /// `UPDATE` adds a new index entry for a row's new value but never
+    /// removes the old one (see `secondary_index` module docs), so a
+    /// candidate's *current* value might not actually match anymore.
+    /// Every candidate is therefore re-checked with the exact predicate
+    /// before being included, not just assumed correct because the index
+    /// produced it.
+    fn try_secondary_index_scan(
+        &self,
+        schema: &TableSchema,
+        left: &str,
+        op: &str,
+        right: &str,
+        full_predicate: &str,
+    ) -> Result<Option<(TableSchema, Vec<Tuple>)>> {
+        let table_id = schema.table_id as u64;
+        let candidates = {
+            let indexes = self.secondary_indexes.read();
+            let Some(index) = indexes.get(&(table_id, left.to_string())) else {
+                return Ok(None);
+            };
+            let Some(col) = schema.columns.iter().find(|c| c.name == left) else {
+                return Ok(None);
+            };
+            let literal = row_codec::parse_value(right, col.data_type);
+            use std::ops::Bound;
+            match op {
+                "=" => index.equals(&literal),
+                ">" => index.range(Bound::Excluded(literal), Bound::Unbounded),
+                ">=" => index.range(Bound::Included(literal), Bound::Unbounded),
+                "<" => index.range(Bound::Unbounded, Bound::Excluded(literal)),
+                "<=" => index.range(Bound::Unbounded, Bound::Included(literal)),
+                _ => return Ok(None), // e.g. "!=" has no useful index range
+            }
+        };
+        let candidates: std::collections::HashSet<u64> = candidates.into_iter().collect();
+
+        let tuples = self.oltp.with_read_snapshot(|tx| {
+            candidates
+                .into_iter()
+                .filter_map(|row_id| self.oltp.read(tx, table_id, row_id).ok().flatten())
+                .filter_map(|bytes| bincode::deserialize::<Tuple>(&bytes).ok())
+                .filter(|tuple| row_codec::evaluate_predicate(full_predicate, schema, tuple).unwrap_or(false))
+                .collect::<Vec<_>>()
+        });
+
+        Ok(Some((schema.clone(), tuples)))
     }
 
     /// Build the schema for a joined row: `left`'s columns followed by
@@ -379,6 +476,10 @@ impl QueryExecutor {
         self.oltp.create_table(table_id);
 
         let tx = self.oltp.begin();
+        // Secondary indexes are only updated once the transaction actually
+        // commits (below) -- updating them eagerly here would leave stale
+        // entries behind for a row that turned out to be aborted.
+        let mut indexed_rows: Vec<(u64, Vec<Value>)> = Vec::new();
         for row in &insert.values {
             let ordered = match Self::order_insert_row(&insert, &schema, row) {
                 Ok(v) => v,
@@ -398,6 +499,8 @@ impl QueryExecutor {
                 }
             };
 
+            indexed_rows.push((row_id, ordered.clone()));
+
             let data = match bincode::serialize(&Tuple { values: ordered }) {
                 Ok(d) => d,
                 Err(e) => {
@@ -413,6 +516,11 @@ impl QueryExecutor {
         }
         let affected = insert.values.len();
         self.oltp.commit(tx)?;
+
+        for (row_id, values) in indexed_rows {
+            self.index_row_in_secondary_indexes(table_id, row_id, &schema, &values);
+        }
+
         Ok(affected)
     }
 
@@ -452,6 +560,9 @@ impl QueryExecutor {
         let rows = self.oltp.scan_table(tx, table_id);
 
         let mut affected = 0usize;
+        // See execute_insert: secondary indexes are only updated once the
+        // transaction actually commits, below.
+        let mut indexed_rows: Vec<(u64, Vec<Value>)> = Vec::new();
         for (row_id, bytes) in rows {
             let Ok(mut tuple) = bincode::deserialize::<Tuple>(&bytes) else {
                 continue; // unreadable row: skip rather than fail the whole statement
@@ -468,6 +579,7 @@ impl QueryExecutor {
             for (idx, value) in &assignments {
                 tuple.values[*idx] = value.clone();
             }
+            indexed_rows.push((row_id, tuple.values.clone()));
 
             let data = match bincode::serialize(&tuple) {
                 Ok(d) => d,
@@ -485,6 +597,11 @@ impl QueryExecutor {
         }
 
         self.oltp.commit(tx)?;
+
+        for (row_id, values) in indexed_rows {
+            self.index_row_in_secondary_indexes(table_id, row_id, &schema, &values);
+        }
+
         Ok(affected)
     }
 
@@ -556,6 +673,73 @@ impl QueryExecutor {
 
         self.oltp.create_table(table_id as u64);
         Ok(())
+    }
+
+    /// Execute a CREATE INDEX: logs the (table, column) to the WAL (so a
+    /// restart knows to rebuild it — see `open`), then builds it now by
+    /// backfill-scanning the table's current rows.
+    fn execute_create_index(&self, create: CreateIndexStatement) -> Result<()> {
+        let table_id = {
+            let catalog = self.catalog.read();
+            let schema = catalog.get_table(&create.table).ok_or_else(|| {
+                DatabaseError::ExecutionError(format!("Unknown table '{}'", create.table))
+            })?;
+            if !schema.columns.iter().any(|c| c.name == create.column) {
+                return Err(DatabaseError::ExecutionError(format!(
+                    "Unknown column '{}' on table '{}'",
+                    create.column, create.table
+                )));
+            }
+            schema.table_id as u64
+        };
+
+        self.oltp.log_index_change(table_id, &create.column)?;
+        self.rebuild_secondary_index(table_id, &create.column)
+    }
+
+    /// (Re)build a secondary index for `table_id`'s `column` from whatever
+    /// rows currently exist, replacing any previous index for that column.
+    fn rebuild_secondary_index(&self, table_id: u64, column: &str) -> Result<()> {
+        let schema = self
+            .catalog
+            .read()
+            .get_table_by_id(table_id as u32)
+            .cloned()
+            .ok_or_else(|| DatabaseError::ExecutionError(format!("Unknown table id {table_id}")))?;
+        let col_idx = schema.columns.iter().position(|c| c.name == column).ok_or_else(|| {
+            DatabaseError::ExecutionError(format!("Unknown column '{column}'"))
+        })?;
+
+        let rows = self.oltp.with_read_snapshot(|tx| self.oltp.scan_table(tx, table_id));
+        let mut index = SecondaryIndex::new();
+        for (row_id, bytes) in rows {
+            if let Ok(tuple) = bincode::deserialize::<Tuple>(&bytes) {
+                if let Some(value) = tuple.values.get(col_idx) {
+                    index.insert(value.clone(), row_id);
+                }
+            }
+        }
+
+        self.secondary_indexes.write().insert((table_id, column.to_string()), index);
+        Ok(())
+    }
+
+    /// Add `row`'s value for every column with a registered secondary
+    /// index. Called after a successful INSERT or UPDATE (an UPDATE only
+    /// adds the *new* value's entry — see `secondary_index`'s module docs
+    /// for why the old one is safely left stale rather than removed).
+    fn index_row_in_secondary_indexes(&self, table_id: u64, row_id: u64, schema: &TableSchema, row: &[Value]) {
+        let mut indexes = self.secondary_indexes.write();
+        if indexes.is_empty() {
+            return;
+        }
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if let Some(index) = indexes.get_mut(&(table_id, col.name.clone())) {
+                if let Some(value) = row.get(idx) {
+                    index.insert(value.clone(), row_id);
+                }
+            }
+        }
     }
 
     /// Map a rendered DDL type string (e.g. `"VARCHAR(50)"`, `"BIGINT"`) onto
@@ -1326,5 +1510,115 @@ mod tests {
         let rows = executor.execute_sql("SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 2);
         assert!(!rows.iter().any(|r| r.contains(&"Carol".to_string())));
+    }
+
+    #[test]
+    fn test_create_index_backfills_existing_rows() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15 -- inserted before the index exists
+
+        executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE name = 'Bob'").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Bob".to_string()));
+    }
+
+    #[test]
+    fn test_secondary_index_equality_and_range() {
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_age ON users (age)").unwrap();
+        seed_users(&executor); // Alice 30, Bob 15
+        executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (3, 'Carol', 40)")
+            .unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE age = 30").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE age > 18").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.iter().any(|r| r.contains(&"Bob".to_string())));
+    }
+
+    #[test]
+    fn test_secondary_index_no_matches_is_empty_not_error() {
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+        seed_users(&executor);
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE name = 'Zed'").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_secondary_index_reflects_update_to_indexed_column() {
+        // The stale old-value entry the index leaves behind after an
+        // UPDATE (see secondary_index module docs) must not cause the row
+        // to wrongly appear under its old value, and it must be findable
+        // under its new value.
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+        seed_users(&executor); // Alice 30, Bob 15
+
+        executor
+            .execute_sql("UPDATE users SET name = 'Robert' WHERE name = 'Bob'")
+            .unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE name = 'Bob'").unwrap();
+        assert!(rows.is_empty(), "stale index entry must not resurrect the old value");
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE name = 'Robert'").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"15".to_string()));
+    }
+
+    #[test]
+    fn test_secondary_index_excludes_deleted_row() {
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+        seed_users(&executor); // Alice 30, Bob 15
+
+        executor.execute_sql("DELETE FROM users WHERE name = 'Bob'").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE name = 'Bob'").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_create_index_unknown_table_errors() {
+        let executor = QueryExecutor::new(users_catalog());
+        assert!(executor.execute_sql("CREATE INDEX idx ON ghosts (name)").is_err());
+    }
+
+    #[test]
+    fn test_secondary_index_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        {
+            let executor = QueryExecutor::open(&wal_path).unwrap();
+            executor
+                .execute_sql("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50), age INT)")
+                .unwrap();
+            executor
+                .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+                .unwrap();
+            executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+            executor
+                .execute_sql("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 15)")
+                .unwrap();
+            // Dropped here -- simulates the process exiting.
+        }
+
+        let reopened = QueryExecutor::open(&wal_path).unwrap();
+        // Both the pre- and post-CREATE-INDEX rows must be findable: the
+        // index is rebuilt by backfill scan over the fully-recovered
+        // table, not by replaying inserts against a stale index snapshot.
+        let rows = reopened.execute_sql("SELECT * FROM users WHERE name = 'Alice'").unwrap();
+        assert_eq!(rows.len(), 1);
+        let rows = reopened.execute_sql("SELECT * FROM users WHERE name = 'Bob'").unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }

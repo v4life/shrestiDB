@@ -81,6 +81,10 @@ impl<'a> Binder<'a> {
                 }
                 Ok(())
             }
+            SQLStatement::CreateIndex(c) => {
+                let table = self.require_table(&c.table)?;
+                self.check_column(table, &c.column)
+            }
         }
     }
 
@@ -210,5 +214,29 @@ mod tests {
         let binder = Binder::new(&catalog);
         let stmt = SQLParser::parse("CREATE TABLE orders (id INT)").unwrap();
         assert!(binder.bind(&stmt).is_ok());
+    }
+
+    #[test]
+    fn test_bind_create_index_success() {
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
+        let stmt = SQLParser::parse("CREATE INDEX idx ON users (name)").unwrap();
+        assert!(binder.bind(&stmt).is_ok());
+    }
+
+    #[test]
+    fn test_bind_create_index_unknown_table() {
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
+        let stmt = SQLParser::parse("CREATE INDEX idx ON ghosts (name)").unwrap();
+        assert!(binder.bind(&stmt).is_err());
+    }
+
+    #[test]
+    fn test_bind_create_index_unknown_column() {
+        let catalog = catalog_with_users();
+        let binder = Binder::new(&catalog);
+        let stmt = SQLParser::parse("CREATE INDEX idx ON users (nope)").unwrap();
+        assert!(binder.bind(&stmt).is_err());
     }
 }
