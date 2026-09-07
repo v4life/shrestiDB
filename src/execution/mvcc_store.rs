@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 pub const TS_INFINITY: u64 = u64::MAX;
 
@@ -81,7 +82,7 @@ impl VersionChain {
 
 // ── Buffered write ops (pending inside a transaction) ─────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WriteOp {
     Insert { table_id: u64, row_id: u64, data: Vec<u8> },
     Update { table_id: u64, row_id: u64, data: Vec<u8> },

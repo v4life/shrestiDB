@@ -9,9 +9,13 @@
 //!   3. `write()` acquires an exclusive lock and buffers the op — nothing is
 //!      applied to the MVCC store until commit, so other transactions never
 //!      see uncommitted writes.
-//!   4. `commit()` assigns a commit timestamp, applies the buffered write set
-//!      atomically, then releases all locks. `abort()` discards the write set
-//!      and releases all locks.
+//!   4. `commit()` assigns a commit timestamp, durably logs the write set to
+//!      the WAL (if one is configured — see `with_wal`) and only then
+//!      applies it and releases all locks. If the WAL write fails, the
+//!      transaction is aborted rather than applied: an in-memory-only
+//!      "commit" that isn't actually durable would be a correctness bug,
+//!      not a degraded feature. `abort()` discards the write set and
+//!      releases all locks.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,12 +26,17 @@ use crate::execution::learned_retention::RetentionPredictor;
 use crate::execution::lock_manager::{LockKey, LockManager};
 use crate::execution::mvcc_store::{MVCCStore, WriteOp};
 use crate::execution::transaction::{TransactionId, TransactionManager};
+use crate::execution::wal::{WalRecord, WriteAheadLog};
 
 pub struct OLTPEngine {
     pub transactions: TransactionManager,
     pub locks: LockManager,
     pub store: MVCCStore,
     pub retention: RetentionPredictor,
+    /// `None` means no durability: writes only ever live in memory (the
+    /// original behavior, still what every in-process test uses). `Some`
+    /// means every commit is logged to disk before it takes effect.
+    wal: Option<WriteAheadLog>,
     commit_clock: AtomicU64,
     write_sets: Mutex<HashMap<u64, Vec<WriteOp>>>,
     snapshots: Mutex<HashMap<u64, u64>>,
@@ -40,10 +49,40 @@ impl OLTPEngine {
             locks: LockManager::new(),
             store: MVCCStore::new(),
             retention: RetentionPredictor::new(),
+            wal: None,
             commit_clock: AtomicU64::new(0),
             write_sets: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A durable engine: every commit is logged to `wal` before it takes
+    /// effect. The caller (see `QueryExecutor::open`) is responsible for
+    /// having already replayed `wal`'s existing records into this engine's
+    /// store (and a catalog) before handing it out for new queries.
+    pub fn with_wal(wal: WriteAheadLog) -> Self {
+        OLTPEngine {
+            wal: Some(wal),
+            ..Self::new()
+        }
+    }
+
+    /// Log a schema change (CREATE TABLE) to the WAL, if one is configured.
+    /// Called by `QueryExecutor::execute_create_table` — schema changes
+    /// aren't part of a transaction's write set, so they don't go through
+    /// `commit()`.
+    pub fn log_schema_change(&self, schema: &crate::execution::catalog::TableSchema) -> Result<()> {
+        match &self.wal {
+            Some(wal) => wal.append(&WalRecord::CreateTable(schema.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Advance the commit clock to at least `ts` (used after replaying a
+    /// WAL on startup, so the first new commit gets a timestamp past
+    /// everything already replayed).
+    pub fn restore_commit_clock(&self, ts: u64) {
+        self.commit_clock.fetch_max(ts, Ordering::SeqCst);
     }
 
     /// Create a table in the underlying MVCC store (idempotent).
@@ -132,9 +171,22 @@ impl OLTPEngine {
     /// now (see `learned_retention.rs`). The sweep itself is always safe —
     /// it only drops versions no active snapshot could still need — so a
     /// wrong prediction costs efficiency, never correctness.
-    pub fn commit(&self, tx_id: TransactionId) {
+    pub fn commit(&self, tx_id: TransactionId) -> Result<()> {
         let ops = self.write_sets.lock().unwrap().remove(&tx_id.0).unwrap_or_default();
         let commit_ts = self.commit_clock.fetch_add(1, Ordering::SeqCst) + 1;
+
+        if let Some(wal) = &self.wal {
+            if !ops.is_empty() {
+                if let Err(e) = wal.append(&WalRecord::Commit { commit_ts, ops: ops.clone() }) {
+                    // Not durable: treat this as an abort, not a commit.
+                    self.transactions.abort(tx_id);
+                    self.locks.release_all(tx_id);
+                    self.snapshots.lock().unwrap().remove(&tx_id.0);
+                    return Err(e);
+                }
+            }
+        }
+
         self.store.apply_write_set(&ops, commit_ts);
         self.transactions.commit(tx_id);
         self.locks.release_all(tx_id);
@@ -149,6 +201,8 @@ impl OLTPEngine {
                 self.retention.record_prune_result(table_id, row_id, removed);
             }
         }
+
+        Ok(())
     }
 
     /// Abort: discard the buffered write set (nothing ever touched the
@@ -205,7 +259,7 @@ mod tests {
         engine.write(tx, insert(1, 1, "hello")).unwrap();
         assert_eq!(engine.read(tx, 1, 1).unwrap(), Some(b"hello".to_vec()));
 
-        engine.commit(tx);
+        engine.commit(tx).unwrap();
     }
 
     #[test]
@@ -219,7 +273,7 @@ mod tests {
         engine.write(writer, insert(1, 1, "v1")).unwrap();
         // Not visible to `reader`: uncommitted, and `reader`'s snapshot predates the commit.
         assert_eq!(engine.read(reader, 1, 1).unwrap(), None);
-        engine.commit(writer);
+        engine.commit(writer).unwrap();
 
         // Still not visible: `reader`'s snapshot was taken before the commit.
         assert_eq!(engine.read(reader, 1, 1).unwrap(), None);
@@ -264,7 +318,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            engine.commit(tx);
+            engine.commit(tx).unwrap();
         }
 
         let versions = engine.store.table(1).version_count(1);
@@ -284,7 +338,7 @@ mod tests {
 
         let tx0 = engine.begin();
         engine.write(tx0, insert(1, 1, "v0")).unwrap();
-        engine.commit(tx0);
+        engine.commit(tx0).unwrap();
 
         // Reader starts a snapshot right after v0 commits, but doesn't read yet.
         let reader = engine.begin();
@@ -304,7 +358,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            engine.commit(tx);
+            engine.commit(tx).unwrap();
         }
 
         // `reader`'s snapshot predates every one of those updates, so it
@@ -330,7 +384,7 @@ mod tests {
         });
 
         thread::sleep(Duration::from_millis(10));
-        engine.commit(tx1); // releases the lock, unblocking tx2's writer
+        engine.commit(tx1).unwrap(); // releases the lock, unblocking tx2's writer
 
         assert!(handle.join().unwrap().is_ok());
     }
