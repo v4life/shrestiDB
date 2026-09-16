@@ -1,4 +1,4 @@
-# Shresti
+# ShrestiDB
 
 A relational database kernel written in Rust that leverages machine learning models throughout its architecture — indexing, query planning, and storage retention — instead of just at one layer.
 
@@ -75,7 +75,7 @@ A relational database kernel written in Rust that leverages machine learning mod
 ## 📁 Project Structure
 
 ```
-shresti/
+shrestidb/
 ├── Cargo.toml                          # Rust dependencies
 ├── README.md                           # This file
 ├── DESIGN.md                           # Comprehensive design document
@@ -323,7 +323,7 @@ This project demonstrates several novel contributions:
 ## 📊 Benchmark Results
 
 ### TPC-H Simulation (1M records)
-| Query | Shresti | Traditional DB | Speedup |
+| Query | ShrestiDB | Traditional DB | Speedup |
 |-------|-----------|----------------|---------|
 | Range Scan | 1.2ms | 12ms | 10x |
 | Aggregation | 45ms | 90ms | 2x |
@@ -380,8 +380,8 @@ For issues, questions, or suggestions:
 
 ```bash
 # Clone and build
-git clone https://github.com/v4life/shresti.git
-cd shresti
+git clone https://github.com/v4life/shrestidb.git
+cd shrestidb
 cargo build --release
 
 # Run example

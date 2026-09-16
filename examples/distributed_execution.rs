@@ -2,9 +2,9 @@
 //!
 //! Demonstrates distributed query processing across multiple worker nodes.
 
-use shresti::distributed::coordinator::{QueryCoordinator, WorkerInfo};
-use shresti::distributed::partitioner::{DataPartitioner, PartitionStrategy};
-use shresti::distributed::distributed_plan::{
+use shrestidb::distributed::coordinator::{QueryCoordinator, WorkerInfo};
+use shrestidb::distributed::partitioner::{DataPartitioner, PartitionStrategy};
+use shrestidb::distributed::distributed_plan::{
     DistributedPlan, DistributedStage,
 };
 use std::time::Instant;
@@ -42,7 +42,7 @@ fn main() {
     // Create data partitioner
     let mut partitioner = DataPartitioner::new(4, PartitionStrategy::Range);
     for i in 0..4 {
-        use shresti::distributed::partitioner::Partition;
+        use shrestidb::distributed::partitioner::Partition;
         let partition = Partition {
             id: i,
             start_key: (i as f64 * 250_000.0),

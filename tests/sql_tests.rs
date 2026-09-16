@@ -2,8 +2,8 @@
 
 #[cfg(test)]
 mod sql_tests {
-    use shresti::execution::catalog::{Catalog, TableSchema, Column, DataType};
-    use shresti::optimizer::planner::QueryPlanner;
+    use shrestidb::execution::catalog::{Catalog, TableSchema, Column, DataType};
+    use shrestidb::optimizer::planner::QueryPlanner;
 
     #[test]
     fn test_simple_select_parsing() {

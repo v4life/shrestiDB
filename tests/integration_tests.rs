@@ -2,14 +2,14 @@
 
 #[cfg(test)]
 mod tests {
-    use shresti::index::pgm::PGMIndex;
-    use shresti::index::btree::BTree;
-    use shresti::index::rmi::{RMIIndex, RMIStage};
-    use shresti::index::models::LinearModel;
-    use shresti::optimizer::cardinality::LearnedCardinalityEstimator;
-    use shresti::optimizer::cost_model::CostModel;
-    use shresti::execution::catalog::Catalog;
-    use shresti::execution::transaction::TransactionManager;
+    use shrestidb::index::pgm::PGMIndex;
+    use shrestidb::index::btree::BTree;
+    use shrestidb::index::rmi::{RMIIndex, RMIStage};
+    use shrestidb::index::models::LinearModel;
+    use shrestidb::optimizer::cardinality::LearnedCardinalityEstimator;
+    use shrestidb::optimizer::cost_model::CostModel;
+    use shrestidb::execution::catalog::Catalog;
+    use shrestidb::execution::transaction::TransactionManager;
 
     #[test]
     fn test_pgm_index_correctness() {
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn test_cost_model_comparison() {
-        use shresti::optimizer::cost_model::{OperatorCost, OperatorType};
+        use shrestidb::optimizer::cost_model::{OperatorCost, OperatorType};
         
         let cost_model = CostModel::new();
         
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_catalog_schema_management() {
-        use shresti::execution::catalog::{TableSchema, Column, DataType};
+        use shrestidb::execution::catalog::{TableSchema, Column, DataType};
         
         let mut catalog = Catalog::new();
         let mut schema = TableSchema::new(1, "test_table".to_string());

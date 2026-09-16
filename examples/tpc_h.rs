@@ -2,9 +2,9 @@
 //!
 //! Simulates the TPC-H analytical query workload.
 
-use shresti::index::pgm::PGMIndex;
-use shresti::optimizer::cardinality::LearnedCardinalityEstimator;
-use shresti::optimizer::cost_model::CostModel;
+use shrestidb::index::pgm::PGMIndex;
+use shrestidb::optimizer::cardinality::LearnedCardinalityEstimator;
+use shrestidb::optimizer::cost_model::CostModel;
 use std::time::Instant;
 
 fn main() {
@@ -38,7 +38,7 @@ fn main() {
     // Simulate Q6: Aggregation query
     println!("Query 6: SELECT sum(extendedprice * discount) FROM orders WHERE ...");
     let cost_model = CostModel::new();
-    use shresti::optimizer::cost_model::{OperatorCost, OperatorType};
+    use shrestidb::optimizer::cost_model::{OperatorCost, OperatorType};
     let plan = vec![
         OperatorCost::new(OperatorType::TableScan, 1_000_000, 1_000_000, 1.0),
         OperatorCost::new(OperatorType::Filter, 1_000_000, 500_000, 0.5),

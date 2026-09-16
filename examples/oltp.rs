@@ -2,8 +2,8 @@
 //!
 //! Simulates online transaction processing workload.
 
-use shresti::execution::transaction::TransactionManager;
-use shresti::execution::catalog::{Catalog, TableSchema, Column, DataType};
+use shrestidb::execution::transaction::TransactionManager;
+use shrestidb::execution::catalog::{Catalog, TableSchema, Column, DataType};
 use std::time::Instant;
 
 fn main() {

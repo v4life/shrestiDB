@@ -116,8 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### From Source
 
 ```bash
-git clone https://github.com/v4life/shresti.git
-cd shresti
+git clone https://github.com/v4life/shrestidb.git
+cd shrestidb
 cargo build --release
 ```
 

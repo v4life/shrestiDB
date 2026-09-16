@@ -1,6 +1,6 @@
-//! Shresti CLI server
+//! ShrestiDB CLI server
 //!
-//! Entry point for the Shresti database kernel: a REPL that reads SQL
+//! Entry point for the ShrestiDB database kernel: a REPL that reads SQL
 //! statements from stdin, runs them through `QueryExecutor::execute_sql`
 //! against a durable, WAL-backed engine (see `execution::wal` and
 //! `execution::oltp`), and prints the results. Data written in one run is
@@ -8,28 +8,28 @@
 
 use std::io::{self, BufRead, Write};
 
-use shresti::execution::QueryExecutor;
-use shresti::VERSION;
+use shrestidb::execution::QueryExecutor;
+use shrestidb::VERSION;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 fn main() -> anyhow::Result<()> {
     FmtSubscriber::builder().with_max_level(Level::INFO).init();
 
-    let wal_path = std::env::args().nth(1).unwrap_or_else(|| "shresti.wal".to_string());
-    info!("Starting Shresti v{VERSION}");
+    let wal_path = std::env::args().nth(1).unwrap_or_else(|| "shrestidb.wal".to_string());
+    info!("Starting ShrestiDB v{VERSION}");
     info!("Using WAL at {wal_path}");
 
     let executor = QueryExecutor::open(&wal_path)?;
 
-    println!("Shresti {VERSION} — type SQL statements, or 'exit' to quit.");
+    println!("ShrestiDB {VERSION} — type SQL statements, or 'exit' to quit.");
     println!("Data is persisted to {wal_path}.");
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
     loop {
-        print!("shresti> ");
+        print!("shrestidb> ");
         stdout.flush()?;
 
         let mut line = String::new();

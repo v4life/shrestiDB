@@ -1,9 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use shresti::optimizer::cardinality::{
+use shrestidb::optimizer::cardinality::{
     LearnedCardinalityEstimator, QueryPredicate, ColumnStats,
 };
-use shresti::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
-use shresti::optimizer::join_reorder::JoinOrderer;
+use shrestidb::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
+use shrestidb::optimizer::join_reorder::JoinOrderer;
 
 fn benchmark_cardinality_estimation(c: &mut Criterion) {
     let mut estimator = LearnedCardinalityEstimator::new(10);

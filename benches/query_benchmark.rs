@@ -1,8 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use shresti::index::pgm::PGMIndex;
-use shresti::optimizer::cardinality::LearnedCardinalityEstimator;
-use shresti::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
-use shresti::execution::catalog::{Catalog, TableSchema, Column, DataType};
+use shrestidb::index::pgm::PGMIndex;
+use shrestidb::optimizer::cardinality::LearnedCardinalityEstimator;
+use shrestidb::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
+use shrestidb::execution::catalog::{Catalog, TableSchema, Column, DataType};
 
 fn generate_test_keys(count: usize) -> Vec<f64> {
     (0..count).map(|i| (i as f64 * 1.5) % 100000.0).collect()

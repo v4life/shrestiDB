@@ -1,8 +1,8 @@
 //! Integration tests for Dynamic PGM Index and SIMD operations
 
-use shresti::index::pgm::DynamicPGMIndex;
-use shresti::compute::simd_ops::SIMDSearch;
-use shresti::compute::vector_math::VectorOps;
+use shrestidb::index::pgm::DynamicPGMIndex;
+use shrestidb::compute::simd_ops::SIMDSearch;
+use shrestidb::compute::vector_math::VectorOps;
 
 #[test]
 fn test_dynamic_pgm_bulk_insertion() {

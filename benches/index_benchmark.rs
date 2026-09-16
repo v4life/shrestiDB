@@ -1,9 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use shresti::index::btree::BTree;
-use shresti::index::pgm::PGMIndex;
-use shresti::index::rmi::{RMIIndex, RMIStage};
-use shresti::index::models::LinearModel;
-use shresti::index::hybrid_router::HybridIndex;
+use shrestidb::index::btree::BTree;
+use shrestidb::index::pgm::PGMIndex;
+use shrestidb::index::rmi::{RMIIndex, RMIStage};
+use shrestidb::index::models::LinearModel;
+use shrestidb::index::hybrid_router::HybridIndex;
 
 /// Generate synthetic keys with skewed distribution
 fn generate_skewed_keys(count: usize) -> Vec<f64> {

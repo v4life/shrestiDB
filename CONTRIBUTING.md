@@ -1,6 +1,6 @@
 # CONTRIBUTING
 
-Thank you for your interest in contributing to Shresti! This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to ShrestiDB! This document provides guidelines and instructions for contributing.
 
 ## Code of Conduct
 
@@ -9,7 +9,7 @@ Be respectful, inclusive, and professional in all interactions.
 ## Getting Started
 
 1. **Fork the repository** on GitHub
-2. **Clone your fork** locally: `git clone https://github.com/YOUR_USERNAME/shresti.git`
+2. **Clone your fork** locally: `git clone https://github.com/YOUR_USERNAME/shrestidb.git`
 3. **Create a feature branch**: `git checkout -b feature/your-feature-name`
 4. **Set up development environment**:
    ```bash

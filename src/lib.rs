@@ -1,4 +1,4 @@
-//! Shresti
+//! ShrestiDB
 //!
 //! A database kernel with ML-driven indexing, query optimization, and
 //! adaptive buffer management.
