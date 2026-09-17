@@ -41,3 +41,4 @@ docs/_build/
 *.db
 *.sqlite
 *.log
+*.wal

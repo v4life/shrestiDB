@@ -5,7 +5,8 @@ mod perf_tests {
     use shrestidb::index::pgm::PGMIndex;
     use shrestidb::ml::regression::LinearRegression;
     use shrestidb::compute::simd_ops::SIMDSearch;
-    use shrestidb::optimizer::cardinality::LearnedCardinalityEstimator;
+    use shrestidb::optimizer::cardinality::ColumnDistribution;
+    use shrestidb::execution::operators::Value;
 
     #[test]
     fn test_pgm_lookup_latency() {
@@ -39,21 +40,16 @@ mod perf_tests {
 
     #[test]
     fn test_cardinality_estimation_speed() {
-        use shrestidb::optimizer::cardinality::QueryPredicate;
-        
-        let estimator = LearnedCardinalityEstimator::new(10);
-        let predicates = vec![
-            QueryPredicate {
-                column_id: 0,
-                min_value: 10.0,
-                max_value: 100.0,
-                is_equality: false,
-            },
-        ];
+        // Real ColumnDistribution now (see optimizer::cardinality's
+        // module doc for why the old "LearnedCardinalityEstimator" this
+        // test used to measure was replaced -- its weights were
+        // hardcoded and never read the stats it was given).
+        let values: Vec<f64> = (0..10_000).map(|i| i as f64).collect();
+        let dist = ColumnDistribution::build_numeric(values, 64);
 
         let start = std::time::Instant::now();
         for _ in 0..10000 {
-            let _ = estimator.estimate_selectivity(&predicates);
+            let _ = dist.estimate_selectivity(">", &Value::Float(5000.0));
         }
         let elapsed = start.elapsed();
         

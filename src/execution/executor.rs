@@ -38,11 +38,12 @@ use crate::execution::row_codec;
 use crate::execution::secondary_index::SecondaryIndex;
 use crate::execution::transaction::TransactionId;
 use crate::execution::wal::WriteAheadLog;
+use crate::optimizer::cardinality::ColumnDistribution;
 use crate::optimizer::planner::{LogicalPlanNode, PhysicalPlan, QueryPlanner};
 use crate::sql::binder::Binder;
 use crate::sql::parser::{
-    CreateIndexStatement, CreateTableStatement, DeleteStatement, InsertStatement, SQLParser, SQLStatement,
-    UpdateStatement,
+    AnalyzeStatement, CreateIndexStatement, CreateTableStatement, DeleteStatement, InsertStatement, SQLParser,
+    SQLStatement, UpdateStatement,
 };
 use parking_lot::RwLock;
 
@@ -66,6 +67,14 @@ pub struct QueryExecutor {
     /// the indexed column) that those lower, byte-oriented layers
     /// deliberately don't have.
     secondary_indexes: RwLock<HashMap<(u64, String), SecondaryIndex>>,
+    /// Real per-column value distributions built by `ANALYZE <table>`
+    /// (`execute_analyze`), keyed by `(table_name, column_name)` — see
+    /// `optimizer::cardinality::ColumnDistribution`'s docs. Unlike
+    /// `secondary_indexes`, this is a disposable, rebuildable cache, not
+    /// data: nothing here is WAL-logged, and it goes stale after further
+    /// writes until `ANALYZE` runs again, the same staleness story every
+    /// production database's `ANALYZE` has.
+    stats: RwLock<HashMap<(String, String), ColumnDistribution>>,
 }
 
 /// A statement parsed (and, for `SELECT`, planned) once by `QueryExecutor::prepare`,
@@ -122,6 +131,7 @@ impl QueryExecutor {
             oltp: OLTPEngine::new(),
             planner: QueryPlanner::new(),
             secondary_indexes: RwLock::new(HashMap::new()),
+            stats: RwLock::new(HashMap::new()),
         }
     }
 
@@ -144,6 +154,7 @@ impl QueryExecutor {
             oltp,
             planner: QueryPlanner::new(),
             secondary_indexes: RwLock::new(HashMap::new()),
+            stats: RwLock::new(HashMap::new()),
         };
 
         for (table_id, column) in index_specs {
@@ -174,7 +185,7 @@ impl QueryExecutor {
 
         match stmt {
             SQLStatement::Select(select) => {
-                let plan = self.planner.plan_select(&select);
+                let plan = self.planner.plan_select(&select, &self.stats.read());
                 self.execute(&plan)
             }
             SQLStatement::Insert(insert) => {
@@ -195,6 +206,10 @@ impl QueryExecutor {
             }
             SQLStatement::CreateIndex(create) => {
                 self.execute_create_index(create)?;
+                Ok(Vec::new())
+            }
+            SQLStatement::Analyze(analyze) => {
+                self.execute_analyze(&analyze)?;
                 Ok(Vec::new())
             }
         }
@@ -224,15 +239,15 @@ impl QueryExecutor {
 
         let kind = match stmt {
             SQLStatement::Select(select) => {
-                let plan = self.planner.plan_select(&select);
+                let plan = self.planner.plan_select(&select, &self.stats.read());
                 PreparedKind::Select(plan)
             }
             SQLStatement::Insert(insert) => PreparedKind::Insert(insert),
             SQLStatement::Update(update) => PreparedKind::Update(update),
             SQLStatement::Delete(delete) => PreparedKind::Delete(delete),
-            SQLStatement::CreateTable(_) | SQLStatement::CreateIndex(_) => {
+            SQLStatement::CreateTable(_) | SQLStatement::CreateIndex(_) | SQLStatement::Analyze(_) => {
                 return Err(DatabaseError::ExecutionError(
-                    "CREATE statements cannot be prepared; use execute_sql".to_string(),
+                    "CREATE and ANALYZE statements cannot be prepared; use execute_sql".to_string(),
                 ));
             }
         };
@@ -304,6 +319,20 @@ impl QueryExecutor {
         }
     }
 
+    /// Parse, bind, and plan `sql` (a `SELECT`) without executing it,
+    /// returning the resulting `PhysicalPlan` — the same role `EXPLAIN`
+    /// plays in most SQL databases, as a Rust API rather than new SQL
+    /// syntax (out of scope for now). `estimated_rows` reflects real
+    /// `ANALYZE`'d statistics when available (`execute_analyze`) or the
+    /// planner's fixed defaults otherwise — see `optimizer::planner`'s
+    /// module doc.
+    pub fn explain(&self, sql: &str) -> Result<PhysicalPlan> {
+        match SQLParser::parse(sql)? {
+            SQLStatement::Select(select) => Ok(self.planner.plan_select(&select, &self.stats.read())),
+            _ => Err(DatabaseError::ExecutionError("explain() only supports SELECT".to_string())),
+        }
+    }
+
     /// Walk every placeholder-eligible field of `stmt` (`WHERE` clauses,
     /// `JOIN` conditions, `UPDATE` assignment right-hand sides, `INSERT`
     /// values — never column/table names, which aren't parameterizable in
@@ -351,7 +380,7 @@ impl QueryExecutor {
                     row_codec::scan_placeholders(predicate, &mut positional, &mut indexed)?;
                 }
             }
-            SQLStatement::CreateTable(_) | SQLStatement::CreateIndex(_) => {}
+            SQLStatement::CreateTable(_) | SQLStatement::CreateIndex(_) | SQLStatement::Analyze(_) => {}
         }
         Ok(positional.max(indexed))
     }
@@ -1087,6 +1116,75 @@ impl QueryExecutor {
 
         self.oltp.log_index_change(table_id, &create.column)?;
         self.rebuild_secondary_index(table_id, &create.column)
+    }
+
+    /// The PGM segment-fitting tolerance `execute_analyze` builds each
+    /// numeric column's distribution with. Looser than the tight bounds
+    /// used elsewhere in this codebase for exact point-lookup indexes
+    /// (`mvcc_store`'s PK index uses 8) -- a cardinality estimate doesn't
+    /// need `search`'s bounded-error guarantee, only a reasonable CDF
+    /// shape, so trading a little accuracy for fewer segments is a fair
+    /// exchange here.
+    const ANALYZE_PGM_ERROR_BOUND: usize = 16;
+
+    /// Execute `ANALYZE <table>`: scans the table's current committed
+    /// rows once and builds a real `ColumnDistribution` for every column,
+    /// replacing whatever was on record for this table before. Not
+    /// WAL-logged (see `stats`'s doc comment) — a restart needs a fresh
+    /// `ANALYZE`, the same staleness story every production database's
+    /// statistics have.
+    fn execute_analyze(&self, analyze: &AnalyzeStatement) -> Result<()> {
+        let schema = self.catalog.read().get_table(&analyze.table).cloned().ok_or_else(|| {
+            DatabaseError::ExecutionError(format!("Unknown table '{}'", analyze.table))
+        })?;
+        let table_id = schema.table_id as u64;
+
+        let rows = self.oltp.with_read_snapshot(|tx| self.oltp.scan_table(tx, table_id));
+        let tuples: Vec<Tuple> =
+            rows.into_iter().filter_map(|(_, bytes)| bincode::deserialize::<Tuple>(&bytes).ok()).collect();
+
+        let mut new_stats = HashMap::new();
+        for (idx, col) in schema.columns.iter().enumerate() {
+            match col.data_type {
+                DataType::Integer | DataType::Float | DataType::Timestamp => {
+                    let values: Vec<f64> = tuples
+                        .iter()
+                        .filter_map(|t| match t.values.get(idx) {
+                            Some(Value::Integer(i)) => Some(*i as f64),
+                            Some(Value::Float(f)) => Some(*f),
+                            _ => None,
+                        })
+                        .collect();
+                    if !values.is_empty() {
+                        new_stats.insert(
+                            (analyze.table.clone(), col.name.clone()),
+                            ColumnDistribution::build_numeric(values, Self::ANALYZE_PGM_ERROR_BOUND),
+                        );
+                    }
+                }
+                DataType::String | DataType::Boolean => {
+                    let values: Vec<String> = tuples
+                        .iter()
+                        .filter_map(|t| match t.values.get(idx) {
+                            Some(Value::String(s)) => Some(s.clone()),
+                            Some(Value::Boolean(b)) => Some(b.to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !values.is_empty() {
+                        new_stats.insert(
+                            (analyze.table.clone(), col.name.clone()),
+                            ColumnDistribution::build_categorical(values),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut stats = self.stats.write();
+        stats.retain(|(table, _), _| table != &analyze.table);
+        stats.extend(new_stats);
+        Ok(())
     }
 
     /// (Re)build a secondary index for `table_id`'s `column` from whatever
@@ -2308,6 +2406,96 @@ mod tests {
     fn test_create_index_unknown_table_errors() {
         let executor = QueryExecutor::new(users_catalog());
         assert!(executor.execute_sql("CREATE INDEX idx ON ghosts (name)").is_err());
+    }
+
+    #[test]
+    fn test_analyze_unknown_table_errors() {
+        let executor = QueryExecutor::new(users_catalog());
+        assert!(executor.execute_sql("ANALYZE ghosts").is_err());
+    }
+
+    #[test]
+    fn test_analyze_numeric_and_categorical_columns() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor
+            .execute_sql("CREATE TABLE orders (id INT PRIMARY KEY, status VARCHAR(20), amount INT)")
+            .unwrap();
+        for i in 1..=950 {
+            executor
+                .execute_sql(&format!("INSERT INTO orders (id, status, amount) VALUES ({i}, 'shipped', {i})"))
+                .unwrap();
+        }
+        for i in 951..=1000 {
+            executor
+                .execute_sql(&format!("INSERT INTO orders (id, status, amount) VALUES ({i}, 'cancelled', {i})"))
+                .unwrap();
+        }
+
+        executor.execute_sql("ANALYZE orders").unwrap();
+
+        let stats = executor.stats.read();
+        assert!(stats.contains_key(&("orders".to_string(), "status".to_string())));
+        assert!(stats.contains_key(&("orders".to_string(), "amount".to_string())));
+        // "id" is the primary key -- still a real INT column, still analyzed.
+        assert!(stats.contains_key(&("orders".to_string(), "id".to_string())));
+    }
+
+    #[test]
+    fn test_analyze_then_select_still_returns_correct_rows() {
+        // ANALYZE only changes plan *estimates* -- it must never change
+        // what a query actually returns.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE orders (id INT PRIMARY KEY, status VARCHAR(20))").unwrap();
+        executor.execute_sql("INSERT INTO orders (id, status) VALUES (1, 'shipped')").unwrap();
+        executor.execute_sql("INSERT INTO orders (id, status) VALUES (2, 'cancelled')").unwrap();
+        executor.execute_sql("ANALYZE orders").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM orders WHERE status = 'cancelled'").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_analyze_makes_plan_estimate_dramatically_more_accurate_than_fixed_heuristic() {
+        // The actual proof this feature exists for. Deliberately a
+        // numeric range predicate, not a categorical equality one: a
+        // categorical column's equality estimate assumes uniformity
+        // across *distinct values* (1/distinct_count -- see
+        // ColumnDistribution::estimate_selectivity's docs), which for a
+        // column with only 2 distinct values (a status-like column) is
+        // 1/2 = 0.5 regardless of the real skew -- no better than the
+        // fixed heuristic it's replacing, an honest limitation, not a
+        // bug (see cardinality.rs's own
+        // test_categorical_equality_selectivity_uses_real_distinct_count).
+        // A numeric column's *range* estimate has no such limitation: it
+        // comes from a real fitted CDF (row_codec::pgm's PGMIndex), not a
+        // distinct-value count, so this is the case that actually
+        // demonstrates the win.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE orders (id INT PRIMARY KEY, amount INT)").unwrap();
+        for i in 1..=950 {
+            executor.execute_sql(&format!("INSERT INTO orders (id, amount) VALUES ({i}, 10)")).unwrap();
+        }
+        for i in 951..=1000 {
+            executor.execute_sql(&format!("INSERT INTO orders (id, amount) VALUES ({i}, 999)")).unwrap();
+        }
+        let ground_truth = executor.execute_sql("SELECT * FROM orders WHERE amount >= 999").unwrap().len();
+        assert_eq!(ground_truth, 50); // sanity: the data really is this skewed
+
+        // Before ANALYZE: the same fixed 0.5 selectivity this planner
+        // has always used, applied to the assumed 1000-row table size --
+        // 500 estimated rows against a true 50. 10x wrong.
+        let before = executor.explain("SELECT * FROM orders WHERE amount >= 999").unwrap().estimated_rows;
+        assert_eq!(before, 500);
+
+        executor.execute_sql("ANALYZE orders").unwrap();
+
+        // After ANALYZE: a real, data-driven estimate close to the true 50.
+        let after = executor.explain("SELECT * FROM orders WHERE amount >= 999").unwrap().estimated_rows;
+        assert!(
+            (after as i64 - 50).abs() < 20,
+            "post-ANALYZE estimate {after} should be close to the true {ground_truth}, not the fixed-heuristic {before}"
+        );
     }
 
     #[test]

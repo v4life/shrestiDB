@@ -26,6 +26,7 @@ pub enum SQLStatement {
     Delete(DeleteStatement),
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
+    Analyze(AnalyzeStatement),
 }
 
 /// One `JOIN` clause: the joined table and its `ON` condition, rendered as
@@ -116,6 +117,20 @@ pub struct CreateIndexStatement {
     pub column: String,
 }
 
+/// `ANALYZE [TABLE] <table>` — scans every column of `table` and builds a
+/// real `optimizer::cardinality::ColumnDistribution` for each (see
+/// `execution::executor::QueryExecutor::execute_analyze`). Column-scoped
+/// `ANALYZE <table> (col1, col2)` (Postgres) or `FOR COLUMNS` (Hive)
+/// syntax both parse fine via `sqlparser` but aren't distinguished here —
+/// this always analyzes every column, a deliberate MVP scope boundary
+/// (analyzing a whole table is cheap enough at this project's scale that
+/// a column-subset optimization isn't worth the complexity yet), not an
+/// oversight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzeStatement {
+    pub table: String,
+}
+
 /// SQL Parser
 pub struct SQLParser;
 
@@ -141,6 +156,7 @@ impl SQLParser {
             AstStatement::Delete(delete) => Self::convert_delete(delete),
             AstStatement::CreateTable(create) => Self::convert_create_table(create),
             AstStatement::CreateIndex(create) => Self::convert_create_index(create),
+            AstStatement::Analyze(analyze) => Self::convert_analyze(analyze),
             other => Err(DatabaseError::ParseError(format!(
                 "Unsupported statement: {other}"
             ))),
@@ -359,6 +375,15 @@ impl SQLParser {
             .ok_or_else(|| DatabaseError::ParseError("CREATE INDEX requires a column".to_string()))?;
 
         Ok(SQLStatement::CreateIndex(CreateIndexStatement { name, table, column }))
+    }
+
+    fn convert_analyze(analyze: ast::Analyze) -> Result<SQLStatement> {
+        let table = analyze
+            .table_name
+            .map(|n| n.to_string())
+            .ok_or_else(|| DatabaseError::ParseError("ANALYZE requires a table".to_string()))?;
+
+        Ok(SQLStatement::Analyze(AnalyzeStatement { table }))
     }
 }
 

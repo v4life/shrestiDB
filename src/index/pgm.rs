@@ -178,6 +178,49 @@ impl PGMIndex {
         SIMDSearch::bounded_search(&self.keys, key, predicted_pos, self.error_bound)
     }
 
+    /// An estimate of how many build-time keys are `<= key`, whether or
+    /// not `key` was actually present in that data — unlike `search`,
+    /// which only succeeds for an exact match (a `key` absent from the
+    /// data returns `None`, discarding the very position `find_segment`'s
+    /// linear model already computed for it). Meant for CDF/selectivity
+    /// estimation (`optimizer::cardinality::ColumnDistribution`), not
+    /// point lookup: `error_bound`'s accuracy guarantee only covers keys
+    /// that were actually in the build set, so for any other key this is
+    /// a genuine estimate, not the bounded one `search` gives, and can be
+    /// off by roughly a segment's worth of rows even for a key close to
+    /// one that was in the data.
+    ///
+    /// Always in `[0, keys.len()]`: `0` means "at or before everything",
+    /// `keys.len()` means "at or after everything" — so
+    /// `predicted_rank(key) as f64 / keys.len() as f64` is directly a
+    /// selectivity estimate for `<= key`.
+    pub fn predicted_rank(&self, key: f64) -> usize {
+        if self.keys.is_empty() {
+            return 0;
+        }
+        if key < self.keys[0] {
+            return 0;
+        }
+        if key >= *self.keys.last().unwrap() {
+            return self.keys.len();
+        }
+
+        match self.find_segment(key) {
+            Some(segment) => segment.predict_position(key),
+            // key falls in a real gap between two segments' covered
+            // ranges -- no data exists at exactly this value, and it's
+            // not before/after everything either (that's handled above).
+            // The rank is the position right after whichever segment
+            // precedes it: every one of that segment's keys is <= key,
+            // none of the next segment's are.
+            None => match self.segments.binary_search_by(|s| s.start_key.partial_cmp(&key).unwrap()) {
+                Ok(idx) => self.segments[idx].start_pos,
+                Err(0) => 0,
+                Err(idx) => self.segments[idx - 1].end_pos + 1,
+            },
+        }
+    }
+
     /// Range search returning positions of all keys in [min_key, max_key]
     pub fn range_search(&self, min_key: f64, max_key: f64) -> Vec<usize> {
         if self.keys.is_empty() || min_key > max_key {
@@ -352,6 +395,62 @@ mod tests {
         let pgm = PGMIndex::build(keys, 1);
         let result = pgm.search(3.0);
         assert_eq!(result, Some(2));
+    }
+
+    #[test]
+    fn test_predicted_rank_on_present_key_is_close_to_real_index() {
+        let keys = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let pgm = PGMIndex::build(keys, 1);
+        // key=5.0 is the 5th element (0-indexed position 4) -- an
+        // in-data key's rank should land within the error bound of its
+        // real position, same guarantee `search` gives for exact match.
+        let rank = pgm.predicted_rank(5.0);
+        assert!((rank as i64 - 4).abs() <= 1, "rank {rank} should be close to real index 4");
+    }
+
+    #[test]
+    fn test_predicted_rank_between_real_values_falls_between_their_ranks() {
+        let keys = vec![10.0, 20.0, 30.0, 80.0, 90.0, 100.0];
+        let pgm = PGMIndex::build(keys, 1);
+        // 50.0 was never in the data (a real gap between 30 and 80) --
+        // its rank must still land between the ranks of its neighbors,
+        // not be thrown away the way search() would (None).
+        let rank_30 = pgm.predicted_rank(30.0);
+        let rank_50 = pgm.predicted_rank(50.0);
+        let rank_80 = pgm.predicted_rank(80.0);
+        assert!(rank_30 <= rank_50, "rank(30)={rank_30} should be <= rank(50)={rank_50}");
+        assert!(rank_50 <= rank_80, "rank(50)={rank_50} should be <= rank(80)={rank_80}");
+    }
+
+    #[test]
+    fn test_predicted_rank_before_and_after_all_data() {
+        let keys = vec![10.0, 20.0, 30.0];
+        let pgm = PGMIndex::build(keys, 1);
+        assert_eq!(pgm.predicted_rank(0.0), 0);
+        assert_eq!(pgm.predicted_rank(100.0), 3);
+    }
+
+    #[test]
+    fn test_predicted_rank_on_heavily_duplicated_column() {
+        // A "status"-column shape: a handful of distinct values, each
+        // repeated many times -- exactly the case duplicate handling in
+        // build() exists for (pgm.rs's close_segment forcing a new
+        // segment when a duplicate run's spread exceeds error_bound).
+        let mut keys = vec![0.0; 950]; // "shipped"
+        keys.extend(vec![1.0; 50]); // "cancelled"
+        let pgm = PGMIndex::build(keys, 4);
+
+        // Before the only two distinct values: rank 0.
+        assert_eq!(pgm.predicted_rank(-1.0), 0);
+        // At or past the last (largest) value: rank is the full count.
+        assert_eq!(pgm.predicted_rank(1.0), 1000);
+        // Strictly between the two distinct values (never present):
+        // every "shipped" row is <= it, no "cancelled" row is.
+        let rank_between = pgm.predicted_rank(0.5);
+        assert!(
+            (rank_between as i64 - 950).abs() <= 4,
+            "rank(0.5)={rank_between} should be close to the 950 'shipped' rows"
+        );
     }
 
     #[test]

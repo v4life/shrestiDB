@@ -1,75 +1,31 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use shrestidb::optimizer::cardinality::{
-    LearnedCardinalityEstimator, QueryPredicate, ColumnStats,
-};
+use shrestidb::optimizer::cardinality::ColumnDistribution;
 use shrestidb::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
 use shrestidb::optimizer::join_reorder::JoinOrderer;
+use shrestidb::execution::operators::Value;
 
 fn benchmark_cardinality_estimation(c: &mut Criterion) {
-    let mut estimator = LearnedCardinalityEstimator::new(10);
-    
-    // Add column statistics
-    estimator.update_column_stats(ColumnStats {
-        column_id: 0,
-        min_value: 0.0,
-        max_value: 1000.0,
-        distinct_values: 100,
-        null_count: 0,
-    });
+    // Real ColumnDistribution now -- see optimizer::cardinality's module
+    // doc for why the old "LearnedCardinalityEstimator" this benchmark
+    // used to measure was replaced (fixed weights, never actually read
+    // the stats it was given).
+    let values: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+    let dist = ColumnDistribution::build_numeric(values, 32);
 
-    let predicates = vec![
-        QueryPredicate {
-            column_id: 0,
-            min_value: 100.0,
-            max_value: 500.0,
-            is_equality: false,
-        },
-    ];
-
-    c.bench_function("cardinality_estimate_single_predicate", |b| {
+    c.bench_function("cardinality_estimate_range_predicate", |b| {
         b.iter(|| {
-            estimator.estimate_selectivity(black_box(&predicates));
+            dist.estimate_selectivity(black_box(">="), black_box(&Value::Float(300.0)));
         });
     });
 }
 
-fn benchmark_cardinality_multiple_predicates(c: &mut Criterion) {
-    let mut estimator = LearnedCardinalityEstimator::new(10);
-    
-    for i in 0..10 {
-        estimator.update_column_stats(ColumnStats {
-            column_id: i,
-            min_value: 0.0,
-            max_value: 1000.0,
-            distinct_values: 100,
-            null_count: 0,
-        });
-    }
+fn benchmark_cardinality_categorical(c: &mut Criterion) {
+    let values: Vec<String> = (0..1000).map(|i| format!("category_{}", i % 20)).collect();
+    let dist = ColumnDistribution::build_categorical(values);
 
-    let predicates = vec![
-        QueryPredicate {
-            column_id: 0,
-            min_value: 100.0,
-            max_value: 500.0,
-            is_equality: false,
-        },
-        QueryPredicate {
-            column_id: 1,
-            min_value: 200.0,
-            max_value: 800.0,
-            is_equality: false,
-        },
-        QueryPredicate {
-            column_id: 2,
-            min_value: 300.0,
-            max_value: 900.0,
-            is_equality: true,
-        },
-    ];
-
-    c.bench_function("cardinality_estimate_multiple_predicates", |b| {
+    c.bench_function("cardinality_estimate_categorical_equality", |b| {
         b.iter(|| {
-            estimator.estimate_selectivity(black_box(&predicates));
+            dist.estimate_selectivity(black_box("="), black_box(&Value::String("category_0".to_string())));
         });
     });
 }
@@ -121,7 +77,7 @@ fn benchmark_join_ordering(c: &mut Criterion) {
 criterion_group!(
     benches,
     benchmark_cardinality_estimation,
-    benchmark_cardinality_multiple_predicates,
+    benchmark_cardinality_categorical,
     benchmark_cost_model_estimation,
     benchmark_plan_cost_comparison,
     benchmark_join_ordering

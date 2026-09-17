@@ -85,6 +85,10 @@ impl<'a> Binder<'a> {
                 let table = self.require_table(&c.table)?;
                 self.check_column(table, &c.column)
             }
+            SQLStatement::Analyze(a) => {
+                self.require_table(&a.table)?;
+                Ok(())
+            }
         }
     }
 

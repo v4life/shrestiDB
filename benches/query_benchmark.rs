@@ -1,15 +1,19 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use shrestidb::index::pgm::PGMIndex;
-use shrestidb::optimizer::cardinality::LearnedCardinalityEstimator;
+use shrestidb::optimizer::cardinality::ColumnDistribution;
 use shrestidb::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
 use shrestidb::execution::catalog::{Catalog, TableSchema, Column, DataType};
+use shrestidb::execution::operators::Value;
 
 fn generate_test_keys(count: usize) -> Vec<f64> {
     (0..count).map(|i| (i as f64 * 1.5) % 100000.0).collect()
 }
 
 fn benchmark_end_to_end_query_optimization(c: &mut Criterion) {
-    let estimator = LearnedCardinalityEstimator::new(10);
+    // Real ColumnDistribution now -- see optimizer::cardinality's module
+    // doc for why the old "LearnedCardinalityEstimator" this benchmark
+    // used to measure was replaced.
+    let dist = ColumnDistribution::build_numeric(generate_test_keys(100000), 64);
     let cost_model = CostModel::new();
 
     let plan = vec![
@@ -20,10 +24,7 @@ fn benchmark_end_to_end_query_optimization(c: &mut Criterion) {
 
     c.bench_function("e2e_optimization_pipeline", |b| {
         b.iter(|| {
-            let _card = estimator.estimate_row_count(
-                100000,
-                &vec![],
-            );
+            let _card = dist.estimate_row_count(">=", &Value::Float(50000.0), 100000);
             let _cost = cost_model.estimate_total_cost(black_box(&plan));
         });
     });

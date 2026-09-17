@@ -3,21 +3,35 @@
 //! Generates query plans by parsing the query and consulting the cost model
 //! and join orderer already held on this planner (previously constructed
 //! but never used — `plan()` ignored its input and returned a hardcoded
-//! single-table scan regardless of what was asked). Row-count estimates for
-//! a bare scan still use a fixed assumed table size: there's no catalog or
-//! table-statistics wiring into the planner yet, so there's no real number
-//! to use instead. The learned cardinality estimator similarly isn't
-//! consulted here yet — it expects structured `QueryPredicate`s, and a
-//! WHERE clause is currently just a flattened string (see `sql::parser`),
-//! so there's no honest way to build one without fabricating fake
-//! structured input.
+//! single-table scan regardless of what was asked). Row-count estimates
+//! are real when `stats` — a map of real
+//! `optimizer::cardinality::ColumnDistribution`s, built by
+//! `QueryExecutor::execute_analyze` from an actual scan of a table's
+//! values (see that type's docs) — has something for the table being
+//! queried: a bare scan's row count comes from any analyzed column's
+//! `total_rows` (every column gets scanned together, so any one of them
+//! gives the whole table's real size), and a `WHERE`-clause estimate uses
+//! a real selectivity when the filter reduces to a single
+//! `<column> <literal>` comparison against a table with no `JOIN` before
+//! it and a distribution on record for that column. Both fall back to
+//! the old fixed constants (`ASSUMED_TABLE_ROWS`,
+//! `DEFAULT_FILTER_SELECTIVITY`) whenever real stats aren't available or
+//! don't apply — no stats yet, a compound `AND`/`OR` predicate, a `JOIN`
+//! in the way, a literal on the wrong side — graceful degradation, not a
+//! new failure mode. A real base row count matters for more than just
+//! looking accurate on its own: a Filter's selectivity, however real,
+//! produces a meaningless final row count if it's multiplied against a
+//! fake base — the two only add up to a real number together.
 
 use crate::execution::aggregate;
-use crate::optimizer::cardinality::LearnedCardinalityEstimator;
+use crate::execution::operators::Value;
+use crate::execution::row_codec;
+use crate::optimizer::cardinality::ColumnDistribution;
 use crate::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
 use crate::optimizer::join_reorder::JoinOrderer;
 use crate::sql::parser::{SQLParser, SQLStatement, SelectStatement};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Logical query plan node
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +86,6 @@ pub struct PhysicalPlan {
 
 /// Query planner
 pub struct QueryPlanner {
-    pub cardinality_estimator: LearnedCardinalityEstimator,
     pub cost_model: CostModel,
     pub join_orderer: JoinOrderer,
 }
@@ -80,7 +93,6 @@ pub struct QueryPlanner {
 impl QueryPlanner {
     pub fn new() -> Self {
         QueryPlanner {
-            cardinality_estimator: LearnedCardinalityEstimator::new(10),
             cost_model: CostModel::new(),
             join_orderer: JoinOrderer::new(),
         }
@@ -101,16 +113,17 @@ impl QueryPlanner {
     /// from honestly.
     const DEFAULT_FILTER_SELECTIVITY: f64 = 0.5;
 
-    /// Generate a query plan for `query`. Parses `query` itself; a caller
-    /// that already has a parsed `SelectStatement` in hand (`execute_sql`,
-    /// `QueryExecutor::prepare`) should call `plan_select` directly instead
-    /// — re-parsing a string that was just parsed one call up is exactly
-    /// the wasted-work pattern `row_codec::CompiledPredicate` existed to
-    /// eliminate on the predicate side; this is the same fix on the
-    /// planning side.
+    /// Generate a query plan for `query`, with no real column statistics
+    /// available (equivalent to `plan_select(select, &HashMap::new())`).
+    /// Parses `query` itself; a caller that already has a parsed
+    /// `SelectStatement` in hand (`execute_sql`, `QueryExecutor::prepare`)
+    /// should call `plan_select` directly instead — re-parsing a string
+    /// that was just parsed one call up is exactly the wasted-work
+    /// pattern `row_codec::CompiledPredicate` existed to eliminate on the
+    /// predicate side; this is the same fix on the planning side.
     pub fn plan(&self, query: &str) -> PhysicalPlan {
         match SQLParser::parse(query) {
-            Ok(SQLStatement::Select(select)) => self.plan_select(&select),
+            Ok(SQLStatement::Select(select)) => self.plan_select(&select, &HashMap::new()),
             // Not a SELECT, or failed to parse: nothing to build a read
             // plan for yet (writes and DDL don't have a plan shape here).
             _ => PhysicalPlan {
@@ -128,9 +141,23 @@ impl QueryPlanner {
 
     /// The actual plan-building logic, over an already-parsed `select` --
     /// see `plan`'s doc comment for why this is the one to call when a
-    /// parsed statement already exists.
-    pub fn plan_select(&self, select: &SelectStatement) -> PhysicalPlan {
-        let mut rows = Self::ASSUMED_TABLE_ROWS;
+    /// parsed statement already exists. `stats` is keyed by
+    /// `(table_name, column_name)`; an empty map degrades exactly to this
+    /// planner's old always-constant behavior.
+    pub fn plan_select(&self, select: &SelectStatement, stats: &HashMap<(String, String), ColumnDistribution>) -> PhysicalPlan {
+        // Any analyzed column's total_rows is the whole table's real row
+        // count as of that ANALYZE (every column gets scanned together),
+        // not just that one column's -- so the first stats entry found
+        // for this table gives a real base row count for the bare scan,
+        // in place of the fixed ASSUMED_TABLE_ROWS placeholder. Without
+        // this, a Filter's real selectivity would still be multiplied
+        // against a fake base count, and the result would be no more
+        // meaningful than the constant it replaced.
+        let mut rows = stats
+            .iter()
+            .find(|((table, _), _)| table == &select.from)
+            .map(|(_, dist)| dist.total_rows())
+            .unwrap_or(Self::ASSUMED_TABLE_ROWS);
         let mut nodes = vec![LogicalPlanNode::Scan {
             table_id: 0,
             table_name: select.from.clone(),
@@ -156,7 +183,23 @@ impl QueryPlanner {
         }
 
         if let Some(predicate) = select.where_clause.clone() {
-            rows = (rows as f64 * Self::DEFAULT_FILTER_SELECTIVITY) as usize;
+            // A real, data-driven estimate only when the filter is a
+            // single <column> <op> <literal> comparison (see
+            // row_codec::split_comparison) against a table nothing has
+            // been JOINed to yet (a post-join filter's columns live in a
+            // merged, qualified schema this planner doesn't resolve) and
+            // a distribution is on record for that exact column. Every
+            // other shape keeps the fixed default it always used.
+            let real_estimate = if select.joins.is_empty() {
+                row_codec::split_comparison(&predicate).and_then(|(left, op, right)| {
+                    let dist = stats.get(&(select.from.clone(), left))?;
+                    let value = literal_for_distribution(&right, dist)?;
+                    dist.estimate_row_count(&op, &value, rows)
+                })
+            } else {
+                None
+            };
+            rows = real_estimate.unwrap_or_else(|| (rows as f64 * Self::DEFAULT_FILTER_SELECTIVITY) as usize);
             nodes.push(LogicalPlanNode::Filter { predicate, rows });
         }
 
@@ -230,6 +273,23 @@ impl QueryPlanner {
 impl Default for QueryPlanner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Parse `raw` (a flattened literal token from `sql::parser`, e.g. `"18"`
+/// or `"'cancelled'"`) into the `Value` shape `dist` expects — a bare
+/// number for a `Numeric` distribution, a (quote-stripped) string for a
+/// `Categorical` one. `None` if `raw` doesn't parse as the shape `dist`
+/// needs (e.g. a non-numeric literal against a `Numeric` column), same
+/// "can't evaluate this way" convention used throughout this codebase.
+fn literal_for_distribution(raw: &str, dist: &ColumnDistribution) -> Option<Value> {
+    match dist {
+        ColumnDistribution::Numeric { .. } => raw.trim().parse::<f64>().ok().map(Value::Float),
+        ColumnDistribution::Categorical { .. } => {
+            let s = raw.trim();
+            let s = s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(s);
+            Some(Value::String(s.to_string()))
+        }
     }
 }
 

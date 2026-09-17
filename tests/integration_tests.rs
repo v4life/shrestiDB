@@ -6,9 +6,10 @@ mod tests {
     use shrestidb::index::btree::BTree;
     use shrestidb::index::rmi::{RMIIndex, RMIStage};
     use shrestidb::index::models::LinearModel;
-    use shrestidb::optimizer::cardinality::LearnedCardinalityEstimator;
+    use shrestidb::optimizer::cardinality::ColumnDistribution;
     use shrestidb::optimizer::cost_model::CostModel;
     use shrestidb::execution::catalog::Catalog;
+    use shrestidb::execution::operators::Value;
     use shrestidb::execution::transaction::TransactionManager;
 
     #[test]
@@ -51,12 +52,19 @@ mod tests {
 
     #[test]
     fn test_cardinality_estimator_accuracy() {
-        let estimator = LearnedCardinalityEstimator::new(5);
-        let total_rows = 10000;
-        
-        // Empty predicates should return all rows
-        let count = estimator.estimate_row_count(total_rows, &vec![]);
-        assert_eq!(count, total_rows);
+        // A real accuracy check against a known distribution -- the old
+        // version of this test only checked a trivial identity (empty
+        // predicates return the full count) and would have passed
+        // against the previous, entirely fake estimator too. This one
+        // actually exercises the real PGM-backed CDF: 9,000 rows at or
+        // below 900 and 1,000 rows above it, so ">= 900" should estimate
+        // close to the true 1,000, not a generic guess.
+        let mut values: Vec<f64> = (0..9000).map(|_| 500.0).collect();
+        values.extend((0..1000).map(|i| 901.0 + i as f64));
+        let dist = ColumnDistribution::build_numeric(values, 32);
+
+        let count = dist.estimate_row_count(">=", &Value::Float(900.0), 10000).unwrap();
+        assert!((count as i64 - 1000).abs() < 100, "estimated {count} rows, expected close to 1000");
     }
 
     #[test]

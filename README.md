@@ -11,10 +11,9 @@ A relational database kernel written in Rust that leverages machine learning mod
 - **Bounded Error Search**: SIMD-accelerated binary search within prediction error bounds
 
 ### ML-Driven Query Optimization
-- **Learned Cardinality Estimator**: Neural network-based selectivity estimation (2x more accurate than histograms)
-- **Learned Cost Model**: Adaptive cost estimation that learns from execution history
-- **Adaptive Join Reordering**: Dynamic programming with learned costs for optimal join order
-- **Workload-Aware Optimization**: Continuously adapts to changing query patterns
+- **Real Cardinality Estimation**: `ANALYZE <table>` builds a real per-column value distribution — a `PGMIndex` (the same learned-index technique above) fit over the column's actual sorted values as an empirical CDF, plus a real distinct-value count for equality selectivity. Replaces a fixed 0.5-selectivity-for-every-filter constant with a genuine, data-driven estimate; see [`optimizer::cardinality`](src/optimizer/cardinality.rs) and the [Real Cardinality Estimation](#real-cardinality-estimation-vs-a-fixed-constant) results below. (An earlier version of this feature was a "neural network" whose weights were hardcoded and never trained — replaced rather than reused; see that module's doc comment for the full story.)
+- **Cost Model**: A real IO/CPU cost formula, consulted for every plan's `estimated_cost` — not adaptive or trained from execution history despite earlier documentation here claiming otherwise.
+- **Hash Join**: Equality join conditions run as a real hash join (build a hash table on the smaller side, probe with the larger) instead of a nested loop — see [Benchmark Results](#-benchmark-results) below for the measured effect. Join **order** (for 3+-table queries) is not yet chosen by cost — queries execute in the order they're written; this is real, scoped, in-progress work, not shipped yet.
 
 ### Intelligent Storage
 - **Learned Buffer Pool**: Markov chain predictor anticipates page access patterns for prefetching
@@ -30,14 +29,22 @@ A relational database kernel written in Rust that leverages machine learning mod
 
 ## 📊 Performance
 
-| Metric | Performance |
-|--------|-------------|
-| Index Lookup | 10-100x faster than B-Tree on typical data |
-| Cardinality Estimation | 2-5x more accurate than histograms |
-| Buffer Pool Hit Rate | 95%+ with predictive prefetching |
-| Query Planning | <10ms for complex queries |
-| Index Build Time | 2-5x faster than B-Tree for 1M+ records |
-| OLTP Throughput | 100K+ transactions/sec |
+Real, measured numbers — not marketing estimates — live in
+[📊 Benchmark Results](#-benchmark-results) below, each reproducible via
+`cargo run --example <name> --release`. Headline results as of the
+latest run: RMI/PGM lookups **7.2-36.8x** faster than this codebase's own
+B-Tree at 1M records (scaling *up* with data size, not down — see
+[Index Build Performance](#index-build-performance)); a hash-joined query
+within **1.2-1.5x** of SQLite/Postgres at 20K x 2K rows; and real,
+`ANALYZE`-driven cardinality estimates landing on the true row count
+where a fixed-constant heuristic was off by **10x** (see
+[Real Cardinality Estimation](#real-cardinality-estimation-vs-a-fixed-constant)).
+An earlier version of this table quoted round marketing-style figures
+("100K+ transactions/sec", "2-5x more accurate than histograms") that
+were never actually measured, some of which directly contradicted real
+numbers already published elsewhere in this same file — replaced with
+pointers to the real thing rather than a second set of numbers to keep
+in sync by hand.
 
 ## 🏗️ Architecture
 
@@ -49,8 +56,8 @@ A relational database kernel written in Rust that leverages machine learning mod
                  │
 ┌────────────────▼──────────────────────┐
 │   Query Optimization Layer            │
-│  (Learned Cost Model, Cardinality     │
-│   Estimator, Join Reordering)         │
+│  (Cost Model, Real Cardinality        │
+│   Estimation via ANALYZE, Hash Join)  │
 └────────────────┬──────────────────────┘
                  │
 ┌────────────────▼──────────────────────┐
@@ -338,9 +345,9 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture, algorithm description
 - [x] Learned index structures (RMI, PGM)
 - [x] Hybrid index router with B-Tree fallback
 - [x] Basic SQL parsing and type system
-- [x] Learned cardinality estimator (neural network)
-- [x] Cost-based query optimizer
-- [x] Join reordering with learned costs
+- [x] Real cardinality estimation (`ANALYZE`, PGM-fitted per-column distributions)
+- [x] Cost model consulted for real plan cost estimates
+- [x] Hash join for equality conditions
 - [x] Vectorized query operators
 - [x] MVCC transaction manager
 - [x] Write-Ahead Log (WAL)
@@ -348,6 +355,7 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture, algorithm description
 - [x] Example workloads (TPC-H, OLTP)
 
 ### In Progress 🔄
+- [ ] Cost-based join ordering for 3+-table queries (the real per-column stats above now make this meaningful to build — previously the cost model applied the same fixed selectivity to every join, so even a real search over orderings would have found no difference between them)
 - [ ] Advanced SQL features (subqueries, window functions)
 - [ ] Index creation/selection automation
 - [ ] Distributed query processing
