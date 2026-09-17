@@ -85,6 +85,34 @@ enum PreparedKind {
     Delete(DeleteStatement),
 }
 
+/// A hashable, total-equality view of a `Value`, for hash-join keys.
+/// `Value` can't derive `Hash`/`Eq` itself — blocked by the `Float(f64)`
+/// variant — so this hashes a float's bit pattern instead of its numeric
+/// value, the standard approach for hash-keyed joins. Two `NaN`s with the
+/// same bit pattern hash-match under this scheme, unlike IEEE float
+/// comparison — the usual convention for a *key*, not a correctness gap
+/// for any join key a real query would actually use.
+#[derive(PartialEq, Eq, Hash)]
+enum JoinHashKey {
+    Integer(i64),
+    Float(u64),
+    String(String),
+    Boolean(bool),
+    Null,
+}
+
+impl JoinHashKey {
+    fn from_value(value: &Value) -> JoinHashKey {
+        match value {
+            Value::Integer(i) => JoinHashKey::Integer(*i),
+            Value::Float(f) => JoinHashKey::Float(f.to_bits()),
+            Value::String(s) => JoinHashKey::String(s.clone()),
+            Value::Boolean(b) => JoinHashKey::Boolean(*b),
+            Value::Null => JoinHashKey::Null,
+        }
+    }
+}
+
 impl QueryExecutor {
     /// In-memory only: nothing here survives a restart. What every
     /// existing test uses.
@@ -392,49 +420,73 @@ impl QueryExecutor {
                     let right_prefix = right_alias.clone().unwrap_or_else(|| right_table.clone());
                     let merged_schema =
                         Self::merge_schemas(&left_schema, left_prefix.as_deref(), &right_schema, &right_prefix);
+                    let left_len = left_schema.columns.len();
 
+                    // Resolve the condition once: which two merged-schema
+                    // column indices it compares, and -- the shape hash
+                    // join needs -- whether it's a plain equality between
+                    // one left-side and one right-side column. Anything
+                    // else (no condition at all, a non-equality operator,
+                    // both operands landing on the same side) falls back
+                    // to the nested loop below, which is always correct
+                    // regardless of shape.
+                    let mut hash_key_indices: Option<(usize, usize)> = None; // (idx into left_tuples, idx into right_tuples)
                     if let Some(cond) = condition {
-                        let (left_tok, _, right_tok) = row_codec::split_comparison(cond).ok_or_else(|| {
+                        let (left_tok, op, right_tok) = row_codec::split_comparison(cond).ok_or_else(|| {
                             DatabaseError::ExecutionError(format!("Unsupported JOIN condition: '{cond}'"))
                         })?;
-                        let is_column = |tok: &str| merged_schema.columns.iter().any(|c| c.name == tok);
-                        if !is_column(&left_tok) || !is_column(&right_tok) {
-                            return Err(DatabaseError::ExecutionError(format!(
-                                "JOIN condition must compare two columns (e.g. 'a.id = b.a_id'), got: '{cond}'"
-                            )));
+                        let col_idx = |tok: &str| merged_schema.columns.iter().position(|c| c.name == tok);
+                        let (a, b) = match (col_idx(&left_tok), col_idx(&right_tok)) {
+                            (Some(a), Some(b)) => (a, b),
+                            _ => {
+                                return Err(DatabaseError::ExecutionError(format!(
+                                    "JOIN condition must compare two columns (e.g. 'a.id = b.a_id'), got: '{cond}'"
+                                )));
+                            }
+                        };
+                        if op == "=" {
+                            hash_key_indices = match (a < left_len, b < left_len) {
+                                (true, false) => Some((a, b - left_len)),
+                                (false, true) => Some((b, a - left_len)),
+                                _ => None, // both operands on the same side: not hash-joinable
+                            };
                         }
                     }
 
-                    // Compiled once before the nested loop -- re-parsing
-                    // the condition string on every one of
-                    // left_tuples.len() * right_tuples.len() pairs is
-                    // exactly the cost that made this join 350-500x
-                    // slower than SQLite/Postgres on the same query (see
-                    // row_codec::CompiledPredicate's docs).
-                    let compiled_condition =
-                        condition.as_ref().and_then(|cond| row_codec::CompiledPredicate::compile(cond, &merged_schema));
+                    let merged_tuples = if let Some((left_key_idx, right_key_idx)) = hash_key_indices {
+                        Self::hash_join(&left_tuples, left_key_idx, &right_tuples, right_key_idx)
+                    } else {
+                        // Compiled once before the nested loop -- re-parsing
+                        // the condition string on every one of
+                        // left_tuples.len() * right_tuples.len() pairs is
+                        // exactly the cost that made this join 350-500x
+                        // slower than SQLite/Postgres on the same query
+                        // (see row_codec::CompiledPredicate's docs).
+                        let compiled_condition = condition
+                            .as_ref()
+                            .and_then(|cond| row_codec::CompiledPredicate::compile(cond, &merged_schema));
 
-                    // A row pair's values are only cloned into a merged
-                    // Tuple once it's known to match -- for
-                    // examples/tpc_h.rs's join that's 3,000 of 900,000
-                    // pairs; cloning (and, for a String column, heap-
-                    // allocating) all 900,000 regardless of match was
-                    // real, wasted cost. See CompiledPredicate::eval_split.
-                    let left_len = left_schema.columns.len();
-                    let mut merged_tuples = Vec::new();
-                    for l in &left_tuples {
-                        for r in &right_tuples {
-                            let keep = match &compiled_condition {
-                                Some(compiled) => compiled.eval_split(l, left_len, r).unwrap_or(true),
-                                None => true, // CROSS JOIN, or a condition that didn't compile
-                            };
-                            if keep {
-                                let mut values = l.values.clone();
-                                values.extend(r.values.clone());
-                                merged_tuples.push(Tuple { values });
+                        // A row pair's values are only cloned into a
+                        // merged Tuple once it's known to match -- cloning
+                        // (and, for a String column, heap-allocating)
+                        // every pair regardless of match was real, wasted
+                        // cost. See CompiledPredicate::eval_split.
+                        let mut merged_tuples = Vec::new();
+                        for l in &left_tuples {
+                            for r in &right_tuples {
+                                let keep = match &compiled_condition {
+                                    Some(compiled) => compiled.eval_split(l, left_len, r).unwrap_or(true),
+                                    None => true, // CROSS JOIN, or a condition that didn't compile
+                                };
+                                if keep {
+                                    let mut values = l.values.clone();
+                                    values.extend(r.values.clone());
+                                    merged_tuples.push(Tuple { values });
+                                }
                             }
                         }
-                    }
+                        merged_tuples
+                    };
                     current = Some((merged_schema, merged_tuples));
                 }
                 LogicalPlanNode::Aggregate { columns, group_by, .. } => {
@@ -682,6 +734,55 @@ impl QueryExecutor {
                 primary_key: false,
             });
             next_id += 1;
+        }
+        merged
+    }
+
+    /// Equi-join `left`/`right` on `left_key_idx`/`right_key_idx` (indices
+    /// into each side's own tuples, not the merged schema): build a hash
+    /// table on the smaller side, probe with the larger — O(n+m) instead
+    /// of the nested loop's O(n*m). Only called from `execute`'s `Join`
+    /// arm once the condition is known to be a plain equality between one
+    /// column on each side; anything else (no condition, a non-equality
+    /// operator, both operands resolving to the same side) stays on the
+    /// nested-loop path, which is always correct regardless of shape.
+    /// Output preserves the schema's expected `left ++ right` column
+    /// order regardless of which side ends up as the hash table.
+    fn hash_join(left: &[Tuple], left_key_idx: usize, right: &[Tuple], right_key_idx: usize) -> Vec<Tuple> {
+        if left.len() <= right.len() {
+            Self::hash_join_build_probe(left, left_key_idx, right, right_key_idx, false)
+        } else {
+            Self::hash_join_build_probe(right, right_key_idx, left, left_key_idx, true)
+        }
+    }
+
+    /// `swapped` is true when `build`/`probe` are actually the join's
+    /// right/left sides (the build side is picked by size in `hash_join`,
+    /// not by which is logically "left") — controls whether a match's
+    /// merged row is built `probe ++ build` or `build ++ probe` so the
+    /// output always ends up `left ++ right` either way.
+    fn hash_join_build_probe(
+        build: &[Tuple],
+        build_key_idx: usize,
+        probe: &[Tuple],
+        probe_key_idx: usize,
+        swapped: bool,
+    ) -> Vec<Tuple> {
+        let mut table: HashMap<JoinHashKey, Vec<&Tuple>> = HashMap::new();
+        for tuple in build {
+            table.entry(JoinHashKey::from_value(&tuple.values[build_key_idx])).or_default().push(tuple);
+        }
+
+        let mut merged = Vec::new();
+        for p in probe {
+            let Some(matches) = table.get(&JoinHashKey::from_value(&p.values[probe_key_idx])) else {
+                continue;
+            };
+            for b in matches {
+                let mut values = if swapped { p.values.clone() } else { b.values.clone() };
+                values.extend_from_slice(if swapped { &b.values } else { &p.values });
+                merged.push(Tuple { values });
+            }
         }
         merged
     }
@@ -1697,6 +1798,77 @@ mod tests {
             .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_hash_join_many_to_many_matching() {
+        // users.id/orders.user_id are both unique-on-one-side (a PK and a
+        // non-unique FK), so existing JOIN tests never exercise a key
+        // that's duplicated on *both* sides of the hash table -- exactly
+        // the shape that would expose a bug in hash_join_build_probe's
+        // per-key Vec<&Tuple> bucket if it only ever handled a single
+        // match per key. Two rows on each side sharing tag=1 must produce
+        // all four combinations.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (1, 1)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (2, 1)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (10, 1)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (20, 1)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a JOIN b ON a.tag = b.tag").unwrap();
+        assert_eq!(rows.len(), 4); // 2 x 2 -- every a paired with every b sharing the tag
+    }
+
+    #[test]
+    fn test_hash_join_picks_smaller_side_either_direction() {
+        // hash_join builds the hash table on whichever side is smaller,
+        // which changes which of build/probe is "left" -- exercise both
+        // directions (left smaller, then right smaller) to prove the
+        // swapped-output-ordering logic in hash_join_build_probe is
+        // correct both ways, not just the common case.
+        // Distinct id values on each side (99 vs 7) so a left/right
+        // column-order bug would actually change the result, rather than
+        // both orderings coincidentally producing the same row.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE small (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("CREATE TABLE big (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("INSERT INTO small (id, tag) VALUES (99, 5)").unwrap();
+        executor.execute_sql("INSERT INTO big (id, tag) VALUES (7, 5)").unwrap();
+        for i in 1..=4 {
+            executor.execute_sql(&format!("INSERT INTO big (id, tag) VALUES ({}, 0)", i + 10)).unwrap();
+        }
+
+        // small (1 row) JOIN big (5 rows) -- small is the build side.
+        let rows = executor.execute_sql("SELECT * FROM small JOIN big ON small.tag = big.tag").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec!["99".to_string(), "5".to_string(), "7".to_string(), "5".to_string()]);
+
+        // big (5 rows) JOIN small (1 row) -- small is still the build
+        // side (picked by size, not join order), but output column order
+        // must still be big-then-small since big is now the "left" table.
+        let rows = executor.execute_sql("SELECT * FROM big JOIN small ON big.tag = small.tag").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec!["7".to_string(), "5".to_string(), "99".to_string(), "5".to_string()]);
+    }
+
+    #[test]
+    fn test_join_non_equality_condition_still_uses_nested_loop() {
+        // A ">" condition between two bare columns is structurally valid
+        // (passes the "compares two real columns" check) but isn't
+        // hash-joinable -- must still fall back to the nested loop and
+        // produce correct results, not be silently dropped or mishandled.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, val) VALUES (1, 10)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, val) VALUES (1, 3)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, val) VALUES (2, 20)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a JOIN b ON a.val > b.val").unwrap();
+        assert_eq!(rows.len(), 1); // a.val=10 > b.val=3, but not > b.val=20
+        assert!(rows[0].contains(&"3".to_string()));
     }
 
     #[test]

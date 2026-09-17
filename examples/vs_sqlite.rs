@@ -12,11 +12,16 @@
 //! One thing is *not* forced to parity, deliberately, because doing so
 //! would misrepresent one engine rather than compare them honestly: **the
 //! join query's plan.** Neither table has a secondary index on the join
-//! column on either engine. SQLite's query planner is free to pick
-//! whatever strategy it wants for that; ShrestiDB always does a nested
-//! loop (see `execution::executor`). That's not a handicap applied to
-//! either side — it's genuinely how each engine would run this query
-//! today.
+//! column on either engine, and SQLite's query planner is free to pick
+//! whatever strategy it wants for that. ShrestiDB picks its own strategy
+//! from the condition's shape (see `execution::executor`): an equality
+//! between two bare columns, this query's shape, runs as a hash join;
+//! anything else falls back to a nested loop. That's not a handicap
+//! applied to either side — it's genuinely how each engine would run this
+//! query today. (The join used to run on separate tables far smaller than
+//! the scan/aggregation ones, specifically because the nested loop it had
+//! no alternative to then was too slow at matching scale — see
+//! `examples/tpc_h.rs`'s module doc. Hash join removed that constraint.)
 //!
 //! The load phase *is* apples-to-apples now: both sides use a real
 //! prepared, parameterized statement (`QueryExecutor::prepare`/
@@ -35,8 +40,6 @@ use std::time::{Duration, Instant};
 
 const NUM_ORDERS: i64 = 20_000;
 const NUM_CUSTOMERS: i64 = 2_000;
-const JOIN_ORDERS: i64 = 3_000;
-const JOIN_CUSTOMERS: i64 = 300;
 
 fn sqlite_query(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     let mut stmt = conn.prepare(sql).unwrap();
@@ -155,63 +158,18 @@ fn main() {
     println!("  ShrestiDB/SQLite: {}", ratio(sqlite_agg, shresti_agg));
     println!();
 
-    // Separate, smaller tables for the join -- see examples/tpc_h.rs's
-    // module doc on why (always a nested loop with no join-key index).
-    shresti
-        .execute_sql("CREATE TABLE join_orders (o_orderkey INT PRIMARY KEY, o_custkey INT, o_totalprice FLOAT)")
-        .unwrap();
-    shresti
-        .execute_sql("CREATE TABLE join_customer (c_custkey INT PRIMARY KEY, c_name VARCHAR(50))")
-        .unwrap();
-    sqlite
-        .execute(
-            "CREATE TABLE join_orders (o_orderkey INTEGER PRIMARY KEY, o_custkey INTEGER, o_totalprice REAL)",
-            [],
-        )
-        .unwrap();
-    sqlite
-        .execute("CREATE TABLE join_customer (c_custkey INTEGER PRIMARY KEY, c_name TEXT)", [])
-        .unwrap();
-    {
-        let shresti_orders_stmt = shresti
-            .prepare("INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES (?, ?, ?)")
-            .unwrap();
-        let mut sqlite_orders_stmt = sqlite
-            .prepare("INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES (?1, ?2, ?3)")
-            .unwrap();
-        for i in 1..=JOIN_ORDERS {
-            let custkey = 1 + (i % JOIN_CUSTOMERS);
-            let price = 100.0 + (i as f64 * 1.337) % 5000.0;
-            shresti
-                .execute_prepared(&shresti_orders_stmt, &[Value::Integer(i), Value::Integer(custkey), Value::Float(price)])
-                .unwrap();
-            sqlite_orders_stmt.execute(rusqlite::params![i, custkey, price]).unwrap();
-        }
-        let shresti_customer_stmt =
-            shresti.prepare("INSERT INTO join_customer (c_custkey, c_name) VALUES (?, ?)").unwrap();
-        let mut sqlite_customer_stmt =
-            sqlite.prepare("INSERT INTO join_customer (c_custkey, c_name) VALUES (?1, ?2)").unwrap();
-        for i in 1..=JOIN_CUSTOMERS {
-            shresti
-                .execute_prepared(&shresti_customer_stmt, &[Value::Integer(i), Value::String(format!("Customer{i}"))])
-                .unwrap();
-            sqlite_customer_stmt.execute(rusqlite::params![i, format!("Customer{i}")]).unwrap();
-        }
-    }
-
-    println!("--- Join: join_orders JOIN join_customer ON o_custkey = c_custkey ({JOIN_ORDERS} x {JOIN_CUSTOMERS}) ---");
+    println!("--- Join: orders JOIN customer ON o_custkey = c_custkey ({NUM_ORDERS} x {NUM_CUSTOMERS}) ---");
     let start = Instant::now();
-    let shresti_rows = shresti
-        .execute_sql("SELECT * FROM join_orders JOIN join_customer ON join_orders.o_custkey = join_customer.c_custkey")
-        .unwrap();
+    let shresti_rows =
+        shresti.execute_sql("SELECT * FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey").unwrap();
     let shresti_join = start.elapsed();
     let start = Instant::now();
     let sqlite_rows = sqlite_query(
         &sqlite,
-        "SELECT * FROM join_orders JOIN join_customer ON join_orders.o_custkey = join_customer.c_custkey",
+        "SELECT * FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey",
     );
     let sqlite_join = start.elapsed();
-    println!("  ShrestiDB: {} rows in {:?} (always nested loop)", shresti_rows.len(), shresti_join);
+    println!("  ShrestiDB: {} rows in {:?} (hash join)", shresti_rows.len(), shresti_join);
     println!("  SQLite:    {} rows in {:?} (planner's choice)", sqlite_rows.len(), sqlite_join);
     println!("  ShrestiDB/SQLite: {}", ratio(sqlite_join, shresti_join));
     println!();

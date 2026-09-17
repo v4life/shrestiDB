@@ -33,8 +33,6 @@ use std::time::{Duration, Instant};
 
 const NUM_ORDERS: i64 = 20_000;
 const NUM_CUSTOMERS: i64 = 2_000;
-const JOIN_ORDERS: i64 = 3_000;
-const JOIN_CUSTOMERS: i64 = 300;
 
 fn pg_url() -> String {
     if let Ok(url) = std::env::var("SHRESTIDB_PG_URL") {
@@ -83,7 +81,7 @@ fn main() {
         .execute_sql("CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_name VARCHAR(50))")
         .unwrap();
 
-    for table in ["orders", "customer", "join_orders", "join_customer"] {
+    for table in ["orders", "customer"] {
         pg.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]).unwrap();
     }
     pg.execute(
@@ -161,60 +159,20 @@ fn main() {
     println!("  ShrestiDB/Postgres: {}", ratio(pg_agg, shresti_agg));
     println!();
 
-    shresti
-        .execute_sql("CREATE TABLE join_orders (o_orderkey INT PRIMARY KEY, o_custkey INT, o_totalprice FLOAT)")
-        .unwrap();
-    shresti
-        .execute_sql("CREATE TABLE join_customer (c_custkey INT PRIMARY KEY, c_name VARCHAR(50))")
-        .unwrap();
-    pg.execute(
-        "CREATE TABLE join_orders (o_orderkey BIGINT PRIMARY KEY, o_custkey BIGINT, o_totalprice DOUBLE PRECISION)",
-        &[],
-    )
-    .unwrap();
-    pg.execute("CREATE TABLE join_customer (c_custkey BIGINT PRIMARY KEY, c_name TEXT)", &[]).unwrap();
-    {
-        let shresti_stmt = shresti
-            .prepare("INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES (?, ?, ?)")
-            .unwrap();
-        let stmt =
-            pg.prepare("INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES ($1, $2, $3)").unwrap();
-        for i in 1..=JOIN_ORDERS {
-            let custkey = 1 + (i % JOIN_CUSTOMERS);
-            let price = 100.0 + (i as f64 * 1.337) % 5000.0;
-            shresti
-                .execute_prepared(&shresti_stmt, &[Value::Integer(i), Value::Integer(custkey), Value::Float(price)])
-                .unwrap();
-            pg.execute(&stmt, &[&i, &custkey, &price]).unwrap();
-        }
-        let shresti_stmt = shresti.prepare("INSERT INTO join_customer (c_custkey, c_name) VALUES (?, ?)").unwrap();
-        let stmt = pg.prepare("INSERT INTO join_customer (c_custkey, c_name) VALUES ($1, $2)").unwrap();
-        for i in 1..=JOIN_CUSTOMERS {
-            shresti
-                .execute_prepared(&shresti_stmt, &[Value::Integer(i), Value::String(format!("Customer{i}"))])
-                .unwrap();
-            pg.execute(&stmt, &[&i, &format!("Customer{i}")]).unwrap();
-        }
-    }
-
-    println!("--- Join: join_orders JOIN join_customer ON o_custkey = c_custkey ({JOIN_ORDERS} x {JOIN_CUSTOMERS}) ---");
+    println!("--- Join: orders JOIN customer ON o_custkey = c_custkey ({NUM_ORDERS} x {NUM_CUSTOMERS}) ---");
     let start = Instant::now();
-    let shresti_rows = shresti
-        .execute_sql("SELECT * FROM join_orders JOIN join_customer ON join_orders.o_custkey = join_customer.c_custkey")
-        .unwrap();
+    let shresti_rows =
+        shresti.execute_sql("SELECT * FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey").unwrap();
     let shresti_join = start.elapsed();
     let start = Instant::now();
-    let pg_rows = pg_query(
-        &mut pg,
-        "SELECT * FROM join_orders JOIN join_customer ON join_orders.o_custkey = join_customer.c_custkey",
-    );
+    let pg_rows = pg_query(&mut pg, "SELECT * FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey");
     let pg_join = start.elapsed();
-    println!("  ShrestiDB: {} rows in {:?} (always nested loop)", shresti_rows.len(), shresti_join);
+    println!("  ShrestiDB: {} rows in {:?} (hash join)", shresti_rows.len(), shresti_join);
     println!("  Postgres:  {} rows in {:?} (planner's choice)", pg_rows.len(), pg_join);
     println!("  ShrestiDB/Postgres: {}", ratio(pg_join, shresti_join));
     println!();
 
-    for table in ["orders", "customer", "join_orders", "join_customer"] {
+    for table in ["orders", "customer"] {
         pg.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]).unwrap();
     }
 

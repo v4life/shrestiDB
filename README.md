@@ -235,34 +235,41 @@ cargo run --example tpc_h --release
 ```
 
 Real output from a run on the author's machine (Apple Silicon Mac, not a
-controlled benchmark environment — see the caveats in the example's own
-module doc, including why the join query's scale is much smaller than the
-scan/aggregation tables):
+controlled benchmark environment — see the example's own module doc for
+what's simplified):
 ```
 === TPC-H-lite ===
 
 Loading 20000 orders and 2000 customers...
-Loaded in 448.4ms
+Loaded in 177.9ms
 
 Range Scan: SELECT * FROM orders WHERE o_orderkey >= 10000
-  10001 rows in 14.8ms (PK-index-accelerated)
+  10001 rows in 12.8ms (PK-index-accelerated)
 
 Aggregation: SELECT COUNT(*), SUM(o_totalprice) FROM orders
-  count=20000, sum=49878369.99999965 in 11.4ms (full scan)
+  count=20000, sum=49878370.000000276 in 11.7ms (full scan)
 
-Join Query: SELECT * FROM join_orders JOIN join_customer ON join_orders.o_custkey = join_customer.c_custkey
-  3000 rows (3000 orders x 300 customers, nested loop) in 14.7ms
+Join Query: SELECT * FROM orders JOIN customer ON orders.o_custkey = customer.c_custkey
+  20000 rows (20000 orders x 2000 customers, hash join) in 42.2ms
 ```
-The join went from 1.80s to 14.7ms across two fixes to `evaluate_predicate`/the
-join loop, in order: compiling its predicate once per query instead of
-re-parsing the string on every row pair (1.80s → 497ms — see
-[`row_codec::CompiledPredicate`](src/execution/row_codec.rs)), then not
-cloning and merging a row pair's values into a `Tuple` at all until the
-condition is known to match, instead of doing that unconditionally for
-every pair and discarding most of them (497ms → 14.7ms — 897,000 of this
-join's 900,000 pairs never match). The second fix was the far bigger
-win — worth remembering when guessing at where time actually goes instead
-of measuring.
+The join now runs at the *same* scale as the scan/aggregation tables —
+it didn't used to, and that history is worth keeping. Three fixes, in
+order: compiling `evaluate_predicate`'s predicate once per query instead
+of re-parsing the string on every row pair (1.80s → 497ms, at the old
+3,000 x 300 scale — see
+[`row_codec::CompiledPredicate`](src/execution/row_codec.rs)); not
+cloning a row pair's values into a `Tuple` at all until the condition is
+known to match, instead of doing that for every pair and discarding most
+of them (497ms → 14.7ms, still at 3,000 x 300 — see
+`CompiledPredicate::eval_split`); then, once those stopped being the
+bottleneck, running the join as a real hash join instead of a nested loop
+at all for its plain-equality condition — O(orders + customers) instead
+of O(orders × customers) — which is what actually let the join scale up
+to match the other tables: 20,000 x 2,000 (40M possible pairs) in 42ms,
+where the old nested loop needed a table 6-7x smaller just to stay fast.
+Measuring the join at matching scale was never possible before hash
+join existed; it's not a coincidence that the scale changed in the same
+commit as the algorithm.
 
 ### Running TPC-C-lite
 ```bash
@@ -369,29 +376,29 @@ This project demonstrates several novel contributions:
 ### TPC-H-lite (20K orders, 2K customers — see [`examples/tpc_h.rs`](examples/tpc_h.rs))
 These are ShrestiDB's own measured numbers, produced by `cargo run
 --example tpc_h --release`. There's no "Traditional DB" anywhere in this
-codebase to compare against, so unlike an earlier version of this table,
-there's no fabricated baseline or speedup column here — see the example's
-module doc for exact scale and caveats (the join query in particular runs
-on a much smaller 3,000 x 300 table pair: it's always a nested loop with
-no index on the join column, so its cost is inherently O(left * right)
-regardless of the predicate-parsing fix described below).
+codebase to compare against, so there's no fabricated baseline or speedup
+column here — see the example's module doc for exact scale and caveats.
 
 | Query | Scale | Time |
 |-------|-------|------|
-| Range Scan (PK-indexed) | 20,000 orders | 14.8ms |
-| Aggregation (full scan) | 20,000 orders | 11.4ms |
-| Join Query (nested loop) | 3,000 x 300 | 14.7ms |
+| Range Scan (PK-indexed) | 20,000 orders | 12.8ms |
+| Aggregation (full scan) | 20,000 orders | 11.7ms |
+| Join Query (hash join) | 20,000 x 2,000 | 42.2ms |
 
-The join figure is after two fixes, applied in order: compiling
+The join runs at the same scale as everything else in this table now — it
+didn't used to. It went through three fixes to get there: compiling
 `evaluate_predicate`'s predicate once per query instead of re-parsing the
-string on every row pair (1.80s → 497ms — see
-[`row_codec::CompiledPredicate`](src/execution/row_codec.rs)), then not
-cloning a row pair's values into a merged `Tuple` at all until the
-condition is known to match, instead of doing that for every pair and
-discarding 897,000 of this join's 900,000 (497ms → 14.7ms). The second
-fix was the far bigger one — a useful reminder that "the predicate parser
-was slow" and "the join is slow" aren't the same diagnosis just because
-fixing the first one helped.
+string on every row pair (1.80s → 497ms, at the old 3,000 x 300 scale —
+see [`row_codec::CompiledPredicate`](src/execution/row_codec.rs)); not
+cloning a row pair's values into a merged `Tuple` until the condition is
+known to match, instead of doing that unconditionally (497ms → 14.7ms,
+still at 3,000 x 300); then replacing the always-nested-loop join with a
+real hash join for its plain-equality condition — O(orders + customers)
+instead of O(orders × customers) — which is what actually let the join
+scale up to 20,000 x 2,000 (40M possible pairs) at 42ms, where the old
+algorithm needed a table 6-7x smaller just to stay fast. The middle fix
+looked biggest in isolation; the last one is what actually removed the
+scale ceiling.
 
 ### TPC-C-lite (see [`examples/oltp.rs`](examples/oltp.rs))
 WAL-backed, fsync-per-commit, 4 threads. Produced by `cargo run --example
@@ -446,19 +453,19 @@ shows up as data grows: by 1M records PGM is 7.2x and RMI is 36.8x
 faster than the B-Tree baseline.
 
 ### vs SQLite / vs Postgres (real comparisons)
-Same TPC-H-lite workload (20K orders, 2K customers; join on a smaller
-3,000 x 300 pair — see [`examples/tpc_h.rs`](examples/tpc_h.rs)'s module
-doc for why) run against real SQLite and Postgres instances, not a
-fabricated baseline. **Read the caveats below the table before drawing
-conclusions from it** — the two comparisons aren't measuring the same
-thing, on purpose.
+Same TPC-H-lite workload (20K orders, 2K customers, joined at that same
+20K x 2K scale — see [`examples/tpc_h.rs`](examples/tpc_h.rs)'s module
+doc) run against real SQLite and Postgres instances, not a fabricated
+baseline. **Read the caveats below the table before drawing conclusions
+from it** — the two comparisons aren't measuring the same thing, on
+purpose.
 
 | Query | ShrestiDB vs SQLite | ShrestiDB vs Postgres |
 |-------|---------------------|------------------------|
-| Load (20K + 2K rows) | 3.27x slower | **11.1x faster** |
-| Range Scan (PK-indexed) | 2.24x slower | **faster (0.62x)** |
-| Aggregation (full scan) | 8.80x slower | 2.52x slower |
-| Join (nested loop, 3K x 300) | 4.11x slower | 2.97x slower |
+| Load (20K + 2K rows) | 3.78x slower | **19.5x faster** |
+| Range Scan (PK-indexed) | 1.76x slower | **faster (0.83x)** |
+| Aggregation (full scan) | 5.36x slower | 2.67x slower |
+| Join (hash join, 20K x 2K) | 1.49x slower | 1.21x slower |
 
 ("Nx slower/faster" = ShrestiDB's time relative to the other engine's,
 for the same query. Run-to-run noise moves these by a point or so —
@@ -467,16 +474,15 @@ don't read the exact digits as more precise than they are.)
 **What this does and doesn't tell you:**
 - **[`vs_sqlite.rs`](examples/vs_sqlite.rs)** is genuinely apples-to-apples:
   both engines in-process, both in-memory (no disk I/O on either side),
-  both fully materializing every result row before the clock stops. The
-  load numbers are now apples-to-apples too: both sides use a real
-  prepared, parameterized statement (`QueryExecutor::prepare`/
-  `execute_prepared` — see [`row_codec`](src/execution/row_codec.rs)'s
-  `?`/`$N` placeholder support), not a fresh `sqlparser` run per row. That
-  cut ShrestiDB's load gap from 10.10x slower to 3.27x — the remaining
-  difference is real per-statement overhead (each `execute_prepared` call
-  still walks the cached statement, re-parses each bound literal via
-  `parse_value`, and takes a lock/transaction per statement), not the
-  giant one this replaced.
+  both fully materializing every result row before the clock stops, and
+  both loaded through a real prepared, parameterized statement
+  (`QueryExecutor::prepare`/`execute_prepared` on ShrestiDB's side — see
+  [`row_codec`](src/execution/row_codec.rs)'s `?`/`$N` placeholder
+  support). That cut ShrestiDB's load gap from 10.10x slower to 3.78x —
+  the remaining difference is real per-statement overhead (each
+  `execute_prepared` call still walks the cached statement, re-parses
+  each bound literal via `parse_value`, and takes a lock/transaction per
+  statement), not the giant re-parse-per-row gap this replaced.
 - **[`vs_postgres.rs`](examples/vs_postgres.rs)** is *not*
   apples-to-apples, deliberately: Postgres pays a real client/server
   round trip per statement (even over loopback) that the other two never
@@ -485,22 +491,22 @@ don't read the exact digits as more precise than they are.)
   being faster. Take the Postgres numbers as "where we stand against a
   real client/server RDBMS as actually deployed," not as an isolated
   measurement of execution speed.
-- **The join gap, the clearest finding from both comparisons, is now
-  mostly closed** — from 350-530x slower down to 2.75-4.56x, across two
-  fixes: compiling `evaluate_predicate`'s predicate once instead of
-  re-parsing it per row pair (350-530x → 73-109x), then not cloning a row
-  pair's values into a merged `Tuple` at all until the condition is known
-  to match, instead of doing that unconditionally and discarding most of
-  them (73-109x → 2.75-4.56x — see
-  [`row_codec::CompiledPredicate::eval_split`](src/execution/row_codec.rs)).
-  The second fix did almost all the remaining work, which is worth sitting
-  with: the first fix looked like *the* fix for a nested-loop join being
-  slow, and it wasn't — it was one of two, and the smaller one. What's
-  left of the gap now is structural, not a bug: still an always-unindexed
-  nested loop against engines whose query planners can pick a smarter
-  strategy, which is a real next target if a query planner is ever
-  scoped in, not something worth chasing further as a standalone
-  micro-optimization.
+- **The join gap is now mostly closed, and the join runs at real scale
+  for the first time.** It was 350-530x slower at the old, deliberately
+  tiny 3,000 x 300 scale — a scale that small specifically because the
+  nested loop it had no alternative to couldn't run any larger without
+  becoming impractical to even benchmark. Three fixes got it to 1.21-1.49x
+  at 20,000 x 2,000 (40M possible pairs, not 900K): compiling the
+  predicate once instead of re-parsing it per pair (350-530x → 73-109x,
+  still at the old scale); not cloning a row pair's values into a merged
+  `Tuple` until the condition is known to match (73-109x → 2.75-4.56x,
+  still at the old scale — see
+  [`row_codec::CompiledPredicate::eval_split`](src/execution/row_codec.rs));
+  then replacing the nested loop itself with a real hash join for
+  equality conditions (see `execution::executor::hash_join`) — which
+  didn't just narrow the gap further, it's what actually removed the
+  scale ceiling the first two fixes never touched. The two earlier fixes
+  made a slow algorithm faster; the third replaced the algorithm.
 
 ## 🤝 Contributing
 
