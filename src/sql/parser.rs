@@ -29,13 +29,18 @@ pub enum SQLStatement {
 }
 
 /// One `JOIN` clause: the joined table and its `ON` condition, rendered as
-/// a flattened string like `where_clause` (e.g. `"users.id = orders.user_id"`)
-/// — there's no expression tree kept around, just like everywhere else in
-/// this AST. `USING`/`NATURAL` joins aren't specially handled: their
-/// condition comes through as `None`, same as an explicit `CROSS JOIN`.
+/// a flattened string like `where_clause` (e.g. `"users.id = orders.user_id"`,
+/// or `"u.id = o.user_id"` if the query used aliases — see `alias`) — there's
+/// no expression tree kept around, just like everywhere else in this AST.
+/// `USING`/`NATURAL` joins aren't specially handled: their condition comes
+/// through as `None`, same as an explicit `CROSS JOIN`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinClause {
     pub table: String,
+    /// The table's alias (`JOIN orders AS o` / `JOIN orders o`), if any.
+    /// `condition` refers to this table by the alias when one is given —
+    /// see `execution::executor::QueryExecutor::merge_schemas`.
+    pub alias: Option<String>,
     pub condition: Option<String>,
 }
 
@@ -45,6 +50,8 @@ pub struct SelectStatement {
     /// Column expressions as written, or `["*"]` for `SELECT *`.
     pub columns: Vec<String>,
     pub from: String,
+    /// The FROM table's alias (`FROM users AS u` / `FROM users u`), if any.
+    pub from_alias: Option<String>,
     /// Any tables joined to `from`, in `JOIN` order.
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<String>,
@@ -166,6 +173,7 @@ impl SQLParser {
             .first()
             .map(|t| Self::table_factor_name(&t.relation))
             .unwrap_or_default();
+        let from_alias = select.from.first().and_then(|t| Self::table_factor_alias(&t.relation));
         let joins = select
             .from
             .first()
@@ -174,6 +182,7 @@ impl SQLParser {
                     .iter()
                     .map(|j| JoinClause {
                         table: Self::table_factor_name(&j.relation),
+                        alias: Self::table_factor_alias(&j.relation),
                         condition: Self::join_condition(&j.join_operator),
                     })
                     .collect()
@@ -191,6 +200,7 @@ impl SQLParser {
         Ok(SQLStatement::Select(SelectStatement {
             columns,
             from,
+            from_alias,
             joins,
             where_clause,
             group_by,
@@ -219,6 +229,14 @@ impl SQLParser {
         match factor {
             ast::TableFactor::Table { name, .. } => name.to_string(),
             other => other.to_string(),
+        }
+    }
+
+    /// The table's alias, if the query gave it one (`FROM t AS a` / `FROM t a`).
+    fn table_factor_alias(factor: &ast::TableFactor) -> Option<String> {
+        match factor {
+            ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+            _ => None,
         }
     }
 

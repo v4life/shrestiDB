@@ -25,6 +25,10 @@ pub enum LogicalPlanNode {
     Scan {
         table_id: u32,
         table_name: String,
+        /// The table's alias in the query (`FROM t AS a`), if any — used to
+        /// qualify this table's columns when it's joined to another (see
+        /// `execution::executor::QueryExecutor::merge_schemas`).
+        alias: Option<String>,
         rows: usize,
     },
     Filter {
@@ -33,6 +37,8 @@ pub enum LogicalPlanNode {
     },
     Join {
         right_table: String,
+        /// The joined table's alias, if any — same role as `Scan::alias`.
+        right_alias: Option<String>,
         /// The `ON` condition, flattened to a string (see `sql::parser`'s
         /// `JoinClause`). `None` means an unconditional join (`CROSS JOIN`,
         /// or a `USING`/`NATURAL` join — those aren't specially resolved,
@@ -106,6 +112,7 @@ impl QueryPlanner {
                     nodes: vec![LogicalPlanNode::Scan {
                         table_id: 0,
                         table_name: String::new(),
+                        alias: None,
                         rows: 0,
                     }],
                     estimated_cost: 0.0,
@@ -118,6 +125,7 @@ impl QueryPlanner {
         let mut nodes = vec![LogicalPlanNode::Scan {
             table_id: 0,
             table_name: select.from.clone(),
+            alias: select.from_alias.clone(),
             rows,
         }];
 
@@ -130,6 +138,7 @@ impl QueryPlanner {
             );
             nodes.push(LogicalPlanNode::Join {
                 right_table: join.table.clone(),
+                right_alias: join.alias.clone(),
                 condition: join.condition.clone(),
                 left_rows,
                 right_rows,

@@ -11,10 +11,10 @@
 //! OLTP store, so a table created this way can immediately be inserted
 //! into. `Aggregate` nodes (COUNT/SUM/AVG/MIN/MAX with no GROUP BY) execute
 //! for real, and so does `Join` — a nested-loop join whose `ON` condition
-//! must compare two real columns (see `merge_schemas`); anything it can't
-//! recognize that way errors rather than silently returning an unfiltered
-//! cross product. There is no `GROUP BY`, and a `JOIN` condition using a
-//! table alias (rather than the table's real name) won't resolve.
+//! must compare two real columns (see `merge_schemas`), qualified by either
+//! the table's real name or its alias if the query gave it one; anything it
+//! can't recognize that way errors rather than silently returning an
+//! unfiltered cross product.
 //!
 //! `new()` is in-memory only, same as always. `open(path)` is the durable
 //! entry point: every CREATE TABLE and every committed write is logged to
@@ -161,19 +161,28 @@ impl QueryExecutor {
     /// just not accelerated.
     pub fn execute(&self, plan: &PhysicalPlan) -> Result<Vec<Vec<String>>> {
         let mut current: Option<(TableSchema, Vec<Tuple>)> = None;
+        // The qualifier a subsequent Join should prefix `current`'s columns
+        // with. `Some` right after a Scan (its alias, or the real table name
+        // if none was given); taken (leaving `None`) the first time it's
+        // consumed by a Join, since a merged schema's columns are already
+        // qualified and must not be prefixed again on a later join in a
+        // chain — see `merge_schemas`.
+        let mut current_qualifier: Option<String> = None;
         let mut nodes = plan.nodes.iter().peekable();
 
         while let Some(node) = nodes.next() {
             match node {
-                LogicalPlanNode::Scan { table_name, .. } => {
+                LogicalPlanNode::Scan { table_name, alias, .. } => {
                     if let Some(LogicalPlanNode::Filter { predicate, .. }) = nodes.peek() {
                         if let Some(indexed) = self.try_indexed_scan(table_name, predicate)? {
                             nodes.next(); // the Filter is already applied by the index lookup
                             current = Some(indexed);
+                            current_qualifier = Some(alias.clone().unwrap_or_else(|| table_name.clone()));
                             continue;
                         }
                     }
                     current = Some(self.scan_table_tuples(table_name)?);
+                    current_qualifier = Some(alias.clone().unwrap_or_else(|| table_name.clone()));
                 }
                 LogicalPlanNode::Filter { predicate, .. } => {
                     let (schema, tuples) = current
@@ -185,12 +194,15 @@ impl QueryExecutor {
                         .collect();
                     current = Some((schema, filtered));
                 }
-                LogicalPlanNode::Join { right_table, condition, .. } => {
+                LogicalPlanNode::Join { right_table, right_alias, condition, .. } => {
                     let (left_schema, left_tuples) = current
                         .take()
                         .ok_or_else(|| DatabaseError::ExecutionError("JOIN with no input".to_string()))?;
                     let (right_schema, right_tuples) = self.scan_table_tuples(right_table)?;
-                    let merged_schema = Self::merge_schemas(&left_schema, &right_schema);
+                    let left_prefix = current_qualifier.take();
+                    let right_prefix = right_alias.clone().unwrap_or_else(|| right_table.clone());
+                    let merged_schema =
+                        Self::merge_schemas(&left_schema, left_prefix.as_deref(), &right_schema, &right_prefix);
 
                     if let Some(cond) = condition {
                         let (left_tok, _, right_tok) = row_codec::split_comparison(cond).ok_or_else(|| {
@@ -428,24 +440,40 @@ impl QueryExecutor {
     }
 
     /// Build the schema for a joined row: `left`'s columns followed by
-    /// `right`'s, each renamed to `"<table>.<column>"` so (a) two tables
-    /// with a same-named column don't collide, and (b) an `ON` condition
-    /// like `"users.id = orders.user_id"` — rendered by `sql::parser`
-    /// exactly that way for a qualified reference — resolves directly
-    /// against these names. A condition using a table *alias* rather than
-    /// its real name won't resolve; there's no alias tracking here.
-    fn merge_schemas(left: &TableSchema, right: &TableSchema) -> TableSchema {
+    /// `right`'s. `right`'s columns are always renamed to
+    /// `"<right_prefix>.<column>"`, where `right_prefix` is the joined
+    /// table's alias if the query gave it one, or its real name otherwise
+    /// — matching how `sql::parser` renders a qualified reference in the
+    /// `ON` condition (`"o.user_id"` for `JOIN orders o`, `"orders.user_id"`
+    /// for a plain `JOIN orders`), so the condition resolves directly
+    /// against these names either way.
+    ///
+    /// `left_prefix` is `Some(qualifier)` when `left` is a single raw table
+    /// scan not yet qualified (the same alias-or-name rule), and `None`
+    /// when `left` is itself already the merged output of an earlier join
+    /// in a chain — its columns are already `"qualifier.column"` and must
+    /// be left alone rather than re-prefixed a second time.
+    fn merge_schemas(left: &TableSchema, left_prefix: Option<&str>, right: &TableSchema, right_prefix: &str) -> TableSchema {
         let mut merged = TableSchema::new(0, format!("{}_{}", left.name, right.name));
         let mut next_id = 1u32;
-        for (table, col) in left
-            .columns
-            .iter()
-            .map(|c| (left, c))
-            .chain(right.columns.iter().map(|c| (right, c)))
-        {
+        for col in &left.columns {
+            let name = match left_prefix {
+                Some(prefix) => format!("{prefix}.{}", col.name),
+                None => col.name.clone(),
+            };
             merged.add_column(Column {
                 id: next_id,
-                name: format!("{}.{}", table.name, col.name),
+                name,
+                data_type: col.data_type,
+                nullable: col.nullable,
+                primary_key: false,
+            });
+            next_id += 1;
+        }
+        for col in &right.columns {
+            merged.add_column(Column {
+                id: next_id,
+                name: format!("{right_prefix}.{}", col.name),
                 data_type: col.data_type,
                 nullable: col.nullable,
                 primary_key: false,
@@ -1210,6 +1238,65 @@ mod tests {
             .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_join_with_aliases_on_both_tables() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_users(&executor); // ids 1 (Alice), 2 (Bob)
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 9.5)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (101, 2, 4.0)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (102, 1, 2.0)")
+            .unwrap();
+
+        let rows = executor
+            .execute_sql("SELECT * FROM users u JOIN orders o ON u.id = o.user_id")
+            .unwrap();
+
+        assert_eq!(rows.len(), 3); // Alice has 2 orders, Bob has 1
+        let alice_orders = rows.iter().filter(|r| r.contains(&"Alice".to_string())).count();
+        assert_eq!(alice_orders, 2);
+    }
+
+    #[test]
+    fn test_join_with_alias_only_on_joined_table() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_users(&executor);
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 9.5)")
+            .unwrap();
+
+        // FROM table unaliased, joined table aliased -- the condition must
+        // resolve "users.id" (real name) against "o.user_id" (alias).
+        let rows = executor
+            .execute_sql("SELECT * FROM users JOIN orders o ON users.id = o.user_id")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+    }
+
+    #[test]
+    fn test_join_with_alias_and_where_on_aliased_column() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_users(&executor); // Alice age 30, Bob age 15
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 9.5)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO orders (id, user_id, total) VALUES (101, 2, 4.0)")
+            .unwrap();
+
+        let rows = executor
+            .execute_sql("SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 18")
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
     }
 
     #[test]
