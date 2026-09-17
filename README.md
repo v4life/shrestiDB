@@ -147,7 +147,9 @@ shrestidb/
 └── examples/                           # Example Workloads
     ├── tpc_h.rs                        # TPC-H analytical workload
     ├── oltp.rs                         # TPC-C-lite OLTP benchmark (New-Order/Payment)
-    └── learned_index_demo.rs           # Learned index showcase
+    ├── learned_index_demo.rs           # Learned index showcase (PGM/RMI/B-Tree)
+    ├── vs_sqlite.rs                    # Real comparison vs SQLite (in-process)
+    └── vs_postgres.rs                  # Real comparison vs Postgres (client/server)
 ```
 
 ## 🔧 Building
@@ -283,6 +285,17 @@ cargo run --example learned_index_demo --release
 
 Shows detailed performance comparison between PGM, RMI, and B-Tree — all three built and searched for real over the same key sets — across different dataset sizes. Feeds the [Index Build Performance](#index-build-performance) numbers below.
 
+### Running vs SQLite / vs Postgres
+```bash
+cargo run --example vs_sqlite --release
+
+# Needs a reachable Postgres (defaults to host=localhost port=5432,
+# user/dbname = $USER; override with SHRESTIDB_PG_URL):
+cargo run --example vs_postgres --release
+```
+
+Real, in-process (`vs_sqlite`) or real client/server (`vs_postgres`) comparisons against the same TPC-H-lite workload as `examples/tpc_h.rs`. Read both examples' module docs before trusting the numbers at a glance — each documents exactly what is and isn't held equal between engines (see [vs SQLite / vs Postgres](#vs-sqlite--vs-postgres-real-comparisons) below for the short version).
+
 ## 📚 Documentation
 
 ### Design Document
@@ -386,6 +399,48 @@ Honestly: at 10K, PGM lookup is actually *slower* than the B-Tree —
 fixed per-lookup overhead dominates at small scale. The real advantage
 shows up as data grows: by 1M records PGM is 7.2x and RMI is 36.8x
 faster than the B-Tree baseline.
+
+### vs SQLite / vs Postgres (real comparisons)
+Same TPC-H-lite workload (20K orders, 2K customers; join on a smaller
+3,000 x 300 pair — see [`examples/tpc_h.rs`](examples/tpc_h.rs)'s module
+doc for why) run against real SQLite and Postgres instances, not a
+fabricated baseline. **Read the caveats below the table before drawing
+conclusions from it** — the two comparisons aren't measuring the same
+thing, on purpose.
+
+| Query | ShrestiDB vs SQLite | ShrestiDB vs Postgres |
+|-------|---------------------|------------------------|
+| Load (20K + 2K rows) | 10.24x slower | **7.7x faster** |
+| Range Scan (PK-indexed) | 1.81x slower | ~tied (0.95x) |
+| Aggregation (full scan) | 9.02x slower | 3.23x slower |
+| Join (nested loop, 3K x 300) | **530x slower** | **351x slower** |
+
+("Nx slower/faster" = ShrestiDB's time relative to the other engine's,
+for the same query.)
+
+**What this does and doesn't tell you:**
+- **[`vs_sqlite.rs`](examples/vs_sqlite.rs)** is genuinely apples-to-apples:
+  both engines in-process, both in-memory (no disk I/O on either side),
+  both fully materializing every result row before the clock stops.
+  SQLite's load numbers use a real prepared, parameterized statement —
+  ShrestiDB has no prepared-statement API yet, so its load numbers
+  include a full SQL re-parse on every single statement. That gap is
+  real, not a benchmark artifact, and it shows: SQLite loads over 10x
+  faster.
+- **[`vs_postgres.rs`](examples/vs_postgres.rs)** is *not*
+  apples-to-apples, deliberately: Postgres pays a real client/server
+  round trip per statement (even over loopback) that the other two never
+  pay, which is most of why ShrestiDB's *load* number looks faster than
+  Postgres here — that's IPC overhead dominating, not query execution
+  being faster. Take the Postgres numbers as "where we stand against a
+  real client/server RDBMS as actually deployed," not as an isolated
+  measurement of execution speed.
+- **The join result is the one honest, unambiguous finding across both
+  comparisons**: ShrestiDB is 350-530x slower at a join than either real
+  database, because `evaluate_predicate` re-parses its predicate string
+  on every row pair instead of caching a parsed expression tree (see
+  `execution::row_codec`). This is the clearest concrete next
+  optimization target this exercise surfaced.
 
 ## 🤝 Contributing
 
