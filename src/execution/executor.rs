@@ -192,10 +192,10 @@ impl QueryExecutor {
                     // Compiled once, outside the loop -- see
                     // row_codec::CompiledPredicate's docs on why that
                     // matters for anything past a handful of rows.
-                    let compiled = row_codec::CompiledPredicate::compile(predicate);
+                    let compiled = row_codec::CompiledPredicate::compile(predicate, &schema);
                     let filtered = tuples
                         .into_iter()
-                        .filter(|t| compiled.as_ref().and_then(|c| c.eval(&schema, t)).unwrap_or(true))
+                        .filter(|t| compiled.as_ref().and_then(|c| c.eval(t)).unwrap_or(true))
                         .collect();
                     current = Some((schema, filtered));
                 }
@@ -227,20 +227,27 @@ impl QueryExecutor {
                     // exactly the cost that made this join 350-500x
                     // slower than SQLite/Postgres on the same query (see
                     // row_codec::CompiledPredicate's docs).
-                    let compiled_condition = condition.as_ref().and_then(|cond| row_codec::CompiledPredicate::compile(cond));
+                    let compiled_condition =
+                        condition.as_ref().and_then(|cond| row_codec::CompiledPredicate::compile(cond, &merged_schema));
 
+                    // A row pair's values are only cloned into a merged
+                    // Tuple once it's known to match -- for
+                    // examples/tpc_h.rs's join that's 3,000 of 900,000
+                    // pairs; cloning (and, for a String column, heap-
+                    // allocating) all 900,000 regardless of match was
+                    // real, wasted cost. See CompiledPredicate::eval_split.
+                    let left_len = left_schema.columns.len();
                     let mut merged_tuples = Vec::new();
                     for l in &left_tuples {
                         for r in &right_tuples {
-                            let mut values = l.values.clone();
-                            values.extend(r.values.clone());
-                            let merged = Tuple { values };
                             let keep = match &compiled_condition {
-                                Some(compiled) => compiled.eval(&merged_schema, &merged).unwrap_or(true),
+                                Some(compiled) => compiled.eval_split(l, left_len, r).unwrap_or(true),
                                 None => true, // CROSS JOIN, or a condition that didn't compile
                             };
                             if keep {
-                                merged_tuples.push(merged);
+                                let mut values = l.values.clone();
+                                values.extend(r.values.clone());
+                                merged_tuples.push(Tuple { values });
                             }
                         }
                     }
@@ -437,14 +444,14 @@ impl QueryExecutor {
             }
         };
         let candidates: std::collections::HashSet<u64> = candidates.into_iter().collect();
-        let compiled = row_codec::CompiledPredicate::compile(full_predicate);
+        let compiled = row_codec::CompiledPredicate::compile(full_predicate, schema);
 
         let tuples = self.oltp.with_read_snapshot(|tx| {
             candidates
                 .into_iter()
                 .filter_map(|row_id| self.oltp.read(tx, table_id, row_id).ok().flatten())
                 .filter_map(|bytes| bincode::deserialize::<Tuple>(&bytes).ok())
-                .filter(|tuple| compiled.as_ref().and_then(|c| c.eval(schema, tuple)).unwrap_or(false))
+                .filter(|tuple| compiled.as_ref().and_then(|c| c.eval(tuple)).unwrap_or(false))
                 .collect::<Vec<_>>()
         });
 
@@ -628,7 +635,7 @@ impl QueryExecutor {
 
         let tx = self.oltp.begin();
         let rows = self.oltp.scan_table(tx, table_id);
-        let compiled_where = update.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p));
+        let compiled_where = update.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p, &schema));
 
         let mut affected = 0usize;
         // See execute_insert: secondary indexes are only updated once the
@@ -644,7 +651,7 @@ impl QueryExecutor {
             // A row that passes here still gets its value re-read and
             // re-checked below, under its own lock, before anything is
             // actually written -- see this method's doc comment.
-            let matches = compiled_where.as_ref().and_then(|c| c.eval(&schema, &tuple)).unwrap_or(true);
+            let matches = compiled_where.as_ref().and_then(|c| c.eval(&tuple)).unwrap_or(true);
             if !matches {
                 continue;
             }
@@ -668,7 +675,7 @@ impl QueryExecutor {
             let Ok(mut tuple) = bincode::deserialize::<Tuple>(&latest_bytes) else {
                 continue;
             };
-            let still_matches = compiled_where.as_ref().and_then(|c| c.eval(&schema, &tuple)).unwrap_or(true);
+            let still_matches = compiled_where.as_ref().and_then(|c| c.eval(&tuple)).unwrap_or(true);
             if !still_matches {
                 continue;
             }
@@ -719,7 +726,7 @@ impl QueryExecutor {
 
         let tx = self.oltp.begin();
         let rows = self.oltp.scan_table(tx, table_id);
-        let compiled_where = delete.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p));
+        let compiled_where = delete.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p, &schema));
 
         let mut affected = 0usize;
         for (row_id, bytes) in rows {
@@ -727,7 +734,7 @@ impl QueryExecutor {
                 continue;
             };
 
-            let matches = compiled_where.as_ref().and_then(|c| c.eval(&schema, &tuple)).unwrap_or(true);
+            let matches = compiled_where.as_ref().and_then(|c| c.eval(&tuple)).unwrap_or(true);
             if !matches {
                 continue;
             }

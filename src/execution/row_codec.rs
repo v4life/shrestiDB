@@ -248,7 +248,7 @@ fn as_f64(v: &Value) -> Option<f64> {
 /// see that type's docs for why this matters in practice, not just in
 /// principle.
 pub fn evaluate_predicate(predicate: &str, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
-    CompiledPredicate::compile(predicate)?.eval(schema, tuple)
+    CompiledPredicate::compile(predicate, schema)?.eval(tuple)
 }
 
 /// A predicate parsed once, for callers evaluating it against many rows.
@@ -260,6 +260,13 @@ pub fn evaluate_predicate(predicate: &str, schema: &TableSchema, tuple: &Tuple) 
 /// Postgres running the equivalent join (see `examples/vs_sqlite.rs` /
 /// `examples/vs_postgres.rs`), not a theoretical one. Compile once outside
 /// the loop, then call `eval` per row.
+///
+/// `compile` also resolves every comparison's column name(s) to a fixed
+/// index into `schema` once, at compile time, rather than `eval`
+/// re-scanning `schema.columns` with a string comparison on every call —
+/// the same reasoning applied one level deeper. `eval` itself does no
+/// string work at all: index lookups and, where a literal was involved,
+/// an already-parsed `Value`.
 pub struct CompiledPredicate {
     expr: BoolExpr,
 }
@@ -267,10 +274,14 @@ pub struct CompiledPredicate {
 impl CompiledPredicate {
     /// `None` for anything `evaluate_predicate` would also treat as
     /// unparseable — see the module docs for exactly what that means for
-    /// the caller (typically: don't filter the row out).
-    pub fn compile(predicate: &str) -> Option<CompiledPredicate> {
+    /// the caller (typically: don't filter the row out). This now
+    /// includes a column name that doesn't resolve against `schema`: the
+    /// old runtime behavior returned `None` for every row when that
+    /// happened anyway (the failure doesn't depend on the row), so moving
+    /// it to compile time changes nothing observable.
+    pub fn compile(predicate: &str, schema: &TableSchema) -> Option<CompiledPredicate> {
         let tokens = tokenize_expr(predicate);
-        let mut parser = ExprParser { tokens: &tokens, pos: 0 };
+        let mut parser = ExprParser { tokens: &tokens, pos: 0, schema };
         let expr = parser.parse_or()?;
         if parser.pos != tokens.len() {
             return None; // trailing tokens the parser couldn't consume
@@ -278,8 +289,23 @@ impl CompiledPredicate {
         Some(CompiledPredicate { expr })
     }
 
-    pub fn eval(&self, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
-        eval_bool_expr(&self.expr, schema, tuple)
+    pub fn eval(&self, tuple: &Tuple) -> Option<bool> {
+        eval_bool_expr(&self.expr, tuple)
+    }
+
+    /// Same as `eval`, but for a `JOIN`'s nested loop specifically:
+    /// evaluates against a still-split `(left, right)` pair instead of an
+    /// already-merged `Tuple`, so a pair that doesn't match never has to
+    /// pay for building one — cloning and concatenating both sides'
+    /// values just to immediately discard the result is real, wasted cost
+    /// on every one of a join's `left_rows * right_rows` pairs that isn't
+    /// a match (which is most of them: 897,000 of 900,000 in
+    /// `examples/tpc_h.rs`'s join). `left_len` is `left`'s column count —
+    /// the same split point `QueryExecutor::merge_schemas` used when this
+    /// predicate was compiled, so a resolved index at or past it refers
+    /// to `right`, not `left`.
+    pub fn eval_split(&self, left: &Tuple, left_len: usize, right: &Tuple) -> Option<bool> {
+        eval_bool_expr_split(&self.expr, left, left_len, right)
     }
 }
 
@@ -304,14 +330,27 @@ pub fn split_comparison(predicate: &str) -> Option<(String, String, String)> {
 
 #[derive(Debug, Clone)]
 enum BoolExpr {
-    Comparison { left: String, op: String, right: String },
+    /// `left_idx` is resolved once at parse time (see `ExprParser::parse_atom`),
+    /// not re-looked-up on every `eval`.
+    Comparison { left_idx: usize, op: String, right: ComparisonOperand },
     And(Box<BoolExpr>, Box<BoolExpr>),
     Or(Box<BoolExpr>, Box<BoolExpr>),
+}
+
+/// A comparison's right-hand side, resolved once at parse time: either
+/// another column (by index) or an already-parsed literal `Value` — never
+/// a raw string needing another schema lookup or `parse_value` call
+/// during `eval`.
+#[derive(Debug, Clone)]
+enum ComparisonOperand {
+    Column(usize),
+    Literal(Value),
 }
 
 struct ExprParser<'a> {
     tokens: &'a [String],
     pos: usize,
+    schema: &'a TableSchema,
 }
 
 impl<'a> ExprParser<'a> {
@@ -352,7 +391,13 @@ impl<'a> ExprParser<'a> {
             return None;
         }
         let right = self.advance()?.clone();
-        Some(BoolExpr::Comparison { left, op, right })
+
+        let left_idx = self.schema.columns.iter().position(|c| c.name == left)?;
+        let right = match self.schema.columns.iter().position(|c| c.name == right) {
+            Some(right_idx) => ComparisonOperand::Column(right_idx),
+            None => ComparisonOperand::Literal(parse_value(&right, self.schema.columns[left_idx].data_type)),
+        };
+        Some(BoolExpr::Comparison { left_idx, op, right })
     }
 
     fn peek(&self) -> Option<&str> {
@@ -374,24 +419,69 @@ fn is_comparison_op(s: &str) -> bool {
     matches!(s, "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=")
 }
 
-fn eval_bool_expr(expr: &BoolExpr, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
+fn eval_bool_expr(expr: &BoolExpr, tuple: &Tuple) -> Option<bool> {
     match expr {
-        BoolExpr::Comparison { left, op, right } => eval_comparison(left, op, right, schema, tuple),
-        BoolExpr::And(l, r) => Some(eval_bool_expr(l, schema, tuple)? && eval_bool_expr(r, schema, tuple)?),
-        BoolExpr::Or(l, r) => Some(eval_bool_expr(l, schema, tuple)? || eval_bool_expr(r, schema, tuple)?),
+        BoolExpr::Comparison { left_idx, op, right } => eval_comparison(*left_idx, op, right, tuple),
+        BoolExpr::And(l, r) => Some(eval_bool_expr(l, tuple)? && eval_bool_expr(r, tuple)?),
+        BoolExpr::Or(l, r) => Some(eval_bool_expr(l, tuple)? || eval_bool_expr(r, tuple)?),
     }
 }
 
-fn eval_comparison(left: &str, op: &str, right: &str, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
-    let left_idx = schema.columns.iter().position(|c| c.name == left)?;
+/// No string work at all: `left_idx`/`right` were already resolved at
+/// parse time (see `ExprParser::parse_atom`), so this is index lookups
+/// and a reference comparison, not a schema scan.
+fn eval_comparison(left_idx: usize, op: &str, right: &ComparisonOperand, tuple: &Tuple) -> Option<bool> {
     let left_value = tuple.values.get(left_idx)?;
-
-    let right_value = match schema.columns.iter().position(|c| c.name == right) {
-        Some(right_idx) => tuple.values.get(right_idx)?.clone(),
-        None => parse_value(right, schema.columns[left_idx].data_type),
+    let right_value = match right {
+        ComparisonOperand::Column(idx) => tuple.values.get(*idx)?,
+        ComparisonOperand::Literal(v) => v,
     };
 
-    compare(left_value, op, &right_value)
+    compare(left_value, op, right_value)
+}
+
+// ── Split (unmerged left/right) evaluation, for CompiledPredicate::eval_split ──
+
+fn eval_bool_expr_split(expr: &BoolExpr, left: &Tuple, left_len: usize, right: &Tuple) -> Option<bool> {
+    match expr {
+        BoolExpr::Comparison { left_idx, op, right: rhs } => {
+            eval_comparison_split(*left_idx, op, rhs, left, left_len, right)
+        }
+        BoolExpr::And(l, r) => Some(
+            eval_bool_expr_split(l, left, left_len, right)? && eval_bool_expr_split(r, left, left_len, right)?,
+        ),
+        BoolExpr::Or(l, r) => Some(
+            eval_bool_expr_split(l, left, left_len, right)? || eval_bool_expr_split(r, left, left_len, right)?,
+        ),
+    }
+}
+
+/// A resolved index at or past `left_len` refers to `right`'s columns —
+/// see `CompiledPredicate::eval_split`'s docs on why that split point is
+/// safe to rely on here.
+fn split_value<'a>(idx: usize, left: &'a Tuple, left_len: usize, right: &'a Tuple) -> Option<&'a Value> {
+    if idx < left_len {
+        left.values.get(idx)
+    } else {
+        right.values.get(idx - left_len)
+    }
+}
+
+fn eval_comparison_split(
+    left_idx: usize,
+    op: &str,
+    right: &ComparisonOperand,
+    left: &Tuple,
+    left_len: usize,
+    right_tuple: &Tuple,
+) -> Option<bool> {
+    let left_value = split_value(left_idx, left, left_len, right_tuple)?;
+    let right_value = match right {
+        ComparisonOperand::Column(idx) => split_value(*idx, left, left_len, right_tuple)?,
+        ComparisonOperand::Literal(v) => v,
+    };
+
+    compare(left_value, op, right_value)
 }
 
 /// Tokenize a predicate: whitespace-separated words, with `'...'` string
