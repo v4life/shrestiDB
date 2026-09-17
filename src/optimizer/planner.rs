@@ -16,7 +16,7 @@ use crate::execution::aggregate;
 use crate::optimizer::cardinality::LearnedCardinalityEstimator;
 use crate::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
 use crate::optimizer::join_reorder::JoinOrderer;
-use crate::sql::parser::{SQLParser, SQLStatement};
+use crate::sql::parser::{SQLParser, SQLStatement, SelectStatement};
 use serde::{Deserialize, Serialize};
 
 /// Logical query plan node
@@ -101,26 +101,35 @@ impl QueryPlanner {
     /// from honestly.
     const DEFAULT_FILTER_SELECTIVITY: f64 = 0.5;
 
-    /// Generate a query plan for `query`.
+    /// Generate a query plan for `query`. Parses `query` itself; a caller
+    /// that already has a parsed `SelectStatement` in hand (`execute_sql`,
+    /// `QueryExecutor::prepare`) should call `plan_select` directly instead
+    /// — re-parsing a string that was just parsed one call up is exactly
+    /// the wasted-work pattern `row_codec::CompiledPredicate` existed to
+    /// eliminate on the predicate side; this is the same fix on the
+    /// planning side.
     pub fn plan(&self, query: &str) -> PhysicalPlan {
-        let select = match SQLParser::parse(query) {
-            Ok(SQLStatement::Select(select)) => select,
+        match SQLParser::parse(query) {
+            Ok(SQLStatement::Select(select)) => self.plan_select(&select),
             // Not a SELECT, or failed to parse: nothing to build a read
             // plan for yet (writes and DDL don't have a plan shape here).
-            _ => {
-                return PhysicalPlan {
-                    nodes: vec![LogicalPlanNode::Scan {
-                        table_id: 0,
-                        table_name: String::new(),
-                        alias: None,
-                        rows: 0,
-                    }],
-                    estimated_cost: 0.0,
-                    estimated_rows: 0,
-                };
-            }
-        };
+            _ => PhysicalPlan {
+                nodes: vec![LogicalPlanNode::Scan {
+                    table_id: 0,
+                    table_name: String::new(),
+                    alias: None,
+                    rows: 0,
+                }],
+                estimated_cost: 0.0,
+                estimated_rows: 0,
+            },
+        }
+    }
 
+    /// The actual plan-building logic, over an already-parsed `select` --
+    /// see `plan`'s doc comment for why this is the one to call when a
+    /// parsed statement already exists.
+    pub fn plan_select(&self, select: &SelectStatement) -> PhysicalPlan {
         let mut rows = Self::ASSUMED_TABLE_ROWS;
         let mut nodes = vec![LogicalPlanNode::Scan {
             table_id: 0,

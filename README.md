@@ -455,25 +455,28 @@ thing, on purpose.
 
 | Query | ShrestiDB vs SQLite | ShrestiDB vs Postgres |
 |-------|---------------------|------------------------|
-| Load (20K + 2K rows) | 10.10x slower | **9.1x faster** |
-| Range Scan (PK-indexed) | 1.70x slower | ~tied (1.02x) |
-| Aggregation (full scan) | 6.87x slower | 2.05x slower |
-| Join (nested loop, 3K x 300) | 4.56x slower | 2.75x slower |
+| Load (20K + 2K rows) | 3.27x slower | **11.1x faster** |
+| Range Scan (PK-indexed) | 2.24x slower | **faster (0.62x)** |
+| Aggregation (full scan) | 8.80x slower | 2.52x slower |
+| Join (nested loop, 3K x 300) | 4.11x slower | 2.97x slower |
 
 ("Nx slower/faster" = ShrestiDB's time relative to the other engine's,
-for the same query.)
+for the same query. Run-to-run noise moves these by a point or so —
+don't read the exact digits as more precise than they are.)
 
 **What this does and doesn't tell you:**
 - **[`vs_sqlite.rs`](examples/vs_sqlite.rs)** is genuinely apples-to-apples:
   both engines in-process, both in-memory (no disk I/O on either side),
-  both fully materializing every result row before the clock stops.
-  SQLite's load numbers use a real prepared, parameterized statement —
-  ShrestiDB has no prepared-statement API yet, so its load numbers
-  include a full SQL re-parse on every single statement. That gap is
-  real, not a benchmark artifact, and it shows: SQLite loads over 10x
-  faster. It's also the one number in this table that these join/predicate
-  fixes don't touch at all — it needs a different fix (a prepared-statement
-  API), not a faster join.
+  both fully materializing every result row before the clock stops. The
+  load numbers are now apples-to-apples too: both sides use a real
+  prepared, parameterized statement (`QueryExecutor::prepare`/
+  `execute_prepared` — see [`row_codec`](src/execution/row_codec.rs)'s
+  `?`/`$N` placeholder support), not a fresh `sqlparser` run per row. That
+  cut ShrestiDB's load gap from 10.10x slower to 3.27x — the remaining
+  difference is real per-statement overhead (each `execute_prepared` call
+  still walks the cached statement, re-parses each bound literal via
+  `parse_value`, and takes a lock/transaction per statement), not the
+  giant one this replaced.
 - **[`vs_postgres.rs`](examples/vs_postgres.rs)** is *not*
   apples-to-apples, deliberately: Postgres pays a real client/server
   round trip per statement (even over loopback) that the other two never

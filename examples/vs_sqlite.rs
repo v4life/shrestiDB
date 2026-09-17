@@ -9,30 +9,28 @@
 //! stops, so neither is being timed on lazy iteration while the other
 //! does real work.
 //!
-//! Two things are *not* forced to parity, deliberately, because doing so
-//! would misrepresent one engine or the other rather than compare them
-//! honestly:
+//! One thing is *not* forced to parity, deliberately, because doing so
+//! would misrepresent one engine rather than compare them honestly: **the
+//! join query's plan.** Neither table has a secondary index on the join
+//! column on either engine. SQLite's query planner is free to pick
+//! whatever strategy it wants for that; ShrestiDB always does a nested
+//! loop (see `execution::executor`). That's not a handicap applied to
+//! either side — it's genuinely how each engine would run this query
+//! today.
 //!
-//! - **The join query's plan.** Neither table has a secondary index on
-//!   the join column on either engine. SQLite's query planner is free to
-//!   pick whatever strategy it wants for that; ShrestiDB always does a
-//!   nested loop (see `execution::executor`). That's not a handicap
-//!   applied to either side — it's genuinely how each engine would run
-//!   this query today.
-//! - **The load phase.** SQLite is loaded through a real prepared,
-//!   parameterized statement — the idiomatic, fast way any real SQLite
-//!   user would bulk-insert. ShrestiDB has no prepared-statement or
-//!   parameter-binding API at all yet: every `execute_sql` call re-parses
-//!   a full SQL string from scratch (see `sql::parser`), even in a tight
-//!   insert loop. Giving ShrestiDB a synthetic advantage by hand-rolling
-//!   some faster non-public insert path would hide that gap rather than
-//!   report it — so the load numbers below include ShrestiDB's real
-//!   per-statement parse cost, and that asymmetry is the point, not an
-//!   oversight.
+//! The load phase *is* apples-to-apples now: both sides use a real
+//! prepared, parameterized statement (`QueryExecutor::prepare`/
+//! `execute_prepared` on ShrestiDB's side — see `row_codec`'s placeholder
+//! support), executed once per row rather than re-parsed from a formatted
+//! SQL string each time. It wasn't always — an earlier version of this
+//! file measured `execute_sql` re-parsing full SQL text per INSERT, which
+//! is what motivated building the prepared-statement API in the first
+//! place.
 
 use rusqlite::Connection;
 use shrestidb::execution::catalog::Catalog;
 use shrestidb::execution::executor::QueryExecutor;
+use shrestidb::execution::operators::Value;
 use std::time::{Duration, Instant};
 
 const NUM_ORDERS: i64 = 20_000;
@@ -92,22 +90,24 @@ fn main() {
     println!("--- Load: {NUM_ORDERS} orders + {NUM_CUSTOMERS} customers ---");
 
     let start = Instant::now();
-    for i in 1..=NUM_ORDERS {
-        let custkey = 1 + (i % NUM_CUSTOMERS);
-        let price = 100.0 + (i as f64 * 1.337) % 5000.0;
-        shresti
-            .execute_sql(&format!(
-                "INSERT INTO orders (o_orderkey, o_custkey, o_totalprice) VALUES ({i}, {custkey}, {price})"
-            ))
-            .unwrap();
-    }
-    for i in 1..=NUM_CUSTOMERS {
-        shresti
-            .execute_sql(&format!("INSERT INTO customer (c_custkey, c_name) VALUES ({i}, 'Customer{i}')"))
-            .unwrap();
+    {
+        let orders_stmt = shresti.prepare("INSERT INTO orders (o_orderkey, o_custkey, o_totalprice) VALUES (?, ?, ?)").unwrap();
+        for i in 1..=NUM_ORDERS {
+            let custkey = 1 + (i % NUM_CUSTOMERS);
+            let price = 100.0 + (i as f64 * 1.337) % 5000.0;
+            shresti
+                .execute_prepared(&orders_stmt, &[Value::Integer(i), Value::Integer(custkey), Value::Float(price)])
+                .unwrap();
+        }
+        let customer_stmt = shresti.prepare("INSERT INTO customer (c_custkey, c_name) VALUES (?, ?)").unwrap();
+        for i in 1..=NUM_CUSTOMERS {
+            shresti
+                .execute_prepared(&customer_stmt, &[Value::Integer(i), Value::String(format!("Customer{i}"))])
+                .unwrap();
+        }
     }
     let shresti_load = start.elapsed();
-    println!("  ShrestiDB (re-parses SQL text per statement): {shresti_load:?}");
+    println!("  ShrestiDB (prepared statement):               {shresti_load:?}");
 
     let start = Instant::now();
     {
@@ -173,6 +173,9 @@ fn main() {
         .execute("CREATE TABLE join_customer (c_custkey INTEGER PRIMARY KEY, c_name TEXT)", [])
         .unwrap();
     {
+        let shresti_orders_stmt = shresti
+            .prepare("INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES (?, ?, ?)")
+            .unwrap();
         let mut sqlite_orders_stmt = sqlite
             .prepare("INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES (?1, ?2, ?3)")
             .unwrap();
@@ -180,17 +183,17 @@ fn main() {
             let custkey = 1 + (i % JOIN_CUSTOMERS);
             let price = 100.0 + (i as f64 * 1.337) % 5000.0;
             shresti
-                .execute_sql(&format!(
-                    "INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES ({i}, {custkey}, {price})"
-                ))
+                .execute_prepared(&shresti_orders_stmt, &[Value::Integer(i), Value::Integer(custkey), Value::Float(price)])
                 .unwrap();
             sqlite_orders_stmt.execute(rusqlite::params![i, custkey, price]).unwrap();
         }
+        let shresti_customer_stmt =
+            shresti.prepare("INSERT INTO join_customer (c_custkey, c_name) VALUES (?, ?)").unwrap();
         let mut sqlite_customer_stmt =
             sqlite.prepare("INSERT INTO join_customer (c_custkey, c_name) VALUES (?1, ?2)").unwrap();
         for i in 1..=JOIN_CUSTOMERS {
             shresti
-                .execute_sql(&format!("INSERT INTO join_customer (c_custkey, c_name) VALUES ({i}, 'Customer{i}')"))
+                .execute_prepared(&shresti_customer_stmt, &[Value::Integer(i), Value::String(format!("Customer{i}"))])
                 .unwrap();
             sqlite_customer_stmt.execute(rusqlite::params![i, format!("Customer{i}")]).unwrap();
         }

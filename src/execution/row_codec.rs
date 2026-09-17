@@ -37,6 +37,7 @@
 //! row's own current value rather than only ever assigning a fixed
 //! literal to every matched row.
 
+use crate::error::{DatabaseError, Result};
 use crate::execution::catalog::{DataType, TableSchema};
 use crate::execution::operators::{Tuple, Value};
 
@@ -65,6 +66,123 @@ pub fn value_to_string(value: &Value) -> String {
         Value::Boolean(b) => b.to_string(),
         Value::Null => "NULL".to_string(),
     }
+}
+
+/// Render a bound `Value` back into the literal-string shape a parsed
+/// token would have — quoted for `String`, bare otherwise — so a
+/// `QueryExecutor::execute_prepared` parameter can be substituted into an
+/// already-flattened statement and fed through the exact same
+/// `parse_value`/`CompiledPredicate`/`CompiledAssignment` paths a literal
+/// written directly in SQL would go through. The inverse of `parse_value`,
+/// not of `value_to_string` (which is for display and drops the quoting a
+/// re-parse would need).
+///
+/// Known limitation, inherited from the tokenizer this whole module
+/// already relies on (see `tokenize_expr`): a quoted string's contents
+/// aren't unescaped, so a bound string containing an apostrophe isn't
+/// safely representable here — attempting it produces a token whose
+/// embedded `'` prematurely closes the literal when re-tokenized.
+/// Pre-existing, not introduced by prepared statements: hand-written SQL
+/// in this engine already can't express a literal apostrophe either.
+pub fn literal_repr(value: &Value) -> String {
+    match value {
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => format!("'{s}'"),
+        Value::Boolean(b) => b.to_string(),
+        Value::Null => "NULL".to_string(),
+    }
+}
+
+// ── Prepared-statement placeholders ────────────────────────────────────────
+//
+// `?` (positional, bound to `params` in the order every scanned/substituted
+// field is visited) or `$N` (explicit 1-based index, bound directly to
+// `params[N-1]` regardless of visit order). One statement must use a single
+// style throughout -- `scan_placeholders` errors the moment it sees both,
+// rather than guessing which the caller meant.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaceholderKind {
+    Positional,
+    Indexed(usize),
+}
+
+/// `None` for anything that isn't a bare, unquoted `?` or `$N` token.
+/// Never true for a quoted literal that happens to contain these
+/// characters — a quoted token from `tokenize_expr` always carries its
+/// quote marks, so `'?'` and `?` are never confused.
+fn placeholder_kind(token: &str) -> Option<PlaceholderKind> {
+    if token == "?" {
+        return Some(PlaceholderKind::Positional);
+    }
+    let digits = token.strip_prefix('$')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<usize>().ok().filter(|n| *n >= 1).map(PlaceholderKind::Indexed)
+}
+
+/// Scan one already-flattened field (a WHERE clause, a JOIN condition, an
+/// UPDATE assignment's right-hand side, a single INSERT value, ...) for
+/// placeholder tokens, folding them into `positional_count`/`max_indexed`
+/// — running totals a caller threads across every field of one statement.
+/// `Err` the moment both a `?` and a `$N` have been seen anywhere in that
+/// statement.
+pub fn scan_placeholders(field: &str, positional_count: &mut usize, max_indexed: &mut usize) -> Result<()> {
+    for token in tokenize_expr(field) {
+        match placeholder_kind(&token) {
+            Some(PlaceholderKind::Positional) => *positional_count += 1,
+            Some(PlaceholderKind::Indexed(n)) => *max_indexed = (*max_indexed).max(n),
+            None => {}
+        }
+        if *positional_count > 0 && *max_indexed > 0 {
+            return Err(DatabaseError::ExecutionError(
+                "cannot mix ? and $N placeholders in the same prepared statement".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite `field`, replacing each placeholder token with the literal
+/// representation (`literal_repr`) of its bound value. `next_positional`
+/// is shared, mutable state across every field substituted for one
+/// `execute_prepared` call, advanced only by `?` tokens — so positional
+/// placeholders bind to `params` in the order fields are visited, which
+/// must match the order `scan_placeholders` visited them in during
+/// `prepare` (both walks are driven by the same per-statement-type field
+/// list in `QueryExecutor::scan_statement_placeholders`, so this holds by
+/// construction, not by convention the two have to independently honor).
+pub fn substitute_placeholders(field: &str, params: &[Value], next_positional: &mut usize) -> Result<String> {
+    let tokens = tokenize_expr(field);
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match placeholder_kind(&token) {
+            Some(PlaceholderKind::Positional) => {
+                let value = params.get(*next_positional).ok_or_else(|| {
+                    DatabaseError::ExecutionError(format!(
+                        "prepared statement expects at least {} parameter(s), got {}",
+                        *next_positional + 1,
+                        params.len()
+                    ))
+                })?;
+                out.push(literal_repr(value));
+                *next_positional += 1;
+            }
+            Some(PlaceholderKind::Indexed(n)) => {
+                let value = params.get(n - 1).ok_or_else(|| {
+                    DatabaseError::ExecutionError(format!(
+                        "prepared statement references ${n} but only {} parameter(s) were given",
+                        params.len()
+                    ))
+                })?;
+                out.push(literal_repr(value));
+            }
+            None => out.push(token),
+        }
+    }
+    Ok(out.join(" "))
 }
 
 /// An `UPDATE ... SET` assignment's right-hand side, compiled once so it
@@ -817,5 +935,79 @@ mod tests {
         let schema = schema();
         let compiled = CompiledAssignment::compile("-5", &schema, DataType::Integer);
         assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(-5));
+    }
+
+    #[test]
+    fn test_literal_repr_roundtrips_through_parse_value() {
+        assert_eq!(parse_value(&literal_repr(&Value::Integer(42)), DataType::Integer), Value::Integer(42));
+        assert_eq!(parse_value(&literal_repr(&Value::Float(3.5)), DataType::Float), Value::Float(3.5));
+        assert_eq!(
+            parse_value(&literal_repr(&Value::String("Bob".to_string())), DataType::String),
+            Value::String("Bob".to_string())
+        );
+        assert_eq!(parse_value(&literal_repr(&Value::Boolean(true)), DataType::Boolean), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_scan_placeholders_counts_positional() {
+        let mut positional = 0;
+        let mut indexed = 0;
+        scan_placeholders("age > ? AND name = ?", &mut positional, &mut indexed).unwrap();
+        assert_eq!(positional, 2);
+        assert_eq!(indexed, 0);
+    }
+
+    #[test]
+    fn test_scan_placeholders_tracks_max_indexed() {
+        let mut positional = 0;
+        let mut indexed = 0;
+        scan_placeholders("age > $2 AND name = $1", &mut positional, &mut indexed).unwrap();
+        assert_eq!(positional, 0);
+        assert_eq!(indexed, 2);
+    }
+
+    #[test]
+    fn test_scan_placeholders_rejects_mixed_styles() {
+        let mut positional = 0;
+        let mut indexed = 0;
+        assert!(scan_placeholders("age > ? AND name = $1", &mut positional, &mut indexed).is_err());
+    }
+
+    #[test]
+    fn test_scan_placeholders_ignores_quoted_question_mark() {
+        // A literal '?' inside a quoted string must never be mistaken for
+        // a placeholder -- tokenize_expr keeps the quote marks, so the
+        // token is "'?'", not "?".
+        let mut positional = 0;
+        let mut indexed = 0;
+        scan_placeholders("name = '?'", &mut positional, &mut indexed).unwrap();
+        assert_eq!(positional, 0);
+        assert_eq!(indexed, 0);
+    }
+
+    #[test]
+    fn test_substitute_placeholders_positional() {
+        let mut next = 0;
+        let params = vec![Value::Integer(18), Value::String("Bob".to_string())];
+        let out = substitute_placeholders("age > ? AND name = ?", &params, &mut next).unwrap();
+        assert_eq!(out, "age > 18 AND name = 'Bob'");
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn test_substitute_placeholders_indexed_out_of_order() {
+        let mut next = 0;
+        let params = vec![Value::Integer(18), Value::String("Bob".to_string())];
+        // $2 before $1 -- indexed placeholders don't depend on appearance
+        // order the way positional ones do.
+        let out = substitute_placeholders("name = $2 AND age > $1", &params, &mut next).unwrap();
+        assert_eq!(out, "name = 'Bob' AND age > 18");
+    }
+
+    #[test]
+    fn test_substitute_placeholders_missing_param_errors() {
+        let mut next = 0;
+        let params = vec![Value::Integer(18)];
+        assert!(substitute_placeholders("age > ? AND name = ?", &params, &mut next).is_err());
     }
 }

@@ -28,6 +28,7 @@
 use postgres::{Client, NoTls};
 use shrestidb::execution::catalog::Catalog;
 use shrestidb::execution::executor::QueryExecutor;
+use shrestidb::execution::operators::Value;
 use std::time::{Duration, Instant};
 
 const NUM_ORDERS: i64 = 20_000;
@@ -95,22 +96,26 @@ fn main() {
     println!("--- Load: {NUM_ORDERS} orders + {NUM_CUSTOMERS} customers ---");
 
     let start = Instant::now();
-    for i in 1..=NUM_ORDERS {
-        let custkey = 1 + (i % NUM_CUSTOMERS);
-        let price = 100.0 + (i as f64 * 1.337) % 5000.0;
-        shresti
-            .execute_sql(&format!(
-                "INSERT INTO orders (o_orderkey, o_custkey, o_totalprice) VALUES ({i}, {custkey}, {price})"
-            ))
+    {
+        let orders_stmt = shresti
+            .prepare("INSERT INTO orders (o_orderkey, o_custkey, o_totalprice) VALUES (?, ?, ?)")
             .unwrap();
-    }
-    for i in 1..=NUM_CUSTOMERS {
-        shresti
-            .execute_sql(&format!("INSERT INTO customer (c_custkey, c_name) VALUES ({i}, 'Customer{i}')"))
-            .unwrap();
+        for i in 1..=NUM_ORDERS {
+            let custkey = 1 + (i % NUM_CUSTOMERS);
+            let price = 100.0 + (i as f64 * 1.337) % 5000.0;
+            shresti
+                .execute_prepared(&orders_stmt, &[Value::Integer(i), Value::Integer(custkey), Value::Float(price)])
+                .unwrap();
+        }
+        let customer_stmt = shresti.prepare("INSERT INTO customer (c_custkey, c_name) VALUES (?, ?)").unwrap();
+        for i in 1..=NUM_CUSTOMERS {
+            shresti
+                .execute_prepared(&customer_stmt, &[Value::Integer(i), Value::String(format!("Customer{i}"))])
+                .unwrap();
+        }
     }
     let shresti_load = start.elapsed();
-    println!("  ShrestiDB (in-process, re-parses SQL per statement): {shresti_load:?}");
+    println!("  ShrestiDB (in-process, prepared statement):    {shresti_load:?}");
 
     let start = Instant::now();
     {
@@ -169,22 +174,24 @@ fn main() {
     .unwrap();
     pg.execute("CREATE TABLE join_customer (c_custkey BIGINT PRIMARY KEY, c_name TEXT)", &[]).unwrap();
     {
+        let shresti_stmt = shresti
+            .prepare("INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES (?, ?, ?)")
+            .unwrap();
         let stmt =
             pg.prepare("INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES ($1, $2, $3)").unwrap();
         for i in 1..=JOIN_ORDERS {
             let custkey = 1 + (i % JOIN_CUSTOMERS);
             let price = 100.0 + (i as f64 * 1.337) % 5000.0;
             shresti
-                .execute_sql(&format!(
-                    "INSERT INTO join_orders (o_orderkey, o_custkey, o_totalprice) VALUES ({i}, {custkey}, {price})"
-                ))
+                .execute_prepared(&shresti_stmt, &[Value::Integer(i), Value::Integer(custkey), Value::Float(price)])
                 .unwrap();
             pg.execute(&stmt, &[&i, &custkey, &price]).unwrap();
         }
+        let shresti_stmt = shresti.prepare("INSERT INTO join_customer (c_custkey, c_name) VALUES (?, ?)").unwrap();
         let stmt = pg.prepare("INSERT INTO join_customer (c_custkey, c_name) VALUES ($1, $2)").unwrap();
         for i in 1..=JOIN_CUSTOMERS {
             shresti
-                .execute_sql(&format!("INSERT INTO join_customer (c_custkey, c_name) VALUES ({i}, 'Customer{i}')"))
+                .execute_prepared(&shresti_stmt, &[Value::Integer(i), Value::String(format!("Customer{i}"))])
                 .unwrap();
             pg.execute(&stmt, &[&i, &format!("Customer{i}")]).unwrap();
         }

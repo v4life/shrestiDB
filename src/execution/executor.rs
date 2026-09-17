@@ -68,6 +68,23 @@ pub struct QueryExecutor {
     secondary_indexes: RwLock<HashMap<(u64, String), SecondaryIndex>>,
 }
 
+/// A statement parsed (and, for `SELECT`, planned) once by `QueryExecutor::prepare`,
+/// ready to be run repeatedly by `execute_prepared` with different bound
+/// `params` — see `prepare`'s doc comment for why this exists.
+pub struct PreparedStatement {
+    kind: PreparedKind,
+    /// The number of bound parameters `execute_prepared` requires: the
+    /// highest `$N` index referenced, or the count of `?` occurrences.
+    param_count: usize,
+}
+
+enum PreparedKind {
+    Select(PhysicalPlan),
+    Insert(InsertStatement),
+    Update(UpdateStatement),
+    Delete(DeleteStatement),
+}
+
 impl QueryExecutor {
     /// In-memory only: nothing here survives a restart. What every
     /// existing test uses.
@@ -108,17 +125,28 @@ impl QueryExecutor {
         Ok(executor)
     }
 
-    /// Parse, bind, and run a SQL statement end to end.
+    /// Parse, bind, and run a SQL statement end to end. Rejects a `?`/`$N`
+    /// placeholder outright rather than letting it silently reach
+    /// `row_codec::parse_value` and become `Value::Null` (that function's
+    /// existing soft-failure-on-unparseable-literal behavior, which would
+    /// otherwise silently corrupt every value using this pattern instead of
+    /// erroring) — `prepare`/`execute_prepared` is what placeholders are
+    /// for; this entry point never binds parameters.
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<Vec<String>>> {
         let stmt = SQLParser::parse(sql)?;
         {
             let catalog = self.catalog.read();
             Binder::new(&catalog).bind(&stmt)?;
         }
+        if Self::scan_statement_placeholders(&stmt)? > 0 {
+            return Err(DatabaseError::ExecutionError(
+                "this statement contains a ?/$N placeholder -- use prepare()/execute_prepared() to bind parameters, execute_sql() cannot".to_string(),
+            ));
+        }
 
         match stmt {
-            SQLStatement::Select(_) => {
-                let plan = self.planner.plan(sql);
+            SQLStatement::Select(select) => {
+                let plan = self.planner.plan_select(&select);
                 self.execute(&plan)
             }
             SQLStatement::Insert(insert) => {
@@ -142,6 +170,162 @@ impl QueryExecutor {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Parse, bind, and plan/validate `sql` once, returning a
+    /// `PreparedStatement` that `execute_prepared` can run repeatedly with
+    /// different bound `params` — each execution substitutes parameters
+    /// into a clone of the cached, already-parsed (and, for `SELECT`,
+    /// already-planned) statement rather than re-running `sqlparser`'s
+    /// tokenizer and recursive-descent parser on raw SQL text every time.
+    /// That re-parse is real, measured cost: it's most of why ShrestiDB's
+    /// bulk-load path was ~10x slower than SQLite's in
+    /// `examples/vs_sqlite.rs`, which used a real prepared statement on
+    /// SQLite's side and `execute_sql` in a loop on this side.
+    ///
+    /// `CREATE TABLE`/`CREATE INDEX` can't be prepared (there's nothing to
+    /// meaningfully re-execute with different parameters) — use
+    /// `execute_sql` for those.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        let stmt = SQLParser::parse(sql)?;
+        {
+            let catalog = self.catalog.read();
+            Binder::new(&catalog).bind(&stmt)?;
+        }
+        let param_count = Self::scan_statement_placeholders(&stmt)?;
+
+        let kind = match stmt {
+            SQLStatement::Select(select) => {
+                let plan = self.planner.plan_select(&select);
+                PreparedKind::Select(plan)
+            }
+            SQLStatement::Insert(insert) => PreparedKind::Insert(insert),
+            SQLStatement::Update(update) => PreparedKind::Update(update),
+            SQLStatement::Delete(delete) => PreparedKind::Delete(delete),
+            SQLStatement::CreateTable(_) | SQLStatement::CreateIndex(_) => {
+                return Err(DatabaseError::ExecutionError(
+                    "CREATE statements cannot be prepared; use execute_sql".to_string(),
+                ));
+            }
+        };
+
+        Ok(PreparedStatement { kind, param_count })
+    }
+
+    /// Run a statement `prepare`d earlier, substituting `params` for its
+    /// `?`/`$N` placeholders. `params.len()` must be at least the number
+    /// `prepare` determined the statement needs (the highest `$N` index,
+    /// or the count of `?` occurrences) — extra trailing params beyond
+    /// what's referenced are accepted and ignored, same as most driver
+    /// APIs, rather than treated as an error.
+    pub fn execute_prepared(&self, stmt: &PreparedStatement, params: &[Value]) -> Result<Vec<Vec<String>>> {
+        if params.len() < stmt.param_count {
+            return Err(DatabaseError::ExecutionError(format!(
+                "prepared statement expects {} parameter(s), got {}",
+                stmt.param_count,
+                params.len()
+            )));
+        }
+
+        let mut next = 0usize;
+        match &stmt.kind {
+            PreparedKind::Select(plan) => {
+                let mut bound_plan = plan.clone();
+                for node in &mut bound_plan.nodes {
+                    match node {
+                        LogicalPlanNode::Filter { predicate, .. } => {
+                            *predicate = row_codec::substitute_placeholders(predicate, params, &mut next)?;
+                        }
+                        LogicalPlanNode::Join { condition: Some(cond), .. } => {
+                            *cond = row_codec::substitute_placeholders(cond, params, &mut next)?;
+                        }
+                        _ => {}
+                    }
+                }
+                self.execute(&bound_plan)
+            }
+            PreparedKind::Insert(insert) => {
+                let mut bound = insert.clone();
+                for row in &mut bound.values {
+                    for value in row {
+                        *value = row_codec::substitute_placeholders(value, params, &mut next)?;
+                    }
+                }
+                let affected = self.execute_insert(bound)?;
+                Ok(vec![vec![affected.to_string()]])
+            }
+            PreparedKind::Update(update) => {
+                let mut bound = update.clone();
+                for (_, raw) in &mut bound.assignments {
+                    *raw = row_codec::substitute_placeholders(raw, params, &mut next)?;
+                }
+                if let Some(predicate) = &mut bound.where_clause {
+                    *predicate = row_codec::substitute_placeholders(predicate, params, &mut next)?;
+                }
+                let affected = self.execute_update(bound)?;
+                Ok(vec![vec![affected.to_string()]])
+            }
+            PreparedKind::Delete(delete) => {
+                let mut bound = delete.clone();
+                if let Some(predicate) = &mut bound.where_clause {
+                    *predicate = row_codec::substitute_placeholders(predicate, params, &mut next)?;
+                }
+                let affected = self.execute_delete(bound)?;
+                Ok(vec![vec![affected.to_string()]])
+            }
+        }
+    }
+
+    /// Walk every placeholder-eligible field of `stmt` (`WHERE` clauses,
+    /// `JOIN` conditions, `UPDATE` assignment right-hand sides, `INSERT`
+    /// values — never column/table names, which aren't parameterizable in
+    /// standard prepared-statement semantics either) and return how many
+    /// bound parameters executing it would need. This exact field order is
+    /// what `execute_prepared`'s substitution walk must also follow, so a
+    /// positional `?`'s binding position agrees between the two — see
+    /// `row_codec::substitute_placeholders`'s doc comment.
+    fn scan_statement_placeholders(stmt: &SQLStatement) -> Result<usize> {
+        let mut positional = 0usize;
+        let mut indexed = 0usize;
+        match stmt {
+            SQLStatement::Select(select) => {
+                // Joins before the WHERE clause -- matching the physical
+                // plan's actual node order (Scan, Join*, Filter, ...),
+                // since execute_prepared's substitution walk visits plan
+                // nodes in that order, not source-text order. A `?`'s
+                // binding position must agree between the two walks.
+                for join in &select.joins {
+                    if let Some(condition) = &join.condition {
+                        row_codec::scan_placeholders(condition, &mut positional, &mut indexed)?;
+                    }
+                }
+                if let Some(predicate) = &select.where_clause {
+                    row_codec::scan_placeholders(predicate, &mut positional, &mut indexed)?;
+                }
+            }
+            SQLStatement::Insert(insert) => {
+                for row in &insert.values {
+                    for value in row {
+                        row_codec::scan_placeholders(value, &mut positional, &mut indexed)?;
+                    }
+                }
+            }
+            SQLStatement::Update(update) => {
+                for (_, raw) in &update.assignments {
+                    row_codec::scan_placeholders(raw, &mut positional, &mut indexed)?;
+                }
+                if let Some(predicate) = &update.where_clause {
+                    row_codec::scan_placeholders(predicate, &mut positional, &mut indexed)?;
+                }
+            }
+            SQLStatement::Delete(delete) => {
+                if let Some(predicate) = &delete.where_clause {
+                    row_codec::scan_placeholders(predicate, &mut positional, &mut indexed)?;
+                }
+            }
+            SQLStatement::CreateTable(_) | SQLStatement::CreateIndex(_) => {}
+        }
+        Ok(positional.max(indexed))
     }
 
     /// Execute a query plan: compiles `Scan`/`Filter`/`Aggregate`/`Join`
@@ -1063,6 +1247,113 @@ mod tests {
         executor
             .execute_sql("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 15)")
             .unwrap();
+    }
+
+    #[test]
+    fn test_execute_sql_rejects_bare_placeholder() {
+        // Before this check existed, "?" reaching parse_value silently
+        // became Value::Null -- the exact silent-corruption shape this
+        // guards against. execute_sql never binds parameters, so this
+        // must error, not quietly write NULL.
+        let executor = QueryExecutor::new(users_catalog());
+        assert!(executor
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (1, ?, 30)")
+            .is_err());
+    }
+
+    #[test]
+    fn test_prepared_insert_executed_repeatedly_with_different_params() {
+        let executor = QueryExecutor::new(users_catalog());
+        let stmt = executor.prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)").unwrap();
+
+        executor.execute_prepared(&stmt, &[Value::Integer(1), Value::String("Alice".to_string()), Value::Integer(30)]).unwrap();
+        executor.execute_prepared(&stmt, &[Value::Integer(2), Value::String("Bob".to_string()), Value::Integer(15)]).unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.contains(&"Alice".to_string()) && r.contains(&"30".to_string())));
+        assert!(rows.iter().any(|r| r.contains(&"Bob".to_string()) && r.contains(&"15".to_string())));
+    }
+
+    #[test]
+    fn test_prepared_select_with_where_placeholder() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let stmt = executor.prepare("SELECT * FROM users WHERE age > ?").unwrap();
+
+        let rows = executor.execute_prepared(&stmt, &[Value::Integer(18)]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+
+        // Same prepared statement, different bound value -- proves the
+        // cached plan's Filter predicate is substituted fresh each call,
+        // not baked in from the first execution.
+        let rows = executor.execute_prepared(&stmt, &[Value::Integer(10)]).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_prepared_select_join_and_where_placeholders_bind_in_plan_order() {
+        // Regression test for an ordering bug caught while implementing
+        // this: the physical plan visits Join nodes before the Filter
+        // node, but source SQL text has WHERE after JOIN -- scanning
+        // placeholders in source order at prepare() time while
+        // substituting in plan order at execute_prepared() time would
+        // silently swap which bound value lands in which slot. Both must
+        // walk in the same order (plan order: joins, then filter).
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total FLOAT)").unwrap();
+        seed_users(&executor); // ids 1 (Alice, age 30), 2 (Bob, age 15)
+        executor.execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 9.5)").unwrap();
+        executor.execute_sql("INSERT INTO orders (id, user_id, total) VALUES (101, 2, 4.0)").unwrap();
+
+        let stmt = executor
+            .prepare("SELECT * FROM users JOIN orders ON users.id = orders.user_id WHERE users.age > ?")
+            .unwrap();
+
+        let rows = executor.execute_prepared(&stmt, &[Value::Integer(18)]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+    }
+
+    #[test]
+    fn test_prepared_update_and_delete_with_placeholders() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let update_stmt = executor.prepare("UPDATE users SET age = ? WHERE name = ?").unwrap();
+        executor
+            .execute_prepared(&update_stmt, &[Value::Integer(31), Value::String("Alice".to_string())])
+            .unwrap();
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"31".to_string()));
+
+        let delete_stmt = executor.prepare("DELETE FROM users WHERE name = ?").unwrap();
+        let affected = executor.execute_prepared(&delete_stmt, &[Value::String("Bob".to_string())]).unwrap();
+        assert_eq!(affected, vec![vec!["1".to_string()]]);
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_prepared_statement_wrong_param_count_errors() {
+        let executor = QueryExecutor::new(users_catalog());
+        let stmt = executor.prepare("SELECT * FROM users WHERE age > ?").unwrap();
+        assert!(executor.execute_prepared(&stmt, &[]).is_err());
+    }
+
+    #[test]
+    fn test_prepare_rejects_mixed_placeholder_styles() {
+        let executor = QueryExecutor::new(users_catalog());
+        assert!(executor.prepare("SELECT * FROM users WHERE age > ? AND name = $1").is_err());
+    }
+
+    #[test]
+    fn test_prepare_create_table_is_rejected() {
+        let executor = QueryExecutor::new(Catalog::new());
+        assert!(executor.prepare("CREATE TABLE t (id INT PRIMARY KEY)").is_err());
     }
 
     #[test]
