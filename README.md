@@ -146,7 +146,7 @@ shrestidb/
 │
 └── examples/                           # Example Workloads
     ├── tpc_h.rs                        # TPC-H analytical workload
-    ├── oltp.rs                         # OLTP transaction workload
+    ├── oltp.rs                         # TPC-C-lite OLTP benchmark (New-Order/Payment)
     └── learned_index_demo.rs           # Learned index showcase
 ```
 
