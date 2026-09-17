@@ -227,40 +227,53 @@ cargo test -- --nocapture
 
 ## 💡 Example Usage
 
-### Running TPC-H Simulation
+### Running TPC-H-lite
 ```bash
 cargo run --example tpc_h --release
 ```
 
-Expected output:
+Real output from a run on the author's machine (Apple Silicon Mac, not a
+controlled benchmark environment — see the caveats in the example's own
+module doc, including why the join query's scale is much smaller than the
+scan/aggregation tables):
 ```
-=== TPC-H Workload Simulation ===
+=== TPC-H-lite ===
 
-Building learned index on 1000000 order records...
-Index built in 95ms
-...
-Index Lookup Performance:
-  Total lookups: 1000
-  Total time: 1.2ms
-  Average latency: 1.2µs
+Loading 20000 orders and 2000 customers...
+Loaded in 575.8ms
+
+Range Scan: SELECT * FROM orders WHERE o_orderkey >= 10000
+  10001 rows in 13.1ms (PK-index-accelerated)
+
+Aggregation: SELECT COUNT(*), SUM(o_totalprice) FROM orders
+  count=20000, sum=49878369.99999997 in 10.5ms (full scan)
+
+Join Query: SELECT * FROM join_orders JOIN join_customer ON join_orders.o_custkey = join_customer.c_custkey
+  3000 rows (3000 orders x 300 customers, nested loop) in 1.80s
 ```
 
-### Running OLTP Workload
+### Running TPC-C-lite
 ```bash
 cargo run --example oltp --release
 ```
 
-Expected output:
+Real output from a run on the author's machine — WAL-backed and
+fsync-per-commit, since durability is part of what these numbers are
+meant to include (see the example's module doc for what's simplified
+versus real TPC-C, including a real gap it surfaced: no expression
+evaluation in `UPDATE ... SET`, so both transactions do a naive
+read-then-write that's exposed to lost updates under contention):
 ```
-=== OLTP Workload Simulation ===
+=== TPC-C-lite ===
+4 warehouses, 200 customers, 100 stock items, 4 threads x 250 transactions (New-Order/Payment, ~50/50)
 
-Transaction Manager initialized
-Schema created: users table with 3 columns
+Elapsed: 28.1s
+New-Order: 492 committed, 0 failed
+Payment:   508 committed, 0 failed
+Total:     1000/1000 committed
 
-Simulating OLTP workload...
-Transactions executed: 10000
-Total time: 95ms
-Throughput: 105,263 TPS
+tpmC (New-Order committed / minute): 1050.9
+Overall throughput: 35.6 committed transactions/sec
 ```
 
 ### Running Learned Index Demo
@@ -322,20 +335,31 @@ This project demonstrates several novel contributions:
 
 ## 📊 Benchmark Results
 
-### TPC-H Simulation (1M records)
-| Query | ShrestiDB | Traditional DB | Speedup |
-|-------|-----------|----------------|---------|
-| Range Scan | 1.2ms | 12ms | 10x |
-| Aggregation | 45ms | 90ms | 2x |
-| Join Query | 180ms | 250ms | 1.4x |
+### TPC-H-lite (20K orders, 2K customers — see [`examples/tpc_h.rs`](examples/tpc_h.rs))
+These are ShrestiDB's own measured numbers, produced by `cargo run
+--example tpc_h --release`. There's no "Traditional DB" anywhere in this
+codebase to compare against, so unlike an earlier version of this table,
+there's no fabricated baseline or speedup column here — see the example's
+module doc for exact scale and caveats (the join query in particular runs
+on a much smaller 3,000 x 300 table pair, since the nested-loop join
+re-parses its predicate string on every row pair).
 
-### OLTP Workload
+| Query | Scale | Time |
+|-------|-------|------|
+| Range Scan (PK-indexed) | 20,000 orders | 13.1ms |
+| Aggregation (full scan) | 20,000 orders | 10.5ms |
+| Join Query (nested loop) | 3,000 x 300 | 1.80s |
+
+### TPC-C-lite (see [`examples/oltp.rs`](examples/oltp.rs))
+WAL-backed, fsync-per-commit, 4 threads. Produced by `cargo run --example
+oltp --release`; see the example's module doc for what's simplified versus
+real TPC-C.
+
 | Metric | Performance |
 |--------|-------------|
-| Throughput | 105K TPS |
-| Avg Latency | 0.1ms |
-| P99 Latency | 2ms |
-| Buffer Hit Rate | 97% |
+| Throughput | 35.6 committed tx/sec |
+| tpmC (New-Order/min) | 1050.9 |
+| Committed | 1000/1000 (0 lock-manager failures) |
 
 ### Index Build Performance
 | Dataset Size | RMI/PGM | B-Tree | Speedup |
