@@ -96,6 +96,18 @@ impl OLTPEngine {
         self.commit_clock.fetch_max(ts, Ordering::SeqCst);
     }
 
+    /// The latest commit timestamp as of right now -- a read at this
+    /// timestamp (not `mvcc_store::TS_INFINITY`; see `RowVersion::visible_at`'s
+    /// strict `<`, which a value equal to `end_ts` on a still-live version
+    /// would fail) sees every write committed before this call returns.
+    /// For a caller that already holds a row's exclusive lock and wants
+    /// its truly current value rather than an older transaction snapshot
+    /// — see `QueryExecutor::execute_update`'s doc comment for why that
+    /// distinction matters.
+    pub fn current_commit_ts(&self) -> u64 {
+        self.commit_clock.load(Ordering::SeqCst)
+    }
+
     /// Create a table in the underlying MVCC store (idempotent).
     pub fn create_table(&self, table_id: u64) {
         self.store.create_table(table_id);

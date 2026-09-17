@@ -263,26 +263,23 @@ cargo run --example oltp --release
 Real output from a run on the author's machine — WAL-backed and
 fsync-per-commit, since durability is part of what these numbers are
 meant to include (see the example's module doc for what's simplified
-versus real TPC-C). Both transactions now use a single-statement
-arithmetic `UPDATE` (`SET s_qty = s_qty - 1`, via
+versus real TPC-C). Both transactions use a single-statement arithmetic
+`UPDATE` (`SET s_qty = s_qty - 1`, via
 [`row_codec::CompiledAssignment`](src/execution/row_codec.rs)) rather
-than the client-side `SELECT`-then-`UPDATE` this benchmark originally
-had to use — **that's simpler, not safer**: it's still exposed to lost
-updates under contention on the same row, because `execute_update` reads
-a row under its transaction's snapshot before it ever takes that row's
-lock (see that method's doc comment for exactly why, and why this
-couldn't be fixed by expression support alone):
+than the client-side `SELECT`-then-`UPDATE` this benchmark originally had
+to use — and, as of the fix described below, that's now genuinely
+race-free under contention on the same row too, not just simpler syntax:
 ```
 === TPC-C-lite ===
 4 warehouses, 200 customers, 100 stock items, 4 threads x 250 transactions (New-Order/Payment, ~50/50)
 
-Elapsed: 29.9s
-New-Order: 499 committed, 0 failed
-Payment:   501 committed, 0 failed
+Elapsed: 28.2s
+New-Order: 509 committed, 0 failed
+Payment:   491 committed, 0 failed
 Total:     1000/1000 committed
 
-tpmC (New-Order committed / minute): 1002.9
-Overall throughput: 33.5 committed transactions/sec
+tpmC (New-Order committed / minute): 1082.1
+Overall throughput: 35.4 committed transactions/sec
 ```
 (This benchmark's queries are simple single-row updates by primary key,
 not filter-heavy scans, so it isn't where the predicate-re-parsing fix
@@ -385,15 +382,21 @@ pair (see [`row_codec::CompiledPredicate`](src/execution/row_codec.rs))
 WAL-backed, fsync-per-commit, 4 threads. Produced by `cargo run --example
 oltp --release`; see the example's module doc for what's simplified versus
 real TPC-C. Both transactions use a single-statement arithmetic `UPDATE`
-(see [`row_codec::CompiledAssignment`](src/execution/row_codec.rs)) —
-simpler than the client-side read-then-write this benchmark used before
-that type existed, but **not** safer against lost updates under
-contention on the same row; see `execute_update`'s doc comment for why.
+(see [`row_codec::CompiledAssignment`](src/execution/row_codec.rs)),
+genuinely race-free under contention on the same row: `execute_update`
+acquires a candidate row's exclusive lock *before* re-reading its latest
+committed value and computing from that, not from the earlier snapshot
+read that decided the row was a candidate — see that method's doc comment
+for the full mechanism, and
+`test_concurrent_arithmetic_updates_do_not_lose_updates` in
+[`execution::executor`](src/execution/executor.rs) for the test that
+proves it (verified to actually fail without the fix, not just pass with
+it).
 
 | Metric | Performance |
 |--------|-------------|
-| Throughput | 33.5 committed tx/sec |
-| tpmC (New-Order/min) | 1002.9 |
+| Throughput | 35.4 committed tx/sec |
+| tpmC (New-Order/min) | 1082.1 |
 | Committed | 1000/1000 (0 lock-manager failures) |
 
 (This benchmark's queries are simple PK updates, not filter-heavy scans,

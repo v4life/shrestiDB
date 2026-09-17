@@ -11,23 +11,23 @@
 //! contention pattern, against the real engine (MVCC + `LockManager` +
 //! fsync'd WAL), not a placeholder loop.
 //!
-//! One real limitation this surfaced rather than hid, now only half true:
-//! `UPDATE ... SET s_qty = s_qty - 1` **is** expressible directly now (see
-//! `row_codec::CompiledAssignment`), so both transactions below use it
-//! rather than the client-side `SELECT`-then-`UPDATE` workaround this
-//! module doc originally described. That did *not* make them safe against
-//! a concurrent UPDATE on the same row, though — `execute_update` reads
-//! every matched row under its transaction's MVCC snapshot before
-//! acquiring any lock, and only locks the row once it writes the already-
-//! computed new value (see that method's doc comment for exactly why).
-//! Two concurrent single-statement increments on the same row can still
-//! both read the same pre-update value and the second to commit still
-//! overwrites the first's — the lost-update race moved from being visible
-//! in this file's Rust to being invisible inside one SQL statement, it
-//! didn't go away. Fixing it for real means acquiring the row's lock
-//! before reading its value for assignment computation, not just before
-//! writing — a real architectural change, not something expressible SQL
-//! syntax alone can fix.
+//! Two real limitations this surfaced, both now fixed rather than hidden.
+//! First: `UPDATE ... SET s_qty = s_qty - 1` **is** expressible directly
+//! now (see `row_codec::CompiledAssignment`), so both transactions below
+//! use it rather than the client-side `SELECT`-then-`UPDATE` workaround
+//! this module doc originally described. Second, and the one that
+//! actually mattered for correctness: making that expressible didn't by
+//! itself make it safe against a concurrent `UPDATE` on the same row —
+//! `execute_update` used to read a matched row under its transaction's
+//! MVCC snapshot before acquiring any lock, computing the new value from
+//! data that could already be stale by the time it wrote. That's fixed
+//! now too: `execute_update` acquires a candidate row's exclusive lock
+//! *before* re-reading its latest committed value and computing from
+//! that, not the earlier snapshot read (see that method's doc comment for
+//! the full mechanism, and `execution::executor`'s
+//! `test_concurrent_arithmetic_updates_do_not_lose_updates` for the test
+//! that proves it — verified to actually fail without the fix, not just
+//! pass with it).
 
 use shrestidb::execution::executor::QueryExecutor;
 use rand::Rng;
@@ -84,12 +84,13 @@ fn setup(executor: &QueryExecutor) {
 
 /// Decrement a random stock item's quantity and record a new order — the
 /// write-heavy transaction TPC-C weights at 45% of its mix. Uses a
-/// single-statement arithmetic `UPDATE` (`row_codec::CompiledAssignment`)
-/// rather than a client-side `SELECT`-then-`UPDATE` — see the module doc
-/// on why that's simpler but still not race-free under contention on the
-/// same stock item, so `s_qty` isn't floored at zero here: letting it go
-/// negative under real contention is more honest than a client-side guard
-/// that can't actually make the update atomic anyway.
+/// single-statement arithmetic `UPDATE` (`row_codec::CompiledAssignment`),
+/// now genuinely race-free under contention on the same stock item (see
+/// the module doc). `s_qty` still isn't floored at zero, though — that's
+/// a separate simplification, not a race: this benchmark never checks
+/// stock availability before decrementing (real TPC-C's New-Order does),
+/// so it can legitimately go negative under enough concurrent demand on
+/// one item, correctly, not as a bug.
 fn new_order(executor: &QueryExecutor, next_order_id: &AtomicI64, rng: &mut impl Rng) -> bool {
     let w_id = rng.gen_range(1..=NUM_WAREHOUSES);
     let c_id = rng.gen_range(1..=(NUM_WAREHOUSES * CUSTOMERS_PER_WAREHOUSE));

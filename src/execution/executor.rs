@@ -29,6 +29,7 @@ use std::path::Path;
 use crate::error::{DatabaseError, Result};
 use crate::execution::aggregate;
 use crate::execution::catalog::{Catalog, Column, DataType, TableSchema};
+use crate::execution::lock_manager::LockKey;
 use crate::execution::mvcc_store::WriteOp;
 use crate::execution::oltp::OLTPEngine;
 use crate::execution::operators::{Tuple, Value};
@@ -573,21 +574,25 @@ impl QueryExecutor {
     /// A self-referential assignment (`SET balance = balance + amount`,
     /// via `row_codec::CompiledAssignment`) is **not** safe against a
     /// concurrent UPDATE touching the same row, and switching a caller
-    /// from a client-side read-then-write to this in one statement does
-    /// not fix that: `scan_table` reads every matched row under this
-    /// transaction's MVCC snapshot with no lock at all (see
-    /// `OLTPEngine::read`'s docs on why reads are lock-free by design),
-    /// and the exclusive lock isn't acquired until `self.oltp.write`,
-    /// *after* the new value has already been computed from that
-    /// snapshot read. Two concurrent UPDATEs against the same row can
-    /// both read the same pre-update value, each compute their own
-    /// increment from it, and the second to commit overwrites the
-    /// first's -- a lost update, same as the race `examples/oltp.rs`'s
-    /// module doc describes for its client-side version of this pattern.
-    /// Fixing it for real would mean acquiring the row's lock before
-    /// reading its value for assignment computation, not just before
-    /// writing -- a real change to this method's flow, not something
-    /// `CompiledAssignment` itself could fix by construction.
+    /// from a client-side read-then-write to this in one statement doesn't
+    /// fix that by itself: `scan_table` reads every candidate row under
+    /// this transaction's MVCC snapshot with no lock at all (see
+    /// `OLTPEngine::read`'s docs on why reads are lock-free by design), so
+    /// a value read that way is stale the instant a concurrent transaction
+    /// commits a change to the same row. What actually closes the race is
+    /// what happens next, for each row that snapshot-read looked like a
+    /// candidate for: this acquires that row's exclusive lock *before*
+    /// re-reading it, then computes and writes from that re-read value,
+    /// not the snapshot one. Once the lock is held, no concurrent
+    /// transaction can also be a writer on this row until this one commits
+    /// or aborts, and `OLTPEngine::commit` applies a transaction's writes
+    /// to the store *before* releasing its locks -- so the re-read is
+    /// guaranteed to reflect every prior holder's committed write, however
+    /// recent. The initial snapshot-read match is still what decides which
+    /// rows to even attempt this for (locking every row in the table for a
+    /// narrow `WHERE` would be its own regression); the `WHERE` clause is
+    /// re-checked against the re-read value too, in case a concurrent
+    /// commit changed a column it depends on in between.
     fn execute_update(&self, update: UpdateStatement) -> Result<usize> {
         let schema = self.catalog.read().get_table(&update.table).cloned().ok_or_else(|| {
             DatabaseError::ExecutionError(format!("Unknown table '{}'", update.table))
@@ -630,16 +635,45 @@ impl QueryExecutor {
         // transaction actually commits, below.
         let mut indexed_rows: Vec<(u64, Vec<Value>)> = Vec::new();
         for (row_id, bytes) in rows {
-            let Ok(mut tuple) = bincode::deserialize::<Tuple>(&bytes) else {
+            let Ok(tuple) = bincode::deserialize::<Tuple>(&bytes) else {
                 continue; // unreadable row: skip rather than fail the whole statement
             };
 
+            // Cheap candidacy check against this transaction's snapshot --
+            // avoids locking every row in the table for a narrow UPDATE.
+            // A row that passes here still gets its value re-read and
+            // re-checked below, under its own lock, before anything is
+            // actually written -- see this method's doc comment.
             let matches = compiled_where.as_ref().and_then(|c| c.eval(&schema, &tuple)).unwrap_or(true);
             if !matches {
                 continue;
             }
 
-            // Evaluate every assignment against the row's pre-statement
+            if let Err(e) = self.oltp.locks.acquire_exclusive(tx, LockKey::new(table_id, row_id)) {
+                self.oltp.abort(tx);
+                return Err(e);
+            }
+
+            // Re-read the row's latest *committed* value now that its
+            // lock is held, and re-check WHERE against that value -- see
+            // this method's doc comment for why this, not the snapshot
+            // read above, is what the assignments below must be computed
+            // from.
+            let Some(table) = self.oltp.store.get_table(table_id) else {
+                continue;
+            };
+            let Some(latest_bytes) = table.read(row_id, self.oltp.current_commit_ts()) else {
+                continue; // deleted by a concurrent transaction since our scan
+            };
+            let Ok(mut tuple) = bincode::deserialize::<Tuple>(&latest_bytes) else {
+                continue;
+            };
+            let still_matches = compiled_where.as_ref().and_then(|c| c.eval(&schema, &tuple)).unwrap_or(true);
+            if !still_matches {
+                continue;
+            }
+
+            // Evaluate every assignment against this row's pre-statement
             // snapshot before writing any of them -- "SET a = b, b = a"
             // must swap using both original values, not have the second
             // assignment see the first one's already-written result.
@@ -1105,6 +1139,48 @@ mod tests {
 
         let rows = executor.execute_sql("SELECT * FROM pair").unwrap();
         assert_eq!(rows, vec![vec!["1".to_string(), "20".to_string(), "10".to_string()]]);
+    }
+
+    #[test]
+    fn test_concurrent_arithmetic_updates_do_not_lose_updates() {
+        // The actual proof of execute_update's lock-before-read fix: before
+        // it, concurrent "value = value + 1" updates from multiple threads
+        // could each read the same pre-update value under their own MVCC
+        // snapshot and compute their increment from it, so whichever
+        // committed last would silently overwrite the other's. With the
+        // fix, every UPDATE re-reads and re-locks the row before computing
+        // its new value, so the final total must be *exactly* the number
+        // of increments applied -- not "usually" or "close to", every
+        // single run, since the fix removes the race by construction
+        // rather than just narrowing the window.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE counter (id INT PRIMARY KEY, value INT)").unwrap();
+        executor.execute_sql("INSERT INTO counter (id, value) VALUES (1, 0)").unwrap();
+
+        const THREADS: usize = 8;
+        const INCREMENTS_PER_THREAD: usize = 50;
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let executor = &executor;
+                scope.spawn(move || {
+                    for _ in 0..INCREMENTS_PER_THREAD {
+                        // A lock-timeout abort under real contention is
+                        // expected and not what this test is checking --
+                        // retry it, same as a real client would on a
+                        // transient serialization failure.
+                        loop {
+                            if executor.execute_sql("UPDATE counter SET value = value + 1 WHERE id = 1").is_ok() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let rows = executor.execute_sql("SELECT * FROM counter").unwrap();
+        assert_eq!(rows[0][1], (THREADS * INCREMENTS_PER_THREAD).to_string());
     }
 
     #[test]
