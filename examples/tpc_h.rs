@@ -17,13 +17,16 @@
 //! unlike `examples/oltp.rs`'s TPC-C-lite benchmark, which is specifically
 //! WAL-backed because durability is part of what TPC-C's numbers measure.
 //!
-//! The join query's scale is deliberately modest: `evaluate_predicate`
-//! re-parses its predicate string on every row pair rather than caching a
-//! parsed expression tree (see `execution::row_codec`), so a nested-loop
-//! join's cost includes that re-parsing cost on every one of its
-//! `left * right` comparisons. Worth optimizing if join-heavy workloads at
-//! real TPC-H scale ever matter here, but out of scope for this benchmark
-//! to fix -- it just picks a scale that stays fast today.
+//! The join query's scale is deliberately modest: it's always a
+//! nested-loop join with no index on the join column (see
+//! `execution::executor`), so its cost is inherently
+//! `O(left * right)` regardless of anything else. `evaluate_predicate`
+//! used to make this much worse by re-parsing its predicate string on
+//! every row pair instead of caching a parsed expression tree -- fixed by
+//! `row_codec::CompiledPredicate`, which cut this benchmark's join from
+//! 1.80s to 497ms. The nested-loop-with-no-index cost is still real and
+//! out of scope for this benchmark to fix; it just picks a scale that
+//! stays fast today.
 
 use shrestidb::execution::catalog::Catalog;
 use shrestidb::execution::executor::QueryExecutor;
@@ -31,9 +34,9 @@ use std::time::Instant;
 
 const NUM_ORDERS: i64 = 20_000;
 const NUM_CUSTOMERS: i64 = 2_000;
-// Nested-loop join cost is O(left * right) with a predicate re-parse per
-// pair (see module doc) -- kept far smaller than the scan/aggregation
-// tables so the join query finishes in a reasonable time.
+// Nested-loop join cost is O(left * right) with no join-key index (see
+// module doc) -- kept far smaller than the scan/aggregation tables so
+// the join query finishes in a reasonable time.
 const JOIN_ORDERS: i64 = 3_000;
 const JOIN_CUSTOMERS: i64 = 300;
 

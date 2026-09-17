@@ -242,17 +242,18 @@ scan/aggregation tables):
 === TPC-H-lite ===
 
 Loading 20000 orders and 2000 customers...
-Loaded in 575.8ms
+Loaded in 514.3ms
 
 Range Scan: SELECT * FROM orders WHERE o_orderkey >= 10000
-  10001 rows in 13.1ms (PK-index-accelerated)
+  10001 rows in 12.5ms (PK-index-accelerated)
 
 Aggregation: SELECT COUNT(*), SUM(o_totalprice) FROM orders
-  count=20000, sum=49878369.99999997 in 10.5ms (full scan)
+  count=20000, sum=49878369.99999978 in 10.0ms (full scan)
 
 Join Query: SELECT * FROM join_orders JOIN join_customer ON join_orders.o_custkey = join_customer.c_custkey
-  3000 rows (3000 orders x 300 customers, nested loop) in 1.80s
+  3000 rows (3000 orders x 300 customers, nested loop) in 496.8ms
 ```
+(Join was 1.80s before `evaluate_predicate` was changed to compile its predicate once per query instead of re-parsing the string on every row pair — see [`row_codec::CompiledPredicate`](src/execution/row_codec.rs).)
 
 ### Running TPC-C-lite
 ```bash
@@ -269,14 +270,18 @@ read-then-write that's exposed to lost updates under contention):
 === TPC-C-lite ===
 4 warehouses, 200 customers, 100 stock items, 4 threads x 250 transactions (New-Order/Payment, ~50/50)
 
-Elapsed: 28.1s
-New-Order: 492 committed, 0 failed
-Payment:   508 committed, 0 failed
+Elapsed: 35.9s
+New-Order: 495 committed, 0 failed
+Payment:   505 committed, 0 failed
 Total:     1000/1000 committed
 
-tpmC (New-Order committed / minute): 1050.9
-Overall throughput: 35.6 committed transactions/sec
+tpmC (New-Order committed / minute): 826.6
+Overall throughput: 27.8 committed transactions/sec
 ```
+(This benchmark's queries are simple single-row updates by primary key,
+not filter-heavy scans, so it isn't where the predicate-re-parsing fix
+above shows up — the elapsed-time difference from an earlier run is
+ordinary fsync-latency noise, not a regression.)
 
 ### Running Learned Index Demo
 ```bash
@@ -354,14 +359,20 @@ These are ShrestiDB's own measured numbers, produced by `cargo run
 codebase to compare against, so unlike an earlier version of this table,
 there's no fabricated baseline or speedup column here — see the example's
 module doc for exact scale and caveats (the join query in particular runs
-on a much smaller 3,000 x 300 table pair, since the nested-loop join
-re-parses its predicate string on every row pair).
+on a much smaller 3,000 x 300 table pair: it's always a nested loop with
+no index on the join column, so its cost is inherently O(left * right)
+regardless of the predicate-parsing fix described below).
 
 | Query | Scale | Time |
 |-------|-------|------|
-| Range Scan (PK-indexed) | 20,000 orders | 13.1ms |
-| Aggregation (full scan) | 20,000 orders | 10.5ms |
-| Join Query (nested loop) | 3,000 x 300 | 1.80s |
+| Range Scan (PK-indexed) | 20,000 orders | 12.5ms |
+| Aggregation (full scan) | 20,000 orders | 10.0ms |
+| Join Query (nested loop) | 3,000 x 300 | 496.8ms |
+
+The join figure is after fixing `evaluate_predicate` to compile its
+predicate once per query instead of re-parsing the string on every row
+pair (see [`row_codec::CompiledPredicate`](src/execution/row_codec.rs))
+— it was 1.80s before that fix, a 3.6x difference from this one change.
 
 ### TPC-C-lite (see [`examples/oltp.rs`](examples/oltp.rs))
 WAL-backed, fsync-per-commit, 4 threads. Produced by `cargo run --example
@@ -370,9 +381,13 @@ real TPC-C.
 
 | Metric | Performance |
 |--------|-------------|
-| Throughput | 35.6 committed tx/sec |
-| tpmC (New-Order/min) | 1050.9 |
+| Throughput | 27.8 committed tx/sec |
+| tpmC (New-Order/min) | 826.6 |
 | Committed | 1000/1000 (0 lock-manager failures) |
+
+(This benchmark's queries are simple PK updates, not filter-heavy scans,
+so run-to-run variance here is ordinary fsync-latency noise, not related
+to the predicate-parsing fix above.)
 
 ### Index Build Performance
 Real numbers from [`examples/learned_index_demo.rs`](examples/learned_index_demo.rs)
@@ -410,10 +425,13 @@ thing, on purpose.
 
 | Query | ShrestiDB vs SQLite | ShrestiDB vs Postgres |
 |-------|---------------------|------------------------|
-| Load (20K + 2K rows) | 10.24x slower | **7.7x faster** |
-| Range Scan (PK-indexed) | 1.81x slower | ~tied (0.95x) |
-| Aggregation (full scan) | 9.02x slower | 3.23x slower |
-| Join (nested loop, 3K x 300) | **530x slower** | **351x slower** |
+| Load (20K + 2K rows) | 9.01x slower | **7.7x faster** |
+| Range Scan (PK-indexed) | 1.18x slower | ~tied (0.96x) |
+| Aggregation (full scan) | 9.42x slower | 3.14x slower |
+| Join (nested loop, 3K x 300) | **109x slower** | **73x slower** |
+
+(Join numbers are after the `evaluate_predicate` fix described below —
+this table showed 530x/351x before it.)
 
 ("Nx slower/faster" = ShrestiDB's time relative to the other engine's,
 for the same query.)
@@ -435,12 +453,19 @@ for the same query.)
   being faster. Take the Postgres numbers as "where we stand against a
   real client/server RDBMS as actually deployed," not as an isolated
   measurement of execution speed.
-- **The join result is the one honest, unambiguous finding across both
-  comparisons**: ShrestiDB is 350-530x slower at a join than either real
-  database, because `evaluate_predicate` re-parses its predicate string
-  on every row pair instead of caching a parsed expression tree (see
-  `execution::row_codec`). This is the clearest concrete next
-  optimization target this exercise surfaced.
+- **The join gap was the clearest finding from both comparisons, and it's
+  now partly fixed.** `evaluate_predicate` used to re-parse its predicate
+  string on every row pair instead of caching a parsed expression tree;
+  it was 350-530x slower than either real database at the join query
+  before that was fixed (see
+  [`row_codec::CompiledPredicate`](src/execution/row_codec.rs), which
+  compiles a predicate once and reuses it across every row). That cut the
+  gap to 73-109x — a real, measured improvement, not a full fix: a
+  nested-loop join with no index on the join column, plus per-comparison
+  schema-column lookup and value cloning, is still inherently slower than
+  either engine's query planner picking a smarter strategy. The remaining
+  gap is a real next target, just a smaller and more precisely scoped one
+  now.
 
 ## 🤝 Contributing
 

@@ -188,9 +188,13 @@ impl QueryExecutor {
                     let (schema, tuples) = current
                         .take()
                         .ok_or_else(|| DatabaseError::ExecutionError("Filter with no input".to_string()))?;
+                    // Compiled once, outside the loop -- see
+                    // row_codec::CompiledPredicate's docs on why that
+                    // matters for anything past a handful of rows.
+                    let compiled = row_codec::CompiledPredicate::compile(predicate);
                     let filtered = tuples
                         .into_iter()
-                        .filter(|t| row_codec::evaluate_predicate(predicate, &schema, t).unwrap_or(true))
+                        .filter(|t| compiled.as_ref().and_then(|c| c.eval(&schema, t)).unwrap_or(true))
                         .collect();
                     current = Some((schema, filtered));
                 }
@@ -216,17 +220,23 @@ impl QueryExecutor {
                         }
                     }
 
+                    // Compiled once before the nested loop -- re-parsing
+                    // the condition string on every one of
+                    // left_tuples.len() * right_tuples.len() pairs is
+                    // exactly the cost that made this join 350-500x
+                    // slower than SQLite/Postgres on the same query (see
+                    // row_codec::CompiledPredicate's docs).
+                    let compiled_condition = condition.as_ref().and_then(|cond| row_codec::CompiledPredicate::compile(cond));
+
                     let mut merged_tuples = Vec::new();
                     for l in &left_tuples {
                         for r in &right_tuples {
                             let mut values = l.values.clone();
                             values.extend(r.values.clone());
                             let merged = Tuple { values };
-                            let keep = match condition {
-                                Some(cond) => {
-                                    row_codec::evaluate_predicate(cond, &merged_schema, &merged).unwrap_or(true)
-                                }
-                                None => true, // CROSS JOIN (or USING/NATURAL, not specially resolved)
+                            let keep = match &compiled_condition {
+                                Some(compiled) => compiled.eval(&merged_schema, &merged).unwrap_or(true),
+                                None => true, // CROSS JOIN, or a condition that didn't compile
                             };
                             if keep {
                                 merged_tuples.push(merged);
@@ -426,13 +436,14 @@ impl QueryExecutor {
             }
         };
         let candidates: std::collections::HashSet<u64> = candidates.into_iter().collect();
+        let compiled = row_codec::CompiledPredicate::compile(full_predicate);
 
         let tuples = self.oltp.with_read_snapshot(|tx| {
             candidates
                 .into_iter()
                 .filter_map(|row_id| self.oltp.read(tx, table_id, row_id).ok().flatten())
                 .filter_map(|bytes| bincode::deserialize::<Tuple>(&bytes).ok())
-                .filter(|tuple| row_codec::evaluate_predicate(full_predicate, schema, tuple).unwrap_or(false))
+                .filter(|tuple| compiled.as_ref().and_then(|c| c.eval(schema, tuple)).unwrap_or(false))
                 .collect::<Vec<_>>()
         });
 
@@ -586,6 +597,7 @@ impl QueryExecutor {
 
         let tx = self.oltp.begin();
         let rows = self.oltp.scan_table(tx, table_id);
+        let compiled_where = update.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p));
 
         let mut affected = 0usize;
         // See execute_insert: secondary indexes are only updated once the
@@ -596,10 +608,7 @@ impl QueryExecutor {
                 continue; // unreadable row: skip rather than fail the whole statement
             };
 
-            let matches = match &update.where_clause {
-                Some(predicate) => row_codec::evaluate_predicate(predicate, &schema, &tuple).unwrap_or(true),
-                None => true,
-            };
+            let matches = compiled_where.as_ref().and_then(|c| c.eval(&schema, &tuple)).unwrap_or(true);
             if !matches {
                 continue;
             }
@@ -645,6 +654,7 @@ impl QueryExecutor {
 
         let tx = self.oltp.begin();
         let rows = self.oltp.scan_table(tx, table_id);
+        let compiled_where = delete.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p));
 
         let mut affected = 0usize;
         for (row_id, bytes) in rows {
@@ -652,10 +662,7 @@ impl QueryExecutor {
                 continue;
             };
 
-            let matches = match &delete.where_clause {
-                Some(predicate) => row_codec::evaluate_predicate(predicate, &schema, &tuple).unwrap_or(true),
-                None => true,
-            };
+            let matches = compiled_where.as_ref().and_then(|c| c.eval(&schema, &tuple)).unwrap_or(true);
             if !matches {
                 continue;
             }

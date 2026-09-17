@@ -24,6 +24,11 @@
 //! than silently degrading to an unfiltered cross product — and it only
 //! ever hands `split_comparison` a single comparison, never a full
 //! boolean expression, since a JOIN's `ON` clause here is scoped that way.
+//!
+//! `evaluate_predicate` is a convenience wrapper that tokenizes and parses
+//! from scratch every call — a per-row hot loop (`Filter`, `JOIN`,
+//! UPDATE/DELETE's matching pass) should use `CompiledPredicate` instead
+//! to pay that cost once, not once per row.
 
 use crate::execution::catalog::{DataType, TableSchema};
 use crate::execution::operators::{Tuple, Value};
@@ -57,15 +62,48 @@ pub fn value_to_string(value: &Value) -> String {
 
 /// Evaluate a flattened WHERE/JOIN-condition predicate against one row —
 /// see the module docs for exactly what shapes this understands and how
-/// callers should treat `None`.
+/// callers should treat `None`. Tokenizes and parses `predicate` from
+/// scratch every call — fine for the many single-shot call sites (tests,
+/// a one-off check), but a caller evaluating the *same* predicate against
+/// many rows (a table scan's `Filter`, a `JOIN`'s nested loop, an
+/// UPDATE/DELETE's matching pass) should compile it once with
+/// `CompiledPredicate::compile` instead and reuse that across every row —
+/// see that type's docs for why this matters in practice, not just in
+/// principle.
 pub fn evaluate_predicate(predicate: &str, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
-    let tokens = tokenize_expr(predicate);
-    let mut parser = ExprParser { tokens: &tokens, pos: 0 };
-    let expr = parser.parse_or()?;
-    if parser.pos != tokens.len() {
-        return None; // trailing tokens the parser couldn't consume
+    CompiledPredicate::compile(predicate)?.eval(schema, tuple)
+}
+
+/// A predicate parsed once, for callers evaluating it against many rows.
+/// `evaluate_predicate` re-tokenizes and re-parses its string argument on
+/// every call, which is invisible for a one-off check but dominates a hot
+/// loop: a nested-loop `JOIN`'s `ON` condition, for instance, is otherwise
+/// re-parsed on every single `left_rows * right_rows` pair — the
+/// difference is a real, measured 350-500x slowdown relative to SQLite or
+/// Postgres running the equivalent join (see `examples/vs_sqlite.rs` /
+/// `examples/vs_postgres.rs`), not a theoretical one. Compile once outside
+/// the loop, then call `eval` per row.
+pub struct CompiledPredicate {
+    expr: BoolExpr,
+}
+
+impl CompiledPredicate {
+    /// `None` for anything `evaluate_predicate` would also treat as
+    /// unparseable — see the module docs for exactly what that means for
+    /// the caller (typically: don't filter the row out).
+    pub fn compile(predicate: &str) -> Option<CompiledPredicate> {
+        let tokens = tokenize_expr(predicate);
+        let mut parser = ExprParser { tokens: &tokens, pos: 0 };
+        let expr = parser.parse_or()?;
+        if parser.pos != tokens.len() {
+            return None; // trailing tokens the parser couldn't consume
+        }
+        Some(CompiledPredicate { expr })
     }
-    eval_bool_expr(&expr, schema, tuple)
+
+    pub fn eval(&self, schema: &TableSchema, tuple: &Tuple) -> Option<bool> {
+        eval_bool_expr(&self.expr, schema, tuple)
+    }
 }
 
 /// Split a flattened `<left> <op> <right>` comparison into its three

@@ -156,7 +156,7 @@ fn main() {
     println!();
 
     // Separate, smaller tables for the join -- see examples/tpc_h.rs's
-    // module doc on why (ShrestiDB's predicate re-parse-per-row cost).
+    // module doc on why (always a nested loop with no join-key index).
     shresti
         .execute_sql("CREATE TABLE join_orders (o_orderkey INT PRIMARY KEY, o_custkey INT, o_totalprice FLOAT)")
         .unwrap();
