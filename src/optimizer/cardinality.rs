@@ -153,6 +153,17 @@ impl ColumnDistribution {
             ColumnDistribution::Categorical { total_rows, .. } => *total_rows,
         }
     }
+
+    /// The column's real, observed distinct-value count as of `ANALYZE`
+    /// time — the same staleness caveat as `total_rows`. Used by
+    /// `join_reorder::JoinOrderer` for a real equi-join cardinality
+    /// estimate instead of a fixed selectivity.
+    pub fn distinct_count(&self) -> usize {
+        match self {
+            ColumnDistribution::Numeric { distinct_count, .. } => *distinct_count,
+            ColumnDistribution::Categorical { distinct_count, .. } => *distinct_count,
+        }
+    }
 }
 
 fn count_distinct(sorted_values: &[f64]) -> usize {

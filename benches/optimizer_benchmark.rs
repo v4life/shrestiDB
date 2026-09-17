@@ -1,8 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use shrestidb::execution::operators::Value;
 use shrestidb::optimizer::cardinality::ColumnDistribution;
 use shrestidb::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
 use shrestidb::optimizer::join_reorder::JoinOrderer;
-use shrestidb::execution::operators::Value;
+use shrestidb::sql::parser::JoinClause;
 
 fn benchmark_cardinality_estimation(c: &mut Criterion) {
     // Real ColumnDistribution now -- see optimizer::cardinality's module
@@ -64,12 +65,32 @@ fn benchmark_plan_cost_comparison(c: &mut Criterion) {
 }
 
 fn benchmark_join_ordering(c: &mut Criterion) {
+    // The real search (see join_reorder::JoinOrderer::find_optimal_order):
+    // a 5-way chain, each join off the root table `t0`, with distinct
+    // per-table selectivity so the search actually has a decision to
+    // make (not just replaying one trivially-valid order).
     let orderer = JoinOrderer::new();
-    let tables = vec![1, 2, 3, 4, 5];
+    let joins: Vec<JoinClause> = (1..=5)
+        .map(|i| JoinClause {
+            table: format!("t{i}"),
+            alias: Some(format!("t{i}")),
+            condition: Some(format!("t0.id = t{i}.t0_id")),
+        })
+        .collect();
+    let row_count_of = |q: &str| if q == "t0" { 10_000 } else { 1_000 };
+    let distinct_count_of = |q: &str, _c: &str| match q {
+        "t0" => Some(10_000),
+        "t1" => Some(10),
+        "t2" => Some(100),
+        "t3" => Some(1_000),
+        "t4" => Some(500),
+        "t5" => Some(50),
+        _ => None,
+    };
 
     c.bench_function("join_reorder_5_tables", |b| {
         b.iter(|| {
-            orderer.find_optimal_order(black_box(tables.clone()));
+            orderer.find_optimal_order(black_box("t0"), black_box(10_000), &joins, row_count_of, distinct_count_of, 0.1);
         });
     });
 }

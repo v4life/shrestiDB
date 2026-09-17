@@ -22,6 +22,16 @@
 //! looking accurate on its own: a Filter's selectivity, however real,
 //! produces a meaningless final row count if it's multiplied against a
 //! fake base — the two only add up to a real number together.
+//!
+//! Multi-table queries also get a real decision, not just a real
+//! estimate: `JOIN` clauses are handed to
+//! `join_reorder::JoinOrderer::find_optimal_order`, which searches for
+//! the cheapest order that's provably safe to run (see that function's
+//! docs) using real distinct-value counts when `stats` has them, falling
+//! back to source order otherwise. The executor has no independent
+//! notion of join order — it walks this planner's `Join` nodes in
+//! whatever sequence they're emitted — so this is a real reordering, not
+//! a number that gets computed and then ignored.
 
 use crate::execution::aggregate;
 use crate::execution::operators::Value;
@@ -153,11 +163,30 @@ impl QueryPlanner {
         // this, a Filter's real selectivity would still be multiplied
         // against a fake base count, and the result would be no more
         // meaningful than the constant it replaced.
-        let mut rows = stats
-            .iter()
-            .find(|((table, _), _)| table == &select.from)
-            .map(|(_, dist)| dist.total_rows())
-            .unwrap_or(Self::ASSUMED_TABLE_ROWS);
+        // Maps each table's qualifier as it appears in JOIN conditions
+        // (its alias if it has one, else its real name) back to the real
+        // table name `stats` is keyed by -- needed because a condition
+        // like "u.id = o.user_id" only ever names aliases, never the
+        // underlying table, once a query uses them.
+        let mut qualifier_to_table: HashMap<String, String> = HashMap::new();
+        let from_qualifier = select.from_alias.clone().unwrap_or_else(|| select.from.clone());
+        qualifier_to_table.insert(from_qualifier.clone(), select.from.clone());
+        for join in &select.joins {
+            let q = join.alias.clone().unwrap_or_else(|| join.table.clone());
+            qualifier_to_table.insert(q, join.table.clone());
+        }
+        let row_count_of = |qualifier: &str| -> usize {
+            qualifier_to_table
+                .get(qualifier)
+                .and_then(|table| stats.iter().find(|((t, _), _)| t == table).map(|(_, dist)| dist.total_rows()))
+                .unwrap_or(Self::ASSUMED_TABLE_ROWS)
+        };
+        let distinct_count_of = |qualifier: &str, column: &str| -> Option<usize> {
+            let table = qualifier_to_table.get(qualifier)?;
+            stats.get(&(table.clone(), column.to_string())).map(|dist| dist.distinct_count())
+        };
+
+        let mut rows = row_count_of(&from_qualifier);
         let mut nodes = vec![LogicalPlanNode::Scan {
             table_id: 0,
             table_name: select.from.clone(),
@@ -165,21 +194,32 @@ impl QueryPlanner {
             rows,
         }];
 
-        for join in &select.joins {
-            let (left_rows, right_rows) = (rows, Self::ASSUMED_TABLE_ROWS);
-            rows = self.join_orderer.estimate_join_cardinality(
-                left_rows,
-                right_rows,
-                Self::DEFAULT_JOIN_SELECTIVITY,
-            );
+        // Real join ordering: search for the cheapest order that's
+        // provably resolvable (every join's condition can be evaluated
+        // against whatever's already been accumulated at that point),
+        // falling back to source order otherwise -- see
+        // `join_reorder::JoinOrderer::find_optimal_order`'s docs. The
+        // executor just walks `nodes` in whatever order they're emitted
+        // here, so this loop's order IS the execution order.
+        let planned_joins = self.join_orderer.find_optimal_order(
+            &from_qualifier,
+            rows,
+            &select.joins,
+            row_count_of,
+            distinct_count_of,
+            Self::DEFAULT_JOIN_SELECTIVITY,
+        );
+        for planned in &planned_joins {
+            let join = &select.joins[planned.join_index];
             nodes.push(LogicalPlanNode::Join {
                 right_table: join.table.clone(),
                 right_alias: join.alias.clone(),
                 condition: join.condition.clone(),
-                left_rows,
-                right_rows,
+                left_rows: planned.left_rows,
+                right_rows: planned.right_rows,
                 join_type: "inner".to_string(),
             });
+            rows = planned.output_rows;
         }
 
         if let Some(predicate) = select.where_clause.clone() {

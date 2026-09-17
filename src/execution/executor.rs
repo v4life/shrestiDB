@@ -1841,6 +1841,65 @@ mod tests {
         catalog
     }
 
+    /// `users_and_orders_catalog` plus a `payments` table referencing
+    /// `orders`, for a genuine 3-way `JOIN ... JOIN ...` chain -- no test
+    /// exercised one before this, despite the alias/qualifier-tracking
+    /// fix (`current_qualifier` in `execute`) that a chained join relies
+    /// on having landed separately, and despite join reordering
+    /// (`optimizer::join_reorder`) now depending on a 3-way chain
+    /// actually working correctly.
+    fn users_orders_and_payments_catalog() -> Catalog {
+        let mut catalog = users_and_orders_catalog();
+        let mut payments = TableSchema::new(3, "payments".to_string());
+        payments.add_column(Column {
+            id: 1,
+            name: "id".to_string(),
+            data_type: DataType::Integer,
+            nullable: false,
+            primary_key: true,
+        });
+        payments.add_column(Column {
+            id: 2,
+            name: "order_id".to_string(),
+            data_type: DataType::Integer,
+            nullable: false,
+            primary_key: false,
+        });
+        payments.add_column(Column {
+            id: 3,
+            name: "method".to_string(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        });
+        catalog.register_table(payments);
+        catalog
+    }
+
+    #[test]
+    fn test_three_way_join_matches_correct_rows() {
+        let executor = QueryExecutor::new(users_orders_and_payments_catalog());
+        seed_users(&executor); // ids 1 (Alice), 2 (Bob)
+        executor.execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 9.5)").unwrap();
+        executor.execute_sql("INSERT INTO orders (id, user_id, total) VALUES (101, 2, 4.0)").unwrap();
+        executor.execute_sql("INSERT INTO payments (id, order_id, method) VALUES (1000, 100, 'card')").unwrap();
+        executor.execute_sql("INSERT INTO payments (id, order_id, method) VALUES (1001, 100, 'cash')").unwrap();
+        executor.execute_sql("INSERT INTO payments (id, order_id, method) VALUES (1002, 101, 'card')").unwrap();
+
+        let rows = executor
+            .execute_sql(
+                "SELECT * FROM users u JOIN orders o ON u.id = o.user_id JOIN payments p ON o.id = p.order_id",
+            )
+            .unwrap();
+
+        // Alice's order 100 has 2 payments, Bob's order 101 has 1.
+        assert_eq!(rows.len(), 3);
+        let alice_payments = rows.iter().filter(|r| r.contains(&"Alice".to_string())).count();
+        assert_eq!(alice_payments, 2);
+        let bob_payments = rows.iter().filter(|r| r.contains(&"Bob".to_string())).count();
+        assert_eq!(bob_payments, 1);
+    }
+
     #[test]
     fn test_join_with_on_condition_matches_correct_rows() {
         let executor = QueryExecutor::new(users_and_orders_catalog());

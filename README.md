@@ -13,7 +13,8 @@ A relational database kernel written in Rust that leverages machine learning mod
 ### ML-Driven Query Optimization
 - **Real Cardinality Estimation**: `ANALYZE <table>` builds a real per-column value distribution — a `PGMIndex` (the same learned-index technique above) fit over the column's actual sorted values as an empirical CDF, plus a real distinct-value count for equality selectivity. Replaces a fixed 0.5-selectivity-for-every-filter constant with a genuine, data-driven estimate; see [`optimizer::cardinality`](src/optimizer/cardinality.rs) and the [Real Cardinality Estimation](#real-cardinality-estimation-vs-a-fixed-constant) results below. (An earlier version of this feature was a "neural network" whose weights were hardcoded and never trained — replaced rather than reused; see that module's doc comment for the full story.)
 - **Cost Model**: A real IO/CPU cost formula, consulted for every plan's `estimated_cost` — not adaptive or trained from execution history despite earlier documentation here claiming otherwise.
-- **Hash Join**: Equality join conditions run as a real hash join (build a hash table on the smaller side, probe with the larger) instead of a nested loop — see [Benchmark Results](#-benchmark-results) below for the measured effect. Join **order** (for 3+-table queries) is not yet chosen by cost — queries execute in the order they're written; this is real, scoped, in-progress work, not shipped yet.
+- **Hash Join**: Equality join conditions run as a real hash join (build a hash table on the smaller side, probe with the larger) instead of a nested loop — see [Benchmark Results](#-benchmark-results) below for the measured effect.
+- **Real Join Reordering**: For 3+-table queries, [`optimizer::join_reorder::JoinOrderer`](src/optimizer/join_reorder.rs) searches for the cheapest join order that's *provably resolvable* by this engine's left-deep executor, using real per-column distinct-value counts from `ANALYZE` — not a heuristic sort, and not a number computed and then ignored; the executor runs whatever order the search picks. See [Real Join Reordering](#real-join-reordering-vs-a-cost-model-with-no-real-signal) below for a measured before/after.
 
 ### Intelligent Storage
 - **Learned Buffer Pool**: Markov chain predictor anticipates page access patterns for prefetching
@@ -57,7 +58,8 @@ in sync by hand.
 ┌────────────────▼──────────────────────┐
 │   Query Optimization Layer            │
 │  (Cost Model, Real Cardinality        │
-│   Estimation via ANALYZE, Hash Join)  │
+│   Estimation, Hash Join, Real Join    │
+│   Reordering — all via ANALYZE)       │
 └────────────────┬──────────────────────┘
                  │
 ┌────────────────▼──────────────────────┐
@@ -348,6 +350,7 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture, algorithm description
 - [x] Real cardinality estimation (`ANALYZE`, PGM-fitted per-column distributions)
 - [x] Cost model consulted for real plan cost estimates
 - [x] Hash join for equality conditions
+- [x] Cost-based join ordering for 3+-table queries (real per-column distinct counts from `ANALYZE`, searched under a provable-resolvability safety check — see [`optimizer::join_reorder`](src/optimizer/join_reorder.rs))
 - [x] Vectorized query operators
 - [x] MVCC transaction manager
 - [x] Write-Ahead Log (WAL)
@@ -355,7 +358,6 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture, algorithm description
 - [x] Example workloads (TPC-H, OLTP)
 
 ### In Progress 🔄
-- [ ] Cost-based join ordering for 3+-table queries (the real per-column stats above now make this meaningful to build — previously the cost model applied the same fixed selectivity to every join, so even a real search over orderings would have found no difference between them)
 - [ ] Advanced SQL features (subqueries, window functions)
 - [ ] Index creation/selection automation
 - [ ] Distributed query processing
@@ -459,6 +461,48 @@ Honestly: at 10K, PGM lookup is actually *slower* than the B-Tree —
 fixed per-lookup overhead dominates at small scale. The real advantage
 shows up as data grows: by 1M records PGM is 7.2x and RMI is 36.8x
 faster than the B-Tree baseline.
+
+### Real Cardinality Estimation (vs. a fixed constant)
+Real numbers from [`examples/cardinality_demo.rs`](examples/cardinality_demo.rs)
+(`cargo run --example cardinality_demo --release`). 100,000 orders, a
+realistic 95%/5% shipped/cancelled skew, query `WHERE amount >= 999`
+(the cancelled orders):
+
+| | Estimated rows | True rows | Error |
+|---|---|---|---|
+| Before `ANALYZE` (fixed 0.5 selectivity) | 500 | 5,000 | 4,500 rows |
+| After `ANALYZE` (real `ColumnDistribution`) | 5,000 | 5,000 | 0 rows |
+
+The fixed heuristic isn't wrong because it's poorly tuned — it's wrong
+because it's the *same number for every filter, on every table,
+regardless of the actual data*. `ANALYZE` replaces it with a real
+piecewise-linear model of the column's empirical CDF (`PGMIndex::predicted_rank`,
+the same learned-index technique behind the lookup numbers above), fit
+to the column's actual values.
+
+### Real Join Reordering (vs. a cost model with no real signal)
+Real numbers from [`examples/join_reorder_demo.rs`](examples/join_reorder_demo.rs)
+(`cargo run --example join_reorder_demo --release`). 200 accounts joined
+to 10,000 `tags` (a low-cardinality, wide fan-out join key — only 2
+distinct values) and 200 `transactions` (a near-1:1 match), written with
+the expensive join listed first in the SQL — the case that benefits most
+from being pushed later:
+
+| | Chosen order | Estimated cost | Wall time |
+|---|---|---|---|
+| Before `ANALYZE` (no distinct counts — every order costs the same) | tags → transactions (source order, unchanged) | 22,330 | 1.44s |
+| After `ANALYZE` (real distinct counts) | transactions → tags | 2,266 | 1.03s |
+
+Row count is identical both times (1,000,000 — reordering changed
+performance, not correctness) — the search only ever picks among orders
+it can *prove* resolvable against this engine's left-deep executor (see
+[`optimizer::join_reorder`](src/optimizer/join_reorder.rs)'s module doc),
+so it can never turn a working query into a broken one, only a faster
+one. The 9.9x drop in estimated cost overstates the real 1.4x wall-time
+win: both orders still materialize and stringify the same ~1,000,000-row
+final result, a fixed cost the cost model doesn't account for at all and
+that dilutes the real, order-dependent difference in join work — a real
+gap, reported rather than tuned away.
 
 ### vs SQLite / vs Postgres (real comparisons)
 Same TPC-H-lite workload (20K orders, 2K customers, joined at that same
