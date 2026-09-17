@@ -281,7 +281,7 @@ Overall throughput: 35.6 committed transactions/sec
 cargo run --example learned_index_demo --release
 ```
 
-Shows detailed performance comparison between PGM and B-Tree across different dataset sizes.
+Shows detailed performance comparison between PGM, RMI, and B-Tree — all three built and searched for real over the same key sets — across different dataset sizes. Feeds the [Index Build Performance](#index-build-performance) numbers below.
 
 ## 📚 Documentation
 
@@ -362,11 +362,30 @@ real TPC-C.
 | Committed | 1000/1000 (0 lock-manager failures) |
 
 ### Index Build Performance
-| Dataset Size | RMI/PGM | B-Tree | Speedup |
-|-------------|---------|--------|---------|
-| 10K | 1ms | 5ms | 5x |
-| 100K | 8ms | 45ms | 5.6x |
-| 1M | 85ms | 520ms | 6.1x |
+Real numbers from [`examples/learned_index_demo.rs`](examples/learned_index_demo.rs)
+(`cargo run --example learned_index_demo --release`) — PGM, a single-stage
+RMI, and this codebase's own `BTree` all built and searched over the same
+sorted key sets. No external database involved; `BTree` is the in-repo
+baseline both learned structures are compared against.
+
+**Build time**
+| Dataset Size | PGM | RMI | B-Tree |
+|-------------|-----|-----|--------|
+| 10K | 157µs | 82µs | 425µs |
+| 100K | 1.39ms | 781µs | 3.52ms |
+| 1M | 12.28ms | 8.36ms | 31.89ms |
+
+**Lookup latency** (avg per lookup, 100 searches)
+| Dataset Size | PGM | RMI | B-Tree | PGM Speedup | RMI Speedup |
+|-------------|-----|-----|--------|-------------|-------------|
+| 10K | 0.130µs | 0.030µs | 0.070µs | 0.5x | 2.3x |
+| 100K | 0.240µs | 0.080µs | 0.240µs | 1.0x | 3.0x |
+| 1M | 0.410µs | 0.080µs | 2.940µs | 7.2x | 36.8x |
+
+Honestly: at 10K, PGM lookup is actually *slower* than the B-Tree —
+fixed per-lookup overhead dominates at small scale. The real advantage
+shows up as data grows: by 1M records PGM is 7.2x and RMI is 36.8x
+faster than the B-Tree baseline.
 
 ## 🤝 Contributing
 

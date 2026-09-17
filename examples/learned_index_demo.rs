@@ -1,9 +1,16 @@
 //! Learned index demonstration
 //!
-//! Shows the power of learned indexes vs traditional approaches.
+//! Builds real `PGMIndex`, `RMIIndex`, and `BTree` instances over the same
+//! sorted key sets at three sizes and times both build and lookup for
+//! each — no fabricated numbers, no external "traditional DB" to compare
+//! against (`BTree` here is this codebase's own baseline, not one). The
+//! RMI is a single-stage model (one `LinearModel` fit over the whole key
+//! set), the same construction `benches/index_benchmark.rs` uses.
 
 use shrestidb::index::pgm::PGMIndex;
 use shrestidb::index::btree::BTree;
+use shrestidb::index::rmi::{RMIIndex, RMIStage};
+use shrestidb::index::models::LinearModel;
 use std::time::Instant;
 
 fn main() {
@@ -33,6 +40,18 @@ fn main() {
         println!("  Build time: {:?}", pgm_build);
         println!("  Segments: {}", pgm.segments.len());
 
+        // Build a single-stage RMI (Recursive Model Index): one linear
+        // model fit over the whole sorted key set, same construction
+        // `benches/index_benchmark.rs` uses.
+        println!("\nBuilding RMI (Recursive Model Index)...");
+        let positions: Vec<usize> = (0..keys.len()).collect();
+        let start = Instant::now();
+        let model = LinearModel::fit(&keys, &positions.iter().map(|p| *p as f64).collect::<Vec<_>>()).unwrap();
+        let stage = RMIStage::new(vec![model]);
+        let rmi = RMIIndex::new(vec![stage], keys.clone(), positions);
+        let rmi_build = start.elapsed();
+        println!("  Build time: {:?}", rmi_build);
+
         // Build B-Tree index
         println!("\nBuilding B-Tree index...");
         let start = Instant::now();
@@ -58,6 +77,13 @@ fn main() {
 
         let start = Instant::now();
         for key in &search_keys {
+            let _ = rmi.find_exact(*key, 16);
+        }
+        let rmi_search = start.elapsed();
+        let rmi_avg = rmi_search.as_micros() as f64 / num_searches as f64;
+
+        let start = Instant::now();
+        for key in &search_keys {
             let _ = btree.search(*key);
         }
         let btree_search = start.elapsed();
@@ -68,11 +94,16 @@ fn main() {
         println!("  PGM:");
         println!("    Total time: {:?}", pgm_search);
         println!("    Avg per lookup: {:.3} µs", pgm_avg);
+        println!("  RMI:");
+        println!("    Total time: {:?}", rmi_search);
+        println!("    Avg per lookup: {:.3} µs", rmi_avg);
         println!("  B-Tree:");
         println!("    Total time: {:?}", btree_search);
         println!("    Avg per lookup: {:.3} µs", btree_avg);
-        println!("\n  Speedup: {:.1}x", btree_avg / pgm_avg);
+        println!("\n  PGM lookup speedup vs B-Tree: {:.1}x", btree_avg / pgm_avg);
+        println!("  RMI lookup speedup vs B-Tree: {:.1}x", btree_avg / rmi_avg);
         println!("  PGM build vs B-Tree: {:.1}x", pgm_build.as_secs_f64() / btree_build.as_secs_f64());
+        println!("  RMI build vs B-Tree: {:.1}x", rmi_build.as_secs_f64() / btree_build.as_secs_f64());
     }
 
     println!("\n=== Key Insights ===");
