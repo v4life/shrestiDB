@@ -569,6 +569,25 @@ impl QueryExecutor {
     /// id — unlike INSERT, there's no id to derive here, `scan_table`
     /// already hands back each row's real id. Returns the number of rows
     /// updated.
+    ///
+    /// A self-referential assignment (`SET balance = balance + amount`,
+    /// via `row_codec::CompiledAssignment`) is **not** safe against a
+    /// concurrent UPDATE touching the same row, and switching a caller
+    /// from a client-side read-then-write to this in one statement does
+    /// not fix that: `scan_table` reads every matched row under this
+    /// transaction's MVCC snapshot with no lock at all (see
+    /// `OLTPEngine::read`'s docs on why reads are lock-free by design),
+    /// and the exclusive lock isn't acquired until `self.oltp.write`,
+    /// *after* the new value has already been computed from that
+    /// snapshot read. Two concurrent UPDATEs against the same row can
+    /// both read the same pre-update value, each compute their own
+    /// increment from it, and the second to commit overwrites the
+    /// first's -- a lost update, same as the race `examples/oltp.rs`'s
+    /// module doc describes for its client-side version of this pattern.
+    /// Fixing it for real would mean acquiring the row's lock before
+    /// reading its value for assignment computation, not just before
+    /// writing -- a real change to this method's flow, not something
+    /// `CompiledAssignment` itself could fix by construction.
     fn execute_update(&self, update: UpdateStatement) -> Result<usize> {
         let schema = self.catalog.read().get_table(&update.table).cloned().ok_or_else(|| {
             DatabaseError::ExecutionError(format!("Unknown table '{}'", update.table))
@@ -577,6 +596,12 @@ impl QueryExecutor {
 
         // Resolve assignment targets up front so a typo, or an attempt to
         // change the primary key's value, fails before any writes happen.
+        // Each assignment's RHS is compiled once here rather than
+        // re-parsed per row -- see row_codec::CompiledAssignment, which
+        // also fixes what was, until now, a silent-corruption bug: an
+        // arithmetic RHS like "s_qty - 1" isn't a valid literal, so
+        // parse_value used to fall back to Value::Null for every matched
+        // row rather than erroring or actually computing the decrement.
         let mut assignments = Vec::with_capacity(update.assignments.len());
         for (col_name, raw_value) in &update.assignments {
             let idx = schema
@@ -589,7 +614,8 @@ impl QueryExecutor {
                     "Updating the primary key column is not supported".to_string(),
                 ));
             }
-            assignments.push((idx, row_codec::parse_value(raw_value, schema.columns[idx].data_type)));
+            let compiled = row_codec::CompiledAssignment::compile(raw_value, &schema, schema.columns[idx].data_type);
+            assignments.push((idx, compiled));
         }
 
         let table_id = schema.table_id as u64;
@@ -613,8 +639,13 @@ impl QueryExecutor {
                 continue;
             }
 
-            for (idx, value) in &assignments {
-                tuple.values[*idx] = value.clone();
+            // Evaluate every assignment against the row's pre-statement
+            // snapshot before writing any of them -- "SET a = b, b = a"
+            // must swap using both original values, not have the second
+            // assignment see the first one's already-written result.
+            let original = tuple.clone();
+            for (idx, compiled) in &assignments {
+                tuple.values[*idx] = compiled.eval(&original);
             }
             indexed_rows.push((row_id, tuple.values.clone()));
 
@@ -1027,6 +1058,53 @@ mod tests {
         let executor = QueryExecutor::new(users_catalog());
         seed_users(&executor);
         assert!(executor.execute_sql("UPDATE users SET id = 99 WHERE id = 1").is_err());
+    }
+
+    #[test]
+    fn test_update_arithmetic_expression_increments_column() {
+        // Before CompiledAssignment existed, "age + 1" wasn't a valid
+        // literal, so this silently wrote NULL to every matched row
+        // instead of erroring -- this is the case that bug was in.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let result = executor.execute_sql("UPDATE users SET age = age + 1 WHERE name = 'Alice'").unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"31".to_string()));
+        let bob = rows.iter().find(|r| r.contains(&"Bob".to_string())).unwrap();
+        assert!(bob.contains(&"15".to_string())); // untouched
+    }
+
+    #[test]
+    fn test_update_arithmetic_expression_without_where_updates_every_row() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+
+        executor.execute_sql("UPDATE users SET age = age - 5").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"25".to_string()));
+        let bob = rows.iter().find(|r| r.contains(&"Bob".to_string())).unwrap();
+        assert!(bob.contains(&"10".to_string()));
+    }
+
+    #[test]
+    fn test_update_multiple_assignments_use_pre_statement_snapshot() {
+        // "SET a = b, b = a" must swap using the row's original values --
+        // if the second assignment saw the first one's already-written
+        // result, both columns would end up equal to the original b.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE pair (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+        executor.execute_sql("INSERT INTO pair (id, a, b) VALUES (1, 10, 20)").unwrap();
+
+        executor.execute_sql("UPDATE pair SET a = b, b = a WHERE id = 1").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM pair").unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string(), "20".to_string(), "10".to_string()]]);
     }
 
     #[test]

@@ -263,25 +263,32 @@ cargo run --example oltp --release
 Real output from a run on the author's machine — WAL-backed and
 fsync-per-commit, since durability is part of what these numbers are
 meant to include (see the example's module doc for what's simplified
-versus real TPC-C, including a real gap it surfaced: no expression
-evaluation in `UPDATE ... SET`, so both transactions do a naive
-read-then-write that's exposed to lost updates under contention):
+versus real TPC-C). Both transactions now use a single-statement
+arithmetic `UPDATE` (`SET s_qty = s_qty - 1`, via
+[`row_codec::CompiledAssignment`](src/execution/row_codec.rs)) rather
+than the client-side `SELECT`-then-`UPDATE` this benchmark originally
+had to use — **that's simpler, not safer**: it's still exposed to lost
+updates under contention on the same row, because `execute_update` reads
+a row under its transaction's snapshot before it ever takes that row's
+lock (see that method's doc comment for exactly why, and why this
+couldn't be fixed by expression support alone):
 ```
 === TPC-C-lite ===
 4 warehouses, 200 customers, 100 stock items, 4 threads x 250 transactions (New-Order/Payment, ~50/50)
 
-Elapsed: 35.9s
-New-Order: 495 committed, 0 failed
-Payment:   505 committed, 0 failed
+Elapsed: 29.9s
+New-Order: 499 committed, 0 failed
+Payment:   501 committed, 0 failed
 Total:     1000/1000 committed
 
-tpmC (New-Order committed / minute): 826.6
-Overall throughput: 27.8 committed transactions/sec
+tpmC (New-Order committed / minute): 1002.9
+Overall throughput: 33.5 committed transactions/sec
 ```
 (This benchmark's queries are simple single-row updates by primary key,
 not filter-heavy scans, so it isn't where the predicate-re-parsing fix
-above shows up — the elapsed-time difference from an earlier run is
-ordinary fsync-latency noise, not a regression.)
+above shows up — run-to-run timing differences here are ordinary
+fsync-latency noise, not a regression or a real speedup from either
+fix.)
 
 ### Running Learned Index Demo
 ```bash
@@ -377,17 +384,22 @@ pair (see [`row_codec::CompiledPredicate`](src/execution/row_codec.rs))
 ### TPC-C-lite (see [`examples/oltp.rs`](examples/oltp.rs))
 WAL-backed, fsync-per-commit, 4 threads. Produced by `cargo run --example
 oltp --release`; see the example's module doc for what's simplified versus
-real TPC-C.
+real TPC-C. Both transactions use a single-statement arithmetic `UPDATE`
+(see [`row_codec::CompiledAssignment`](src/execution/row_codec.rs)) —
+simpler than the client-side read-then-write this benchmark used before
+that type existed, but **not** safer against lost updates under
+contention on the same row; see `execute_update`'s doc comment for why.
 
 | Metric | Performance |
 |--------|-------------|
-| Throughput | 27.8 committed tx/sec |
-| tpmC (New-Order/min) | 826.6 |
+| Throughput | 33.5 committed tx/sec |
+| tpmC (New-Order/min) | 1002.9 |
 | Committed | 1000/1000 (0 lock-manager failures) |
 
 (This benchmark's queries are simple PK updates, not filter-heavy scans,
 so run-to-run variance here is ordinary fsync-latency noise, not related
-to the predicate-parsing fix above.)
+to the predicate-parsing fix above or the assignment-evaluation fix
+below.)
 
 ### Index Build Performance
 Real numbers from [`examples/learned_index_demo.rs`](examples/learned_index_demo.rs)

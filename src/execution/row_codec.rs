@@ -29,6 +29,13 @@
 //! from scratch every call — a per-row hot loop (`Filter`, `JOIN`,
 //! UPDATE/DELETE's matching pass) should use `CompiledPredicate` instead
 //! to pay that cost once, not once per row.
+//!
+//! `CompiledAssignment` is the equivalent for an `UPDATE ... SET`
+//! clause's right-hand side: a bare literal (the common case) or a single
+//! `<column-or-literal> <op> <column-or-literal>` arithmetic expression
+//! (`+`, `-`, `*`, `/`), letting `SET balance = balance + amount` read a
+//! row's own current value rather than only ever assigning a fixed
+//! literal to every matched row.
 
 use crate::execution::catalog::{DataType, TableSchema};
 use crate::execution::operators::{Tuple, Value};
@@ -57,6 +64,176 @@ pub fn value_to_string(value: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Boolean(b) => b.to_string(),
         Value::Null => "NULL".to_string(),
+    }
+}
+
+/// An `UPDATE ... SET` assignment's right-hand side, compiled once so it
+/// can be evaluated against every matching row without re-parsing the
+/// expression string per row — the same reasoning as `CompiledPredicate`,
+/// applied to the assignment side of an `UPDATE` instead of its `WHERE`
+/// side.
+///
+/// Understands a bare literal (`SET age = 31`, `SET name = 'Bob'` — the
+/// overwhelmingly common case, and the only shape this supported before
+/// this type existed), a bare column reference (`SET age = other_age`),
+/// or a single `<operand> <op> <operand>` binary arithmetic expression
+/// (`+`, `-`, `*`, `/`), each operand either a column reference or a
+/// literal. Every column reference is read from the row's values *as they
+/// were before this statement's other assignments ran*, so
+/// `SET a = b, b = a` swaps the two rather than leaving both equal to the
+/// original `b`. Anything shaped differently (nested arithmetic, a
+/// function call, ...) falls back to being parsed as one literal typed by
+/// the target column, exactly the old behavior: silently `Value::Null`
+/// rather than an error, the same soft-failure convention `parse_value`
+/// already uses.
+///
+/// Before this type existed, `execute_update` passed every assignment's
+/// raw string straight to `parse_value`, which only understands a plain
+/// literal — `SET s_qty = s_qty - 1` parsed as neither a valid integer
+/// nor anything else, so `parse_value` silently fell back to
+/// `Value::Null`. An UPDATE using this extremely common pattern didn't
+/// error; it silently wrote every matched row's column to NULL. See
+/// `examples/oltp.rs`'s module doc, which surfaced this while building a
+/// benchmark, for how it was worked around before this type existed.
+pub struct CompiledAssignment {
+    kind: AssignmentKind,
+}
+
+enum AssignmentKind {
+    Literal(Value),
+    ColumnRef(usize),
+    Arithmetic { left: ValueOperand, op: char, right: ValueOperand },
+}
+
+enum ValueOperand {
+    Column(usize),
+    Literal(Value),
+}
+
+impl CompiledAssignment {
+    /// `target_type` is the assigned column's declared type — used only
+    /// for the plain-literal fallback path, to match `parse_value`'s
+    /// existing behavior exactly (e.g. the literal `5` assigned to a
+    /// `Float` column becomes `Value::Float(5.0)`, not `Value::Integer`).
+    /// An arithmetic expression's own operands are typed by their own
+    /// shape instead (quoted = string, otherwise int/float/bool),
+    /// independent of the target column, since the two operands can
+    /// legitimately have different natural types (an `Integer` column
+    /// plus a `Float` literal, say).
+    pub fn compile(expr: &str, schema: &TableSchema, target_type: DataType) -> CompiledAssignment {
+        let tokens = tokenize_expr(expr);
+        match tokens.as_slice() {
+            [left, op_tok, right] => {
+                if let Some(op) = arith_op(op_tok) {
+                    if let (Some(left), Some(right)) = (resolve_operand(left, schema), resolve_operand(right, schema)) {
+                        return CompiledAssignment { kind: AssignmentKind::Arithmetic { left, op, right } };
+                    }
+                }
+            }
+            [single] => {
+                if let Some(idx) = schema.columns.iter().position(|c| &c.name == single) {
+                    return CompiledAssignment { kind: AssignmentKind::ColumnRef(idx) };
+                }
+            }
+            _ => {}
+        }
+        CompiledAssignment { kind: AssignmentKind::Literal(parse_value(expr, target_type)) }
+    }
+
+    /// Evaluate against `tuple`'s *pre-statement* values — see the type
+    /// docs on why the caller must pass the row as it was before any of
+    /// this UPDATE's other assignments were applied, not a
+    /// partway-mutated working copy.
+    pub fn eval(&self, tuple: &Tuple) -> Value {
+        match &self.kind {
+            AssignmentKind::Literal(v) => v.clone(),
+            AssignmentKind::ColumnRef(idx) => tuple.values.get(*idx).cloned().unwrap_or(Value::Null),
+            AssignmentKind::Arithmetic { left, op, right } => {
+                let left = Self::operand_value(left, tuple);
+                let right = Self::operand_value(right, tuple);
+                arith(&left, *op, &right).unwrap_or(Value::Null)
+            }
+        }
+    }
+
+    fn operand_value(operand: &ValueOperand, tuple: &Tuple) -> Value {
+        match operand {
+            ValueOperand::Column(idx) => tuple.values.get(*idx).cloned().unwrap_or(Value::Null),
+            ValueOperand::Literal(v) => v.clone(),
+        }
+    }
+}
+
+fn resolve_operand(token: &str, schema: &TableSchema) -> Option<ValueOperand> {
+    if let Some(idx) = schema.columns.iter().position(|c| c.name == token) {
+        return Some(ValueOperand::Column(idx));
+    }
+    parse_literal_value(token).map(ValueOperand::Literal)
+}
+
+fn arith_op(token: &str) -> Option<char> {
+    match token {
+        "+" => Some('+'),
+        "-" => Some('-'),
+        "*" => Some('*'),
+        "/" => Some('/'),
+        _ => None,
+    }
+}
+
+/// Parse a literal whose type is inferred from its own shape (quoted =
+/// string, otherwise the first of int/float/bool that fits) — unlike
+/// `parse_value`, which is typed by an externally-known target column.
+/// Used for an arithmetic assignment's operands, which don't have a
+/// single target column to be typed by.
+fn parse_literal_value(token: &str) -> Option<Value> {
+    let token = token.trim();
+    if let Some(s) = token.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return Some(Value::String(s.to_string()));
+    }
+    if let Ok(i) = token.parse::<i64>() {
+        return Some(Value::Integer(i));
+    }
+    if let Ok(f) = token.parse::<f64>() {
+        return Some(Value::Float(f));
+    }
+    if let Ok(b) = token.parse::<bool>() {
+        return Some(Value::Boolean(b));
+    }
+    None
+}
+
+fn arith(left: &Value, op: char, right: &Value) -> Option<Value> {
+    use Value::*;
+    match (left, right) {
+        (Integer(a), Integer(b)) => match op {
+            '+' => Some(Integer(a + b)),
+            '-' => Some(Integer(a - b)),
+            '*' => Some(Integer(a * b)),
+            '/' if *b != 0 => Some(Integer(a / b)),
+            _ => None,
+        },
+        (String(a), String(b)) if op == '+' => Some(String(format!("{a}{b}"))),
+        (Integer(_) | Float(_), Integer(_) | Float(_)) => {
+            let a = as_f64(left)?;
+            let b = as_f64(right)?;
+            match op {
+                '+' => Some(Float(a + b)),
+                '-' => Some(Float(a - b)),
+                '*' => Some(Float(a * b)),
+                '/' if b != 0.0 => Some(Float(a / b)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Integer(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
     }
 }
 
@@ -478,5 +655,77 @@ mod tests {
             evaluate_predicate("age > 18 AND active = true )", &schema, &row(1, "Bob", 30, true)),
             None
         );
+    }
+
+    #[test]
+    fn test_compiled_assignment_plain_literal() {
+        // The pre-existing behavior -- a bare literal, unchanged by
+        // CompiledAssignment's arithmetic support.
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("31", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(31));
+    }
+
+    #[test]
+    fn test_compiled_assignment_column_plus_literal() {
+        // The case that used to silently produce Value::Null: "age + 1"
+        // isn't a valid literal, so the old parse_value-only path failed
+        // soft to NULL instead of computing anything.
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("age + 1", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(31));
+    }
+
+    #[test]
+    fn test_compiled_assignment_column_minus_literal() {
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("age - 5", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(25));
+    }
+
+    #[test]
+    fn test_compiled_assignment_column_times_literal() {
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("age * 2", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(60));
+    }
+
+    #[test]
+    fn test_compiled_assignment_column_to_column() {
+        // "SET age = id" -- both operands are columns.
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("id", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(7, "Bob", 30, true)), Value::Integer(7));
+
+        let compiled = CompiledAssignment::compile("id + age", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(7, "Bob", 30, true)), Value::Integer(37));
+    }
+
+    #[test]
+    fn test_compiled_assignment_division_by_zero_is_null() {
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("age / 0", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Null);
+    }
+
+    #[test]
+    fn test_compiled_assignment_unsupported_shape_falls_back_to_null() {
+        // More than one operator -- not a shape this understands, so it
+        // falls back to parsing the whole string as one literal, which
+        // fails and produces Value::Null (parse_value's existing
+        // soft-failure convention), not an error.
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("age + 1 + 1", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Null);
+    }
+
+    #[test]
+    fn test_compiled_assignment_negative_literal_still_works() {
+        // A bare negative number has no operator token at all (no
+        // surrounding whitespace to split on), so it must stay on the
+        // plain-literal path, not be misread as a two-token expression.
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("-5", &schema, DataType::Integer);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(-5));
     }
 }

@@ -11,21 +11,23 @@
 //! contention pattern, against the real engine (MVCC + `LockManager` +
 //! fsync'd WAL), not a placeholder loop.
 //!
-//! One real limitation this surfaced rather than hid: there's no
-//! server-side expression evaluation in `UPDATE ... SET` (see
-//! `execution::row_codec` — assignment values are parsed as literals, not
-//! expressions) and no multi-statement SQL transaction, so `s_qty = s_qty -
-//! 1` isn't expressible directly. Both transactions below do the
-//! textbook-naive thing instead: `SELECT` the current value, compute the
-//! new one in Rust, then `UPDATE` to that literal — which means, under
-//! real concurrent contention on the same warehouse/customer row (which
-//! this benchmark deliberately creates, with only a handful of warehouses
-//! shared across all threads), a classic lost update is possible: the
-//! `LockManager` only serializes the two `UPDATE`s themselves, not the
-//! read-compute-write gap between the `SELECT` and the `UPDATE`. That's a
-//! real, honest gap in this system today (no read-modify-write primitive,
-//! no explicit `BEGIN`/`COMMIT` spanning statements), not a bug in this
-//! benchmark — worth fixing separately if atomic increments matter.
+//! One real limitation this surfaced rather than hid, now only half true:
+//! `UPDATE ... SET s_qty = s_qty - 1` **is** expressible directly now (see
+//! `row_codec::CompiledAssignment`), so both transactions below use it
+//! rather than the client-side `SELECT`-then-`UPDATE` workaround this
+//! module doc originally described. That did *not* make them safe against
+//! a concurrent UPDATE on the same row, though — `execute_update` reads
+//! every matched row under its transaction's MVCC snapshot before
+//! acquiring any lock, and only locks the row once it writes the already-
+//! computed new value (see that method's doc comment for exactly why).
+//! Two concurrent single-statement increments on the same row can still
+//! both read the same pre-update value and the second to commit still
+//! overwrites the first's — the lost-update race moved from being visible
+//! in this file's Rust to being invisible inside one SQL statement, it
+//! didn't go away. Fixing it for real means acquiring the row's lock
+//! before reading its value for assignment computation, not just before
+//! writing — a real architectural change, not something expressible SQL
+//! syntax alone can fix.
 
 use shrestidb::execution::executor::QueryExecutor;
 use rand::Rng;
@@ -81,22 +83,21 @@ fn setup(executor: &QueryExecutor) {
 }
 
 /// Decrement a random stock item's quantity and record a new order — the
-/// write-heavy transaction TPC-C weights at 45% of its mix.
+/// write-heavy transaction TPC-C weights at 45% of its mix. Uses a
+/// single-statement arithmetic `UPDATE` (`row_codec::CompiledAssignment`)
+/// rather than a client-side `SELECT`-then-`UPDATE` — see the module doc
+/// on why that's simpler but still not race-free under contention on the
+/// same stock item, so `s_qty` isn't floored at zero here: letting it go
+/// negative under real contention is more honest than a client-side guard
+/// that can't actually make the update atomic anyway.
 fn new_order(executor: &QueryExecutor, next_order_id: &AtomicI64, rng: &mut impl Rng) -> bool {
     let w_id = rng.gen_range(1..=NUM_WAREHOUSES);
     let c_id = rng.gen_range(1..=(NUM_WAREHOUSES * CUSTOMERS_PER_WAREHOUSE));
     let s_id = rng.gen_range(1..=NUM_STOCK_ITEMS);
     let qty = rng.gen_range(1..=10);
 
-    let Ok(rows) = executor.execute_sql(&format!("SELECT s_qty FROM stock WHERE s_id = {s_id}")) else {
-        return false;
-    };
-    let Some(current_qty) = rows.first().and_then(|r| r[0].parse::<i64>().ok()) else {
-        return false;
-    };
-    let new_qty = (current_qty - qty).max(0);
     if executor
-        .execute_sql(&format!("UPDATE stock SET s_qty = {new_qty} WHERE s_id = {s_id}"))
+        .execute_sql(&format!("UPDATE stock SET s_qty = s_qty - {qty} WHERE s_id = {s_id}"))
         .is_err()
     {
         return false;
@@ -114,39 +115,23 @@ fn new_order(executor: &QueryExecutor, next_order_id: &AtomicI64, rng: &mut impl
 /// Move money from a customer to their warehouse's balance — TPC-C weights
 /// this at 43% of its mix, and it's the transaction most likely to
 /// contend here since only `NUM_WAREHOUSES` rows absorb every thread's
-/// writes to the warehouse side.
+/// writes to the warehouse side. Same single-statement arithmetic
+/// `UPDATE` as `new_order` — see its doc comment and the module doc for
+/// what that does and doesn't fix.
 fn payment(executor: &QueryExecutor, rng: &mut impl Rng) -> bool {
     let w_id = rng.gen_range(1..=NUM_WAREHOUSES);
     let c_id = rng.gen_range(1..=(NUM_WAREHOUSES * CUSTOMERS_PER_WAREHOUSE));
     let amount: f64 = rng.gen_range(1.0..500.0);
 
-    let Ok(rows) = executor.execute_sql(&format!("SELECT c_balance FROM customer WHERE c_id = {c_id}")) else {
-        return false;
-    };
-    let Some(current_balance) = rows.first().and_then(|r| r[0].parse::<f64>().ok()) else {
-        return false;
-    };
     if executor
-        .execute_sql(&format!(
-            "UPDATE customer SET c_balance = {} WHERE c_id = {c_id}",
-            current_balance + amount
-        ))
+        .execute_sql(&format!("UPDATE customer SET c_balance = c_balance + {amount} WHERE c_id = {c_id}"))
         .is_err()
     {
         return false;
     }
 
-    let Ok(rows) = executor.execute_sql(&format!("SELECT w_balance FROM warehouse WHERE w_id = {w_id}")) else {
-        return false;
-    };
-    let Some(current_w_balance) = rows.first().and_then(|r| r[0].parse::<f64>().ok()) else {
-        return false;
-    };
     executor
-        .execute_sql(&format!(
-            "UPDATE warehouse SET w_balance = {} WHERE w_id = {w_id}",
-            current_w_balance + amount
-        ))
+        .execute_sql(&format!("UPDATE warehouse SET w_balance = w_balance + {amount} WHERE w_id = {w_id}"))
         .is_ok()
 }
 
