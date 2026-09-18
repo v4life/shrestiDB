@@ -3,7 +3,6 @@ use shrestidb::index::btree::BTree;
 use shrestidb::index::pgm::PGMIndex;
 use shrestidb::index::rmi::{RMIIndex, RMIStage};
 use shrestidb::index::models::LinearModel;
-use shrestidb::index::hybrid_router::HybridIndex;
 
 /// Generate synthetic keys with skewed distribution
 fn generate_skewed_keys(count: usize) -> Vec<f64> {

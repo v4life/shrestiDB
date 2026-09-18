@@ -5,10 +5,10 @@ A relational database kernel written in Rust that leverages machine learning mod
 ## 🚀 Key Features
 
 ### Learned Indexing
-- **Recursive Model Index (RMI)**: Multi-stage learned index with O(1) average case lookup
-- **Piecewise Geometric Model (PGM)**: Adaptive segmented indexing optimized for skewed data
-- **Hybrid Router**: Automatically switches between learned models and B-Tree fallback based on data distribution
+- **Recursive Model Index (RMI)**: Multi-stage learned index, real and measured — up to 36.8x faster lookups than this codebase's own B-Tree at 1M records (see [Index Build Performance](#index-build-performance)).
+- **Piecewise Geometric Model (PGM)**: Adaptive segmented indexing optimized for skewed data; the actual primary-key index the live engine uses (`execution::mvcc_store::MVCCTable`), and the model reused for real cardinality estimation below.
 - **Bounded Error Search**: SIMD-accelerated binary search within prediction error bounds
+- ~~Hybrid Router~~: a `HybridIndex` (routing between a learned model and a B-Tree fallback) existed but was never used by the real query path — the live PK index is `DynamicPGMIndex`, used directly. Removed rather than left implying a routing capability that wasn't wired in.
 
 ### ML-Driven Query Optimization
 - **Real Cardinality Estimation**: `ANALYZE <table>` builds a real per-column value distribution — a `PGMIndex` (the same learned-index technique above) fit over the column's actual sorted values as an empirical CDF, plus a real distinct-value count for equality selectivity. Replaces a fixed 0.5-selectivity-for-every-filter constant with a genuine, data-driven estimate; see [`optimizer::cardinality`](src/optimizer/cardinality.rs) and the [Real Cardinality Estimation](#real-cardinality-estimation-vs-a-fixed-constant) results below. (An earlier version of this feature was a "neural network" whose weights were hardcoded and never trained — replaced rather than reused; see that module's doc comment for the full story.)
@@ -19,17 +19,31 @@ A relational database kernel written in Rust that leverages machine learning mod
 - **Real `USING`/`NATURAL JOIN`**: previously silently executed as an unfiltered `CROSS JOIN` — an earlier version of this parser recognized the syntax but discarded it entirely, so `a JOIN b USING (id)` on 2×3 rows returned all 6 (every combination) instead of the 2 that actually match. Now resolved against the real schemas at execution time into an ordinary equi-join condition; see `execution::executor::resolve_using_condition`/`resolve_natural_condition`. Scope limit, loudly enforced rather than silently guessed at: only a single shared/listed column is supported (this engine's join execution has no composite hash key) — more than one is a clear error, not a partial match. `SEMI`/`ANTI` join variants remain a known, lower-priority gap (execute as `INNER JOIN` rather than their real semantics); they're non-standard syntax, unlikely to be hit by accident.
 - **Real three-valued (`NULL`-aware) comparison logic**: a comparison touching `NULL` used to be conflated with "this engine couldn't evaluate the predicate at all" — both fell back to keeping the row, so `WHERE fk > 100` with `fk` actually `NULL` incorrectly *included* that row, and (on the hash-join path specifically) two independent `NULL`s on a join key spuriously matched each other, since a `NULL` was just an ordinary, matchable hash key. Both were reachable before, but far more so once `LEFT`/`RIGHT`/`FULL OUTER JOIN` started routinely producing `NULL`-padded rows that flow into later predicates. Fixed with a real `Tri` (`True`/`False`/`Unknown`) type implementing SQL's actual `AND`/`OR` truth tables (`row_codec::Tri`) — `Unknown` is excluded exactly like `False`, never given the "give up and keep it" treatment real structural failures get — plus excluding `NULL`-keyed rows from the hash-join table entirely, so a `NULL` join key can never match, not even another `NULL`.
 
-### Intelligent Storage
-- **Learned Buffer Pool**: Markov chain predictor anticipates page access patterns for prefetching
-- **Slotted Pages**: Efficient variable-length record storage with minimal fragmentation
-- **Direct I/O**: Asynchronous I/O with io_uring support for high throughput
-- **Write-Ahead Log**: Durable ACID transactions with crash recovery
+### Storage
+- **Write-Ahead Log**: Durable, real crash recovery — a plain append-only log (`execution::wal`) that every write goes through, replayed to rebuild the in-memory store on restart. See [`execution::recovery`](src/execution/recovery.rs).
+- **In-Memory MVCC Store**: The actual live storage — version chains per row (`execution::mvcc_store::MVCCTable`), not page-based disk storage.
+
+Earlier versions of this list also claimed a "Learned Buffer Pool"
+(Markov-chain page-access prediction), "Slotted Pages", and "Direct I/O
+with io_uring support". A real, disk-backed paged-storage module
+(`storage::page`/`storage::disk_manager`/`storage::buffer_pool`, ~700
+lines, including a genuine — if unused — Markov-chain predictor) existed
+in the repository, but nothing in the actual read/write path ever used
+it: this engine's real storage is the in-memory MVCC store above, with
+the WAL providing durability. There was no page cache to prefetch into,
+no page-based I/O of any kind, and no `io_uring` dependency anywhere in
+the project — that whole claim never had code behind it. The unused
+module has been removed rather than left implying storage capabilities
+the shipped engine doesn't have; making a learned buffer pool real here
+would mean building an actual disk-backed paged storage engine
+underneath the current one, a genuinely large undertaking, not a
+wiring fix — see the project's issue tracker / commit history for that
+discussion if it's ever picked up.
 
 ### High-Performance Execution
-- **Vectorized Query Engine**: Batch processing for cache efficiency
-- **MVCC Transactions**: Lock-free snapshot isolation without write conflicts
-- **SIMD Acceleration**: Vectorized filters and search operations
-- **Learned Lock Scheduling**: Adaptive concurrency control
+- **MVCC Transactions**: Real snapshot isolation via [`execution::mvcc_store`](src/execution/mvcc_store.rs) — version chains per row, a real read/write lock manager ([`execution::lock_manager`](src/execution/lock_manager.rs)) for write conflicts.
+- **SIMD Acceleration**: Vectorized search inside the PGM index specifically ([`compute::simd_ops`](src/compute/simd_ops.rs)) — not a general query-engine-wide batch-processing feature; this codebase's row execution is per-tuple, not columnar/batched.
+- ~~Learned Lock Scheduling~~: no adaptive or learned concurrency-control code exists anywhere in this codebase. The lock manager above is real, but plain — acquire/release, no scheduling logic beyond that. Removed rather than left as an unfounded claim.
 
 ## 📊 Performance
 
@@ -83,14 +97,14 @@ in sync by hand.
                  │
 ┌────────────────▼──────────────────────┐
 │      Index Layer                      │
-│  (RMI, PGM, B-Tree Fallback,         │
-│   Hybrid Router)                      │
+│  (RMI, PGM — this crate's own         │
+│   B-Tree as the comparison baseline)  │
 └────────────────┬──────────────────────┘
                  │
 ┌────────────────▼──────────────────────┐
 │      Storage Layer                    │
-│  (Pages, Disk Manager, Learned        │
-│   Buffer Pool with Prefetching)       │
+│  (In-Memory MVCC Store, Write-Ahead   │
+│   Log)                                │
 └──────────────────────────────────────┘
 ```
 
@@ -106,29 +120,21 @@ shrestidb/
 │   ├── lib.rs                          # Library exports
 │   ├── error.rs                        # Error types
 │   │
-│   ├── storage/                        # [LAYER 1] Storage Management
-│   │   ├── mod.rs
-│   │   ├── page.rs                     # Slotted pages (4KB)
-│   │   ├── disk_manager.rs             # Direct I/O abstraction
-│   │   └── buffer_pool.rs              # Learned prefetch predictor
-│   │
-│   ├── index/                          # [LAYER 2] Learned Indexing
+│   ├── index/                          # [LAYER 1] Learned Indexing
 │   │   ├── mod.rs
 │   │   ├── models.rs                   # LinearModel, PiecewiseLinearModel
 │   │   ├── rmi.rs                      # Recursive Model Index
 │   │   ├── pgm.rs                      # Piecewise Geometric Model
-│   │   ├── btree.rs                    # B-Tree reference implementation
-│   │   └── hybrid_router.rs            # Dynamic index selection
+│   │   └── btree.rs                    # B-Tree comparison baseline
 │   │
-│   ├── optimizer/                      # [LAYER 3] Query Optimization
+│   ├── optimizer/                      # [LAYER 2] Query Optimization
 │   │   ├── mod.rs
-│   │   ├── cardinality.rs              # Neural network cardinality estimator
-│   │   ├── cost_model.rs               # Learned cost model
-│   │   ├── join_reorder.rs             # Adaptive join ordering
-│   │   ├── planner.rs                  # Query planner
-│   │   └── statistics.rs               # Statistics collection
+│   │   ├── cardinality.rs              # Real, ANALYZE-driven cardinality estimation (PGM-based)
+│   │   ├── cost_model.rs               # Real IO/CPU cost formula (not adaptive/trained)
+│   │   ├── join_reorder.rs             # Real, cost-based join ordering
+│   │   └── planner.rs                  # Query planner
 │   │
-│   ├── execution/                      # [LAYER 4] Query Execution
+│   ├── execution/                      # [LAYER 3] Query Execution & Storage
 │   │   ├── mod.rs
 │   │   ├── catalog.rs                  # Schema and metadata
 │   │   ├── operators.rs                # Query operators
@@ -137,7 +143,7 @@ shrestidb/
 │   │   ├── wal.rs                      # Write-Ahead Log
 │   │   └── recovery.rs                 # Crash recovery
 │   │
-│   ├── sql/                            # [LAYER 5] SQL Processing
+│   ├── sql/                            # [LAYER 4] SQL Processing
 │   │   ├── mod.rs
 │   │   ├── parser.rs                   # SQL parsing
 │   │   ├── binder.rs                   # Semantic analysis
@@ -356,9 +362,8 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture, algorithm description
 ## 🎯 Development Status
 
 ### Completed ✅
-- [x] Core storage layer with paging and buffer pool
-- [x] Learned index structures (RMI, PGM)
-- [x] Hybrid index router with B-Tree fallback
+- [x] In-memory MVCC store with Write-Ahead Log recovery
+- [x] Learned index structures (RMI, PGM), real and measured against this codebase's own B-Tree
 - [x] Basic SQL parsing and type system
 - [x] Real cardinality estimation (`ANALYZE`, PGM-fitted per-column distributions)
 - [x] Cost model consulted for real plan cost estimates
@@ -384,15 +389,21 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture, algorithm description
 - [ ] ML-based query compilation
 - [ ] Integration with popular ORMs
 
-## 🔬 Research Contributions
+## 🔬 What's Actually Real Here
 
-This project demonstrates several novel contributions:
+This section used to list grandiose, unverified "research contributions"
+("First complete RDBMS with ML throughout", "Superior accuracy to
+histogram-based approaches" — never measured against any histogram),
+several of them describing code that turned out to be unused or
+nonexistent (a buffer pool nothing called, a "hybrid" index router
+nothing routed through). Replaced with the actual, measured results —
+each reproducible via `cargo run --example <name> --release`, not
+claimed from vibes:
 
-1. **Practical Learned Database System**: First complete RDBMS with ML throughout
-2. **Adaptive Index Selection**: Automatic switching between index types
-3. **Learned Buffer Pool**: Markov chain-based prefetching
-4. **Neural Cardinality Estimation**: Superior accuracy to histogram-based approaches
-5. **Hybrid Execution**: Combining learned models with traditional fallbacks
+1. **Real learned-index lookup speedup**: PGM/RMI beat this codebase's own B-Tree by 7.2-36.8x at 1M records — real, but a component-level result, not (yet) an end-to-end one; see [Point Lookup Latency vs SQLite](#point-lookup-latency-vs-sqlite-does-the-index-speedup-survive-the-full-sql-path) for the honest full-SQL-path number.
+2. **Real, `ANALYZE`-driven cardinality estimation**: replaced a fake "neural network" (hardcoded weights, a `train()` that never trained) with an actual empirical-CDF model over real column data — see [Real Cardinality Estimation](#real-cardinality-estimation-vs-a-fixed-constant).
+3. **Real, cost-based join reordering**: a dead `.sort()`-by-ID stub, never called by anything, replaced with a real search using real per-column distinct counts, gated by a provable-safety check — see [Real Join Reordering](#real-join-reordering-vs-a-cost-model-with-no-real-signal).
+4. **Real outer-join and `NULL` semantics**: `LEFT`/`RIGHT`/`FULL OUTER JOIN` and `USING`/`NATURAL JOIN` previously executed silently wrong (dropping or fabricating rows); `NULL` comparisons were treated as matches instead of SQL's three-valued `UNKNOWN`. All fixed and tested.
 
 ## 📊 Benchmark Results
 
