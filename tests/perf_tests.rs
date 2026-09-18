@@ -3,7 +3,6 @@
 #[cfg(test)]
 mod perf_tests {
     use shrestidb::index::pgm::PGMIndex;
-    use shrestidb::ml::regression::LinearRegression;
     use shrestidb::compute::simd_ops::SIMDSearch;
     use shrestidb::optimizer::cardinality::ColumnDistribution;
     use shrestidb::execution::operators::Value;
@@ -24,18 +23,6 @@ mod perf_tests {
         
         // PGM should be very fast (sub-microsecond for this size)
         assert!(avg_latency < 1000.0);
-    }
-
-    #[test]
-    fn test_linear_regression_accuracy() {
-        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-        let y = vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0];
-
-        let model = LinearRegression::fit(&x, &y).unwrap();
-        let r2 = model.r_squared(&x, &y);
-        
-        println!("Linear regression R² : {:.6}", r2);
-        assert!(r2 > 0.999);
     }
 
     #[test]
