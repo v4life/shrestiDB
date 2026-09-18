@@ -126,6 +126,9 @@ pub struct SelectStatement {
     pub having: Option<String>,
     pub order_by: Option<String>,
     pub limit: Option<usize>,
+    /// `OFFSET <n>` -- `0` when omitted (real SQL treats a bare `LIMIT`
+    /// with no `OFFSET` as `OFFSET 0`, not "no `OFFSET` clause exists").
+    pub offset: usize,
 }
 
 /// INSERT statement
@@ -289,6 +292,7 @@ impl SQLParser {
         let having = select.having.as_ref().map(|e| e.to_string());
         let order_by = query.order_by.as_ref().map(|o| o.to_string());
         let limit = query.limit_clause.as_ref().and_then(Self::extract_limit);
+        let offset = query.limit_clause.as_ref().and_then(Self::extract_offset).unwrap_or(0);
 
         Ok(SQLStatement::Select(SelectStatement {
             distinct,
@@ -301,6 +305,7 @@ impl SQLParser {
             having,
             order_by,
             limit,
+            offset,
         }))
     }
 
@@ -365,6 +370,22 @@ impl SQLParser {
         match clause {
             ast::LimitClause::LimitOffset { limit, .. } => {
                 limit.as_ref().and_then(Self::expr_as_usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// `OFFSET <n>` — MySQL's `LIMIT <offset>, <limit>` form
+    /// (`ast::LimitClause::OffsetCommaLimit`) isn't recognized here any
+    /// more than `extract_limit` recognizes its `limit` half; both return
+    /// `None` for it rather than silently misreading one number as the
+    /// other. `GenericDialect` (what this parser uses throughout) doesn't
+    /// parse that MySQL-specific comma form in the first place, so this
+    /// isn't reachable today regardless.
+    fn extract_offset(clause: &ast::LimitClause) -> Option<usize> {
+        match clause {
+            ast::LimitClause::LimitOffset { offset, .. } => {
+                offset.as_ref().and_then(|o| Self::expr_as_usize(&o.value))
             }
             _ => None,
         }
@@ -592,6 +613,27 @@ mod tests {
         let stmt = SQLParser::parse("SELECT ALL user_id FROM orders").unwrap();
         match stmt {
             SQLStatement::Select(s) => assert!(!s.distinct),
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_limit_offset() {
+        let stmt = SQLParser::parse("SELECT * FROM orders LIMIT 5 OFFSET 10").unwrap();
+        match stmt {
+            SQLStatement::Select(s) => {
+                assert_eq!(s.limit, Some(5));
+                assert_eq!(s.offset, 10);
+            }
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_without_offset_is_zero() {
+        let stmt = SQLParser::parse("SELECT * FROM orders LIMIT 5").unwrap();
+        match stmt {
+            SQLStatement::Select(s) => assert_eq!(s.offset, 0),
             _ => panic!("Expected SELECT statement"),
         }
     }

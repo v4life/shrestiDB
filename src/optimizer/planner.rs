@@ -157,11 +157,15 @@ pub enum LogicalPlanNode {
     /// differ in a column `SELECT` doesn't return must still collapse to
     /// one. Placed before `Limit`, so `LIMIT` caps the deduplicated set.
     Distinct { rows: usize },
-    /// `LIMIT <n>` — same story as `Sort`: parsed into `select.limit` and
-    /// then silently ignored everywhere. Always the last node in a plan
-    /// when present, so it caps whatever `Sort`/`Project`/`Aggregate`/`Distinct`
-    /// already produced rather than racing them.
-    Limit { limit: usize, rows: usize },
+    /// `LIMIT <n> [OFFSET <m>]` — same story as `Sort`: both were parsed
+    /// (`select.limit`/`select.offset`) and then silently ignored
+    /// everywhere; `OFFSET` specifically had no field on `SelectStatement`
+    /// at all until this fix, so `LIMIT 1 OFFSET 1` behaved identically to
+    /// `LIMIT 1`. Always the last node in a plan when present, so it caps
+    /// whatever `Sort`/`Project`/`Aggregate`/`Distinct` already produced
+    /// rather than racing them. `offset` rows are skipped *before* `limit`
+    /// is applied, standard SQL order.
+    Limit { limit: usize, offset: usize, rows: usize },
 }
 
 /// Physical query plan
@@ -396,11 +400,19 @@ impl QueryPlanner {
             nodes.push(LogicalPlanNode::Distinct { rows });
         }
 
-        // LIMIT: always last -- caps whatever Sort/Project/Aggregate/Distinct
-        // already produced rather than racing any of them.
-        if let Some(limit) = select.limit {
-            rows = rows.min(limit);
-            nodes.push(LogicalPlanNode::Limit { limit, rows });
+        // LIMIT/OFFSET: always last -- caps whatever
+        // Sort/Project/Aggregate/Distinct already produced rather than
+        // racing any of them. A node is emitted whenever either is
+        // present -- OFFSET with no LIMIT (skip N, keep the rest) is
+        // valid SQL on its own, represented as `limit: usize::MAX` (an
+        // effective "no cap"; Vec::truncate is a no-op past the real
+        // length) rather than reaching for an Option here purely to
+        // express one rare combination.
+        if select.limit.is_some() || select.offset > 0 {
+            let limit = select.limit.unwrap_or(usize::MAX);
+            let offset = select.offset;
+            rows = rows.saturating_sub(offset).min(limit);
+            nodes.push(LogicalPlanNode::Limit { limit, offset, rows });
         }
 
         let estimated_cost = self.cost_model.estimate_total_cost(&Self::to_operator_costs(&nodes));
@@ -670,6 +682,33 @@ mod tests {
         let planner = QueryPlanner::new();
         let plan = planner.plan("SELECT user_id FROM orders").unwrap();
         assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Distinct { .. })));
+    }
+
+    #[test]
+    fn test_plan_carries_offset_onto_the_limit_node() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT * FROM users LIMIT 5 OFFSET 10").unwrap();
+        match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Limit { .. })) {
+            Some(LogicalPlanNode::Limit { limit, offset, .. }) => {
+                assert_eq!(*limit, 5);
+                assert_eq!(*offset, 10);
+            }
+            _ => panic!("expected a Limit node"),
+        }
+    }
+
+    #[test]
+    fn test_plan_emits_limit_node_for_offset_alone() {
+        let planner = QueryPlanner::new();
+        // OFFSET with no LIMIT is valid SQL on its own -- must still get a
+        // node (see LogicalPlanNode::Limit's docs on the usize::MAX
+        // "no cap" representation), not be silently dropped for having no
+        // accompanying LIMIT to attach to.
+        let plan = planner.plan("SELECT * FROM users OFFSET 10").unwrap();
+        match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Limit { .. })) {
+            Some(LogicalPlanNode::Limit { offset, .. }) => assert_eq!(*offset, 10),
+            _ => panic!("expected a Limit node"),
+        }
     }
 
     #[test]

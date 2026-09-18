@@ -777,10 +777,14 @@ impl QueryExecutor {
                         .collect();
                     current = Some((schema, deduped));
                 }
-                LogicalPlanNode::Limit { limit, .. } => {
-                    let (schema, mut tuples) = current
+                LogicalPlanNode::Limit { limit, offset, .. } => {
+                    let (schema, tuples) = current
                         .take()
                         .ok_or_else(|| DatabaseError::ExecutionError("Limit with no input".to_string()))?;
+                    // OFFSET first, standard SQL order -- skip() rather
+                    // than an index-based split since offset may exceed
+                    // the row count (an empty result, not an error).
+                    let mut tuples: Vec<Tuple> = tuples.into_iter().skip(*offset).collect();
                     tuples.truncate(*limit);
                     current = Some((schema, tuples));
                 }
@@ -3135,6 +3139,35 @@ mod tests {
         assert_eq!(user1_row[1], "2");
         let user2_row = rows.iter().find(|r| r[0] == "2").unwrap();
         assert_eq!(user2_row[1], "1");
+    }
+
+    #[test]
+    fn test_limit_offset_skips_then_caps() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor); // ids 100, 101, 102
+
+        let rows = executor
+            .execute_sql("SELECT id FROM orders ORDER BY id LIMIT 1 OFFSET 1")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["101".to_string()]]);
+    }
+
+    #[test]
+    fn test_offset_without_limit_skips_and_keeps_the_rest() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let rows = executor.execute_sql("SELECT id FROM orders ORDER BY id OFFSET 1").unwrap();
+        assert_eq!(rows, vec![vec!["101".to_string()], vec!["102".to_string()]]);
+    }
+
+    #[test]
+    fn test_offset_past_every_row_is_an_empty_result_not_an_error() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let rows = executor.execute_sql("SELECT id FROM orders ORDER BY id OFFSET 100").unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
