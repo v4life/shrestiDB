@@ -43,6 +43,14 @@ within **1.2-1.5x** of SQLite/Postgres at 20K x 2K rows; and real,
 `ANALYZE`-driven cardinality estimates landing on the true row count
 where a fixed-constant heuristic was off by **10x** (see
 [Real Cardinality Estimation](#real-cardinality-estimation-vs-a-fixed-constant)).
+That 36.8x lookup number is a real, component-level win, not yet an
+end-to-end one: tested through the full SQL path against SQLite at the
+same 1M-row scale (many point lookups, the scenario built to give it
+the best chance), ShrestiDB is **5.71x slower**, not faster — real
+per-statement overhead around the index currently swallows what the
+search itself saves (see [Point Lookup Latency vs
+SQLite](#point-lookup-latency-vs-sqlite-does-the-index-speedup-survive-the-full-sql-path)).
+Reported here because a real negative result is still a real result.
 An earlier version of this table quoted round marketing-style figures
 ("100K+ transactions/sec", "2-5x more accurate than histograms") that
 were never actually measured, some of which directly contradicted real
@@ -464,6 +472,37 @@ Honestly: at 10K, PGM lookup is actually *slower* than the B-Tree —
 fixed per-lookup overhead dominates at small scale. The real advantage
 shows up as data grows: by 1M records PGM is 7.2x and RMI is 36.8x
 faster than the B-Tree baseline.
+
+### Point Lookup Latency vs SQLite (does the index speedup survive the full SQL path?)
+Real numbers from [`examples/vs_sqlite_point_lookup.rs`](examples/vs_sqlite_point_lookup.rs)
+(`cargo run --example vs_sqlite_point_lookup --release`) — 1,000,000
+rows, 20,000 primary-key point lookups (`SELECT * FROM t WHERE id = ?`),
+both engines via real prepared statements, in-memory, no disk I/O on
+either side. This is the scenario built specifically to give the
+learned index its best shot: the scale where [Index Build
+Performance](#index-build-performance) shows the largest real advantage
+(36.8x at 1M rows), and a workload of single-row lookups rather than a
+range scan, so total time is dominated by the search itself rather than
+materializing a large result:
+
+| | Total (20K lookups) | Per lookup |
+|---|---|---|
+| SQLite | 22.05ms | 1.10µs |
+| ShrestiDB | 125.93ms | 6.30µs |
+
+**ShrestiDB is 5.71x slower, not faster.** The component-level 36.8x
+lookup advantage over this codebase's own B-Tree is real (see [Index
+Build Performance](#index-build-performance)) — but it doesn't survive
+the full SQL execution path: real per-statement overhead (a
+lock/transaction per `execute_prepared` call, row deserialization,
+materializing the result into owned `String`s) costs several
+microseconds on its own, dwarfing whatever the index search saves at
+this row count. The honest conclusion from every benchmark on this page
+together: the learned-index technique is a genuine, measured algorithmic
+win in isolation, but this engine doesn't yet have a scenario where a
+user would actually experience it as "faster than SQLite" end to end —
+that requires shrinking the fixed per-query overhead around the index,
+not a faster index.
 
 ### Real Cardinality Estimation (vs. a fixed constant)
 Real numbers from [`examples/cardinality_demo.rs`](examples/cardinality_demo.rs)
