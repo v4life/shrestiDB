@@ -43,6 +43,30 @@ pub struct JoinClause {
     /// see `execution::executor::QueryExecutor::merge_schemas`.
     pub alias: Option<String>,
     pub condition: Option<String>,
+    /// `INNER`/`LEFT`/`RIGHT`/`FULL OUTER` — see `JoinKind`'s docs. An
+    /// earlier version of this struct didn't track this at all, so every
+    /// join (however written) executed as `INNER JOIN`: an unmatched row
+    /// on either side was silently dropped instead of appearing once
+    /// with `NULL`s on the other side, the standard SQL meaning of
+    /// `LEFT`/`RIGHT`/`FULL OUTER`.
+    pub kind: JoinKind,
+}
+
+/// Which side(s) of a join must still appear, padded with `NULL`s, when
+/// it has no match on the other side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinKind {
+    /// An unmatched row on either side is dropped — plain `JOIN`/`INNER
+    /// JOIN`, and (not specially handled beyond that) `CROSS JOIN` and
+    /// this parser's non-standard passthroughs (`SEMI`/`ANTI`/`APPLY`).
+    Inner,
+    /// Every left row appears at least once; an unmatched left row gets
+    /// one output row with `NULL` for every right-side column.
+    Left,
+    /// The mirror of `Left`: every right row appears at least once.
+    Right,
+    /// Both: `Left` and `Right` together.
+    FullOuter,
 }
 
 /// SELECT statement
@@ -200,6 +224,7 @@ impl SQLParser {
                         table: Self::table_factor_name(&j.relation),
                         alias: Self::table_factor_alias(&j.relation),
                         condition: Self::join_condition(&j.join_operator),
+                        kind: Self::join_kind(&j.join_operator),
                     })
                     .collect()
             })
@@ -238,6 +263,22 @@ impl SQLParser {
         match constraint {
             ast::JoinConstraint::On(expr) => Some(expr.to_string()),
             _ => None,
+        }
+    }
+
+    /// Which side(s) of a join keep an unmatched row (padded with `NULL`
+    /// on the other side) -- see `JoinKind`'s own docs. Every non-outer
+    /// variant (`INNER`, `CROSS`, the non-standard `SEMI`/`ANTI`/`APPLY`
+    /// kinds this codebase doesn't give special semantics to either) maps
+    /// to `Inner`, matching this parser's existing "not specially
+    /// resolved" treatment of anything beyond plain equi-joins.
+    fn join_kind(op: &ast::JoinOperator) -> JoinKind {
+        use ast::JoinOperator::*;
+        match op {
+            Left(_) | LeftOuter(_) => JoinKind::Left,
+            Right(_) | RightOuter(_) => JoinKind::Right,
+            FullOuter(_) => JoinKind::FullOuter,
+            _ => JoinKind::Inner,
         }
     }
 

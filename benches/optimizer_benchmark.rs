@@ -75,6 +75,7 @@ fn benchmark_join_ordering(c: &mut Criterion) {
             table: format!("t{i}"),
             alias: Some(format!("t{i}")),
             condition: Some(format!("t0.id = t{i}.t0_id")),
+            kind: shrestidb::sql::parser::JoinKind::Inner,
         })
         .collect();
     let row_count_of = |q: &str| if q == "t0" { 10_000 } else { 1_000 };

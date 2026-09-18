@@ -39,7 +39,7 @@ use crate::execution::row_codec;
 use crate::optimizer::cardinality::ColumnDistribution;
 use crate::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
 use crate::optimizer::join_reorder::JoinOrderer;
-use crate::sql::parser::{SQLParser, SQLStatement, SelectStatement};
+use crate::sql::parser::{JoinKind, SQLParser, SQLStatement, SelectStatement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -70,7 +70,11 @@ pub enum LogicalPlanNode {
         condition: Option<String>,
         left_rows: usize,
         right_rows: usize,
-        join_type: String,
+        /// `INNER`/`LEFT`/`RIGHT`/`FULL OUTER`, from `sql::parser::JoinClause::kind`
+        /// -- the executor's `Join` arm reads this to decide whether an
+        /// unmatched row on either side is dropped (`Inner`) or emitted
+        /// once with `NULL`s on the other side.
+        kind: JoinKind,
     },
     Aggregate {
         /// The projected columns: each is either a recognized aggregate
@@ -217,7 +221,7 @@ impl QueryPlanner {
                 condition: join.condition.clone(),
                 left_rows: planned.left_rows,
                 right_rows: planned.right_rows,
-                join_type: "inner".to_string(),
+                kind: join.kind,
             });
             rows = planned.output_rows;
         }

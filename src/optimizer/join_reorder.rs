@@ -30,10 +30,20 @@
 //! joins this planner does understand while silently leaving others
 //! pinned in place, would be a subtler and harder-to-predict result than
 //! just declining to reorder anything for that query.
+//!
+//! The same "decline rather than guess" rule applies to any query
+//! containing an OUTER join (`LEFT`/`RIGHT`/`FULL OUTER` — see
+//! `sql::parser::JoinKind`): unlike an INNER join, an OUTER join isn't
+//! freely reorderable relative to its neighbors — moving one can change
+//! which rows come out NULL-padded, or how many times a row appears.
+//! Proving that safe in general is a substantially harder problem than
+//! the qualifier-resolvability check above, and out of scope here — a
+//! query with any non-`Inner` join in its chain always keeps source
+//! order.
 
 use crate::execution::row_codec;
 use crate::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
-use crate::sql::parser::JoinClause;
+use crate::sql::parser::{JoinClause, JoinKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -198,7 +208,17 @@ impl JoinOrderer {
             default_join_selectivity,
         };
 
-        let searchable = joins.len() <= 8 && !shapes.iter().any(|s| matches!(s, JoinShape::Unresolvable));
+        // An OUTER join (LEFT/RIGHT/FULL) isn't freely reorderable the
+        // way an INNER join is -- moving it relative to another join can
+        // change which rows come out NULL-padded, or how many times.
+        // Proving *that* safe is a substantially harder problem than the
+        // qualifier-resolvability check above, and out of scope here: any
+        // non-inner join in the chain disables the search entirely for
+        // this query, same conservative fallback as an unresolvable
+        // condition.
+        let all_inner = joins.iter().all(|j| j.kind == JoinKind::Inner);
+        let searchable =
+            all_inner && joins.len() <= 8 && !shapes.iter().any(|s| matches!(s, JoinShape::Unresolvable));
         let chosen = if searchable {
             let mut known: HashSet<String> = HashSet::new();
             known.insert(from_qualifier.to_string());
@@ -321,7 +341,16 @@ mod tests {
     use super::*;
 
     fn join(table: &str, alias: Option<&str>, condition: Option<&str>) -> JoinClause {
-        JoinClause { table: table.to_string(), alias: alias.map(str::to_string), condition: condition.map(str::to_string) }
+        JoinClause {
+            table: table.to_string(),
+            alias: alias.map(str::to_string),
+            condition: condition.map(str::to_string),
+            kind: JoinKind::Inner,
+        }
+    }
+
+    fn outer_join(table: &str, alias: Option<&str>, condition: Option<&str>, kind: JoinKind) -> JoinClause {
+        JoinClause { table: table.to_string(), alias: alias.map(str::to_string), condition: condition.map(str::to_string), kind }
     }
 
     #[test]
@@ -429,6 +458,33 @@ mod tests {
         let joins = vec![join("logs", Some("l"), None)];
         let planned = orderer.find_optimal_order("u", 10, &joins, |_| 5, |_, _| None, 0.1);
         assert_eq!(planned[0].output_rows, 50); // full cross product, not selectivity-reduced
+    }
+
+    #[test]
+    fn test_find_optimal_order_never_reorders_when_any_join_is_outer() {
+        let orderer = JoinOrderer::new();
+        // Same shape as test_find_optimal_order_picks_more_selective_join_first
+        // -- reordering would clearly be "cheaper" by the cost model --
+        // but `small` is a LEFT JOIN here, so the whole query must keep
+        // source order regardless of what the cost model would otherwise pick.
+        let joins = vec![
+            join("big", Some("b"), Some("u.id = b.u_id")),
+            outer_join("small", Some("s"), Some("u.id = s.u_id"), JoinKind::Left),
+        ];
+        let row_count_of = |q: &str| match q {
+            "u" => 100,
+            "b" => 100_000,
+            "s" => 100,
+            _ => 1000,
+        };
+        let distinct_count_of = |q: &str, _c: &str| match q {
+            "u" => Some(100),
+            "b" => Some(2),
+            "s" => Some(100),
+            _ => None,
+        };
+        let planned = orderer.find_optimal_order("u", 100, &joins, row_count_of, distinct_count_of, 0.1);
+        assert_eq!(planned.iter().map(|pj| pj.join_index).collect::<Vec<_>>(), vec![0, 1]);
     }
 
     #[test]

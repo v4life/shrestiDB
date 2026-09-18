@@ -42,8 +42,8 @@ use crate::optimizer::cardinality::ColumnDistribution;
 use crate::optimizer::planner::{LogicalPlanNode, PhysicalPlan, QueryPlanner};
 use crate::sql::binder::Binder;
 use crate::sql::parser::{
-    AnalyzeStatement, CreateIndexStatement, CreateTableStatement, DeleteStatement, InsertStatement, SQLParser,
-    SQLStatement, UpdateStatement,
+    AnalyzeStatement, CreateIndexStatement, CreateTableStatement, DeleteStatement, InsertStatement, JoinKind,
+    SQLParser, SQLStatement, UpdateStatement,
 };
 use parking_lot::RwLock;
 
@@ -440,11 +440,12 @@ impl QueryExecutor {
                         .collect();
                     current = Some((schema, filtered));
                 }
-                LogicalPlanNode::Join { right_table, right_alias, condition, .. } => {
+                LogicalPlanNode::Join { right_table, right_alias, condition, kind, .. } => {
                     let (left_schema, left_tuples) = current
                         .take()
                         .ok_or_else(|| DatabaseError::ExecutionError("JOIN with no input".to_string()))?;
                     let (right_schema, right_tuples) = self.scan_table_tuples(right_table)?;
+                    let right_cols = right_schema.columns.len();
                     let left_prefix = current_qualifier.take();
                     let right_prefix = right_alias.clone().unwrap_or_else(|| right_table.clone());
                     let merged_schema =
@@ -483,7 +484,7 @@ impl QueryExecutor {
                     }
 
                     let merged_tuples = if let Some((left_key_idx, right_key_idx)) = hash_key_indices {
-                        Self::hash_join(&left_tuples, left_key_idx, &right_tuples, right_key_idx)
+                        Self::hash_join(&left_tuples, left_key_idx, &right_tuples, right_key_idx, *kind, left_len, right_cols)
                     } else {
                         // Compiled once before the nested loop -- re-parsing
                         // the condition string on every one of
@@ -500,20 +501,32 @@ impl QueryExecutor {
                         // (and, for a String column, heap-allocating)
                         // every pair regardless of match was real, wasted
                         // cost. See CompiledPredicate::eval_split.
+                        //
+                        // left_matched/right_matched track which rows on
+                        // each side ever matched at least one row on the
+                        // other -- needed for LEFT/RIGHT/FULL OUTER to
+                        // emit a NULL-padded row for the ones that never
+                        // did (see the loop below), on top of the ordinary
+                        // matched pairs.
+                        let mut left_matched = vec![false; left_tuples.len()];
+                        let mut right_matched = vec![false; right_tuples.len()];
                         let mut merged_tuples = Vec::new();
-                        for l in &left_tuples {
-                            for r in &right_tuples {
+                        for (li, l) in left_tuples.iter().enumerate() {
+                            for (ri, r) in right_tuples.iter().enumerate() {
                                 let keep = match &compiled_condition {
                                     Some(compiled) => compiled.eval_split(l, left_len, r).unwrap_or(true),
                                     None => true, // CROSS JOIN, or a condition that didn't compile
                                 };
                                 if keep {
+                                    left_matched[li] = true;
+                                    right_matched[ri] = true;
                                     let mut values = l.values.clone();
                                     values.extend(r.values.clone());
                                     merged_tuples.push(Tuple { values });
                                 }
                             }
                         }
+                        Self::append_unmatched(&mut merged_tuples, *kind, &left_tuples, &left_matched, &right_tuples, &right_matched, left_len, right_cols);
                         merged_tuples
                     };
                     current = Some((merged_schema, merged_tuples));
@@ -777,11 +790,22 @@ impl QueryExecutor {
     /// nested-loop path, which is always correct regardless of shape.
     /// Output preserves the schema's expected `left ++ right` column
     /// order regardless of which side ends up as the hash table.
-    fn hash_join(left: &[Tuple], left_key_idx: usize, right: &[Tuple], right_key_idx: usize) -> Vec<Tuple> {
+    /// `left_cols`/`right_cols` (each side's own column count, not the
+    /// merged schema's) are only used for `NULL`-padding unmatched rows
+    /// when `kind` calls for it — see `append_unmatched`.
+    fn hash_join(
+        left: &[Tuple],
+        left_key_idx: usize,
+        right: &[Tuple],
+        right_key_idx: usize,
+        kind: JoinKind,
+        left_cols: usize,
+        right_cols: usize,
+    ) -> Vec<Tuple> {
         if left.len() <= right.len() {
-            Self::hash_join_build_probe(left, left_key_idx, right, right_key_idx, false)
+            Self::hash_join_build_probe(left, left_key_idx, right, right_key_idx, false, kind, left_cols, right_cols)
         } else {
-            Self::hash_join_build_probe(right, right_key_idx, left, left_key_idx, true)
+            Self::hash_join_build_probe(right, right_key_idx, left, left_key_idx, true, kind, left_cols, right_cols)
         }
     }
 
@@ -789,31 +813,85 @@ impl QueryExecutor {
     /// right/left sides (the build side is picked by size in `hash_join`,
     /// not by which is logically "left") — controls whether a match's
     /// merged row is built `probe ++ build` or `build ++ probe` so the
-    /// output always ends up `left ++ right` either way.
+    /// output always ends up `left ++ right` either way, and which of
+    /// `build`/`probe`'s match-tracking corresponds to the join's
+    /// logical left/right side for `append_unmatched`.
     fn hash_join_build_probe(
         build: &[Tuple],
         build_key_idx: usize,
         probe: &[Tuple],
         probe_key_idx: usize,
         swapped: bool,
+        kind: JoinKind,
+        left_cols: usize,
+        right_cols: usize,
     ) -> Vec<Tuple> {
-        let mut table: HashMap<JoinHashKey, Vec<&Tuple>> = HashMap::new();
-        for tuple in build {
-            table.entry(JoinHashKey::from_value(&tuple.values[build_key_idx])).or_default().push(tuple);
+        let mut table: HashMap<JoinHashKey, Vec<usize>> = HashMap::new();
+        for (i, tuple) in build.iter().enumerate() {
+            table.entry(JoinHashKey::from_value(&tuple.values[build_key_idx])).or_default().push(i);
         }
 
+        // Indexed by position in `build`/`probe` -- a one-to-many or
+        // many-to-many match still only needs each row marked once.
+        let mut build_matched = vec![false; build.len()];
+        let mut probe_matched = vec![false; probe.len()];
         let mut merged = Vec::new();
-        for p in probe {
-            let Some(matches) = table.get(&JoinHashKey::from_value(&p.values[probe_key_idx])) else {
+        for (pi, p) in probe.iter().enumerate() {
+            let Some(indices) = table.get(&JoinHashKey::from_value(&p.values[probe_key_idx])) else {
                 continue;
             };
-            for b in matches {
+            for &bi in indices {
+                build_matched[bi] = true;
+                probe_matched[pi] = true;
+                let b = &build[bi];
                 let mut values = if swapped { p.values.clone() } else { b.values.clone() };
                 values.extend_from_slice(if swapped { &b.values } else { &p.values });
                 merged.push(Tuple { values });
             }
         }
+
+        let (left_tuples, left_matched, right_tuples, right_matched) =
+            if swapped { (probe, &probe_matched, build, &build_matched) } else { (build, &build_matched, probe, &probe_matched) };
+        Self::append_unmatched(&mut merged, kind, left_tuples, left_matched, right_tuples, right_matched, left_cols, right_cols);
         merged
+    }
+
+    /// Shared by both join strategies: given which rows on each side
+    /// matched at least one row on the other (`left_matched`/
+    /// `right_matched`, indexed the same as `left_tuples`/`right_tuples`),
+    /// append the `NULL`-padded rows `kind` requires for the ones that
+    /// never matched -- every left row for `Left`/`FullOuter`, every
+    /// right row for `Right`/`FullOuter`. A no-op for `Inner` (an
+    /// unmatched row is just dropped, the pre-existing behavior). Output
+    /// rows keep the schema's `left ++ right` column order.
+    fn append_unmatched(
+        merged: &mut Vec<Tuple>,
+        kind: JoinKind,
+        left_tuples: &[Tuple],
+        left_matched: &[bool],
+        right_tuples: &[Tuple],
+        right_matched: &[bool],
+        left_cols: usize,
+        right_cols: usize,
+    ) {
+        if matches!(kind, JoinKind::Left | JoinKind::FullOuter) {
+            for (i, l) in left_tuples.iter().enumerate() {
+                if !left_matched[i] {
+                    let mut values = l.values.clone();
+                    values.extend(std::iter::repeat(Value::Null).take(right_cols));
+                    merged.push(Tuple { values });
+                }
+            }
+        }
+        if matches!(kind, JoinKind::Right | JoinKind::FullOuter) {
+            for (i, r) in right_tuples.iter().enumerate() {
+                if !right_matched[i] {
+                    let mut values: Vec<Value> = std::iter::repeat(Value::Null).take(left_cols).collect();
+                    values.extend(r.values.clone());
+                    merged.push(Tuple { values });
+                }
+            }
+        }
     }
 
     /// Execute an INSERT by writing rows directly to the OLTP engine.
@@ -1955,6 +2033,98 @@ mod tests {
             .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_left_join_hash_path_keeps_unmatched_left_row_with_nulls() {
+        // a.id=2 has no matching b row -- LEFT JOIN must still emit it
+        // once, with NULLs for b's columns, not drop it the way INNER
+        // JOIN (the only behavior this engine had before) would.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (1, 1)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (2, 99)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (10, 1)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a LEFT JOIN b ON a.tag = b.tag").unwrap();
+        assert_eq!(rows.len(), 2);
+        let matched = rows.iter().find(|r| r[0] == "1").unwrap();
+        assert_eq!(matched, &vec!["1".to_string(), "1".to_string(), "10".to_string(), "1".to_string()]);
+        let unmatched = rows.iter().find(|r| r[0] == "2").unwrap();
+        assert_eq!(unmatched, &vec!["2".to_string(), "99".to_string(), "NULL".to_string(), "NULL".to_string()]);
+    }
+
+    #[test]
+    fn test_right_join_hash_path_keeps_unmatched_right_row_with_nulls() {
+        // Mirror of the LEFT JOIN case: b.id=20 has no matching a row.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (1, 1)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (10, 1)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (20, 99)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a RIGHT JOIN b ON a.tag = b.tag").unwrap();
+        assert_eq!(rows.len(), 2);
+        let matched = rows.iter().find(|r| r[2] == "10").unwrap();
+        assert_eq!(matched, &vec!["1".to_string(), "1".to_string(), "10".to_string(), "1".to_string()]);
+        let unmatched = rows.iter().find(|r| r[2] == "20").unwrap();
+        assert_eq!(unmatched, &vec!["NULL".to_string(), "NULL".to_string(), "20".to_string(), "99".to_string()]);
+    }
+
+    #[test]
+    fn test_full_outer_join_keeps_unmatched_rows_on_both_sides() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (1, 1)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (2, 99)").unwrap(); // unmatched left
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (10, 1)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (20, 88)").unwrap(); // unmatched right
+
+        let rows = executor.execute_sql("SELECT * FROM a FULL OUTER JOIN b ON a.tag = b.tag").unwrap();
+        assert_eq!(rows.len(), 3); // 1 matched pair + 1 unmatched left + 1 unmatched right
+        assert!(rows.iter().any(|r| r == &vec!["1".to_string(), "1".to_string(), "10".to_string(), "1".to_string()]));
+        assert!(rows.iter().any(|r| r == &vec!["2".to_string(), "99".to_string(), "NULL".to_string(), "NULL".to_string()]));
+        assert!(rows.iter().any(|r| r == &vec!["NULL".to_string(), "NULL".to_string(), "20".to_string(), "88".to_string()]));
+    }
+
+    #[test]
+    fn test_left_join_nested_loop_path_keeps_unmatched_left_row_with_nulls() {
+        // A non-equality condition ("<") isn't hash-joinable, so this
+        // exercises the nested-loop path's own unmatched-row tracking,
+        // not hash_join_build_probe's -- both paths need this to work.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, val) VALUES (1, 1)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, val) VALUES (2, 100)").unwrap(); // matches nothing (no b.val > 100)
+        executor.execute_sql("INSERT INTO b (id, val) VALUES (10, 5)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a LEFT JOIN b ON a.val < b.val").unwrap();
+        assert_eq!(rows.len(), 2);
+        let matched = rows.iter().find(|r| r[0] == "1").unwrap();
+        assert_eq!(matched, &vec!["1".to_string(), "1".to_string(), "10".to_string(), "5".to_string()]);
+        let unmatched = rows.iter().find(|r| r[0] == "2").unwrap();
+        assert_eq!(unmatched, &vec!["2".to_string(), "100".to_string(), "NULL".to_string(), "NULL".to_string()]);
+    }
+
+    #[test]
+    fn test_inner_join_default_still_drops_unmatched_rows() {
+        // Same data shape as the LEFT JOIN hash-path test above, but
+        // plain JOIN -- confirms adding outer-join support didn't change
+        // INNER JOIN's pre-existing (and still correct) behavior.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (1, 1)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (2, 99)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (10, 1)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a JOIN b ON a.tag = b.tag").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows.iter().any(|r| r.contains(&"NULL".to_string())));
     }
 
     #[test]
