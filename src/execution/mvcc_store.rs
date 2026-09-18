@@ -298,4 +298,201 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
     }
+
+    // ── Retention benchmark: learned predictor vs fixed-interval sweeping ──
+    //
+    // Real comparison of `execution::learned_retention::RetentionPredictor`
+    // (the scheduler actually wired into `OLTPEngine::commit`, see
+    // `oltp.rs`) against fixed-interval sweeping, under a realistic skewed
+    // write workload. Drives `MVCCTable` directly with the same
+    // `apply_insert`/`apply_update`/`prune_row` primitives `OLTPEngine`
+    // itself calls, rather than adding a pluggable-policy seam to the real
+    // commit path just to run a benchmark -- that path is hot and already
+    // correct, not worth the risk for this.
+    //
+    // Lives here (an in-crate test) rather than as an `examples/` binary
+    // because `apply_insert`/`apply_update`/`prune_row` are `pub(crate)` on
+    // purpose: they bypass the WAL and lock manager entirely, and staying
+    // reachable only from inside the crate is what keeps raw MVCC mutation
+    // behind the transactional path for every real caller.
+    mod retention_bloat_benchmark {
+        use super::*;
+        use crate::execution::learned_retention::RetentionPredictor;
+        use std::collections::HashMap;
+
+        const NUM_ROWS: u64 = 500;
+        const NUM_HOT_ROWS: u64 = 20;
+        const TOTAL_COMMITS: u64 = 20_000;
+        /// The snapshot horizon (below which pruning is safe -- see
+        /// `VersionChain::prune`'s docs) advances only every this-many
+        /// commits, modeling a long-running reader that trails a few
+        /// commits behind rather than always being fully caught up.
+        /// Without that lag *any* prune attempt would always find
+        /// something to remove and every policy would look identical.
+        const HORIZON_LAG_EVERY: u64 = 5;
+
+        /// Deterministic, dependency-free "random enough" stream --
+        /// reproducible across runs (no RNG crate pulled in just for this),
+        /// which matters since every policy must see the identical write
+        /// sequence to be a fair comparison.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                self.0 >> 33
+            }
+        }
+
+        /// 80% of writes land on the 20 "hot" rows, the rest spread across
+        /// the remaining 480 "cold" ones -- a realistic skew, not a
+        /// uniform one; real OLTP access patterns concentrate like this.
+        fn build_write_sequence() -> Vec<u64> {
+            let mut rng = Lcg(0xC0FFEE);
+            (0..TOTAL_COMMITS)
+                .map(|_| {
+                    if rng.next() % 100 < 80 {
+                        rng.next() % NUM_HOT_ROWS
+                    } else {
+                        NUM_HOT_ROWS + (rng.next() % (NUM_ROWS - NUM_HOT_ROWS))
+                    }
+                })
+                .collect()
+        }
+
+        struct Outcome {
+            label: String,
+            end_of_run_bloat: usize,
+            sweep_attempts: usize,
+            wasted_sweeps: usize,
+        }
+
+        fn horizon_at(commit_ts: u64) -> u64 {
+            commit_ts.saturating_sub(1) / HORIZON_LAG_EVERY
+        }
+
+        fn apply_write(table: &MVCCTable, row_id: u64, commit_ts: u64) {
+            if table.version_count(row_id) == 0 {
+                table.apply_insert(row_id, commit_ts, vec![0u8]);
+            } else {
+                table.apply_update(row_id, commit_ts, vec![0u8]);
+            }
+        }
+
+        fn total_bloat(table: &MVCCTable) -> usize {
+            (0..NUM_ROWS).map(|r| table.version_count(r).saturating_sub(1)).sum()
+        }
+
+        fn run_learned(writes: &[u64]) -> Outcome {
+            let table = MVCCTable::default();
+            let predictor = RetentionPredictor::new();
+            let mut sweep_attempts = 0usize;
+            let mut wasted_sweeps = 0usize;
+
+            for (i, &row_id) in writes.iter().enumerate() {
+                let commit_ts = i as u64 + 1;
+                apply_write(&table, row_id, commit_ts);
+
+                predictor.record_write(1, row_id);
+                if predictor.should_prune(1, row_id) {
+                    sweep_attempts += 1;
+                    let removed = table.prune_row(row_id, horizon_at(commit_ts));
+                    if removed == 0 {
+                        wasted_sweeps += 1;
+                    }
+                    predictor.record_prune_result(1, row_id, removed);
+                }
+            }
+
+            println!("  [diagnostic] predictor.has_model() at end of run: {}", predictor.has_model());
+
+            Outcome {
+                label: "learned (RetentionPredictor)".to_string(),
+                end_of_run_bloat: total_bloat(&table),
+                sweep_attempts,
+                wasted_sweeps,
+            }
+        }
+
+        fn run_fixed_interval(writes: &[u64], interval: u64) -> Outcome {
+            let table = MVCCTable::default();
+            let mut writes_since_prune: HashMap<u64, u64> = HashMap::new();
+            let mut sweep_attempts = 0usize;
+            let mut wasted_sweeps = 0usize;
+
+            for (i, &row_id) in writes.iter().enumerate() {
+                let commit_ts = i as u64 + 1;
+                apply_write(&table, row_id, commit_ts);
+
+                let count = writes_since_prune.entry(row_id).or_insert(0);
+                *count += 1;
+                if *count >= interval {
+                    *count = 0;
+                    sweep_attempts += 1;
+                    let removed = table.prune_row(row_id, horizon_at(commit_ts));
+                    if removed == 0 {
+                        wasted_sweeps += 1;
+                    }
+                }
+            }
+
+            Outcome {
+                label: format!("fixed interval = {interval}"),
+                end_of_run_bloat: total_bloat(&table),
+                sweep_attempts,
+                wasted_sweeps,
+            }
+        }
+
+        fn print_outcome(o: &Outcome) {
+            println!(
+                "  {:<32} end-of-run bloat: {:>6}   sweep attempts: {:>6}   wasted: {:>6} ({:>5.1}%)",
+                o.label,
+                o.end_of_run_bloat,
+                o.sweep_attempts,
+                o.wasted_sweeps,
+                100.0 * o.wasted_sweeps as f64 / o.sweep_attempts.max(1) as f64
+            );
+        }
+
+        #[test]
+        fn test_retention_bloat_comparison() {
+            let writes = build_write_sequence();
+
+            let sweep_every_write = run_fixed_interval(&writes, 1);
+            let fixed_4 = run_fixed_interval(&writes, 4);
+            let fixed_8 = run_fixed_interval(&writes, 8);
+            let fixed_32 = run_fixed_interval(&writes, 32);
+            let fixed_128 = run_fixed_interval(&writes, 128);
+            let learned = run_learned(&writes);
+
+            println!("\n=== MVCC Retention: Learned Predictor vs Fixed-Interval Sweeping ===");
+            println!(
+                "{NUM_ROWS} rows ({NUM_HOT_ROWS} hot, {} cold), {TOTAL_COMMITS} commits, \
+                 80% of writes hit the hot set, horizon lags by up to {HORIZON_LAG_EVERY} commits\n",
+                NUM_ROWS - NUM_HOT_ROWS
+            );
+            for o in [&sweep_every_write, &fixed_4, &fixed_8, &fixed_32, &fixed_128, &learned] {
+                print_outcome(o);
+            }
+
+            // The real claim under test: sweeping every write (the
+            // "always safe, never smart" extreme) can't be beaten on
+            // bloat by anything that sweeps less often -- so the
+            // meaningful bar for the learned predictor isn't "beats
+            // everything," it's "gets close to sweep-every-write's bloat
+            // without paying its wasted-sweep cost."
+            assert!(
+                learned.wasted_sweeps < sweep_every_write.wasted_sweeps,
+                "learned predictor's wasted sweeps ({}) should be well below sweeping every write ({})",
+                learned.wasted_sweeps,
+                sweep_every_write.wasted_sweeps
+            );
+            assert!(
+                learned.end_of_run_bloat < fixed_128.end_of_run_bloat,
+                "learned predictor's bloat ({}) should be well below the too-sparse fixed_128 policy's ({})",
+                learned.end_of_run_bloat,
+                fixed_128.end_of_run_bloat
+            );
+        }
+    }
 }

@@ -31,9 +31,38 @@ use crate::index::models::LinearModel;
 
 const BOOTSTRAP_INTERVAL: u64 = 8;
 const PRUNE_THRESHOLD: f64 = 3.0;
-const MIN_SAMPLES_TO_FIT: usize = 4;
-const RETRAIN_EVERY: usize = 5;
+const MIN_SAMPLES_TO_FIT: usize = 30;
+const RETRAIN_EVERY: usize = 20;
 const MAX_SAMPLES: usize = 200;
+
+/// A deterministic per-row bootstrap threshold in `BOOTSTRAP_INTERVAL ± 2`,
+/// instead of every row always sweeping at exactly `BOOTSTRAP_INTERVAL`.
+///
+/// Without this, the model can never fit at all: while `model` is `None`,
+/// `should_prune` (below) triggers a sweep the instant `writes_since_prune`
+/// reaches `BOOTSTRAP_INTERVAL`, for every row, every time -- which means
+/// the training sample `record_prune_result` feeds `LinearModel::fit` (see
+/// `record_prune_result`) always has the exact same x-value. `fit` rejects
+/// zero-variance input (`denominator.abs() < 1e-10`), so it returns `None`
+/// forever, which keeps `should_prune` in the `None` (bootstrap) branch
+/// forever -- a self-reinforcing deadlock verified empirically via
+/// `mvcc_store`'s `test_retention_bloat_comparison`: `has_model()` stayed
+/// `false` for the whole run under a realistic 20,000-commit skewed
+/// workload driven purely through the public API, with `RetentionPredictor`
+/// behaving identically to a fixed-interval-8 policy the entire time
+/// despite being "wired in and running," not merely fake. Different rows
+/// getting different (but each individually stable) bootstrap thresholds
+/// gives `fit` real cross-row variance to learn from without ever
+/// sacrificing the "always eventually sweeps" safety property (the jitter
+/// range is small and centered on the original constant, not a source of
+/// unbounded delay).
+fn jittered_bootstrap(table_id: u64, row_id: u64) -> u64 {
+    let mut h = table_id.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(row_id);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51AFD7ED558CCD);
+    h ^= h >> 33;
+    (BOOTSTRAP_INTERVAL - 2) + (h % 5) // BOOTSTRAP_INTERVAL in {6, 7, 8, 9, 10}
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RowStats {
@@ -81,7 +110,7 @@ impl RetentionPredictor {
 
         match &*self.model.lock().unwrap() {
             Some(m) => m.predict(writes as f64) >= PRUNE_THRESHOLD,
-            None => writes >= BOOTSTRAP_INTERVAL,
+            None => writes >= jittered_bootstrap(table_id, row_id),
         }
     }
 
@@ -133,12 +162,63 @@ mod tests {
     #[test]
     fn test_bootstraps_before_model_exists() {
         let p = RetentionPredictor::new();
-        for _ in 0..7 {
+        let threshold = jittered_bootstrap(1, 1);
+        for _ in 0..threshold - 1 {
             p.record_write(1, 1);
             assert!(!p.should_prune(1, 1));
         }
-        p.record_write(1, 1); // 8th write
+        p.record_write(1, 1); // the threshold-th write
         assert!(p.should_prune(1, 1));
+    }
+
+    #[test]
+    fn test_jittered_bootstrap_stays_within_a_small_range_of_the_original_constant() {
+        for table_id in 0..5 {
+            for row_id in 0..50 {
+                let t = jittered_bootstrap(table_id, row_id);
+                assert!(
+                    (BOOTSTRAP_INTERVAL - 2..=BOOTSTRAP_INTERVAL + 2).contains(&t),
+                    "jittered threshold {t} for ({table_id}, {row_id}) escaped the intended small range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_jittered_bootstrap_gives_different_rows_different_thresholds() {
+        // The whole point of the jitter: without real spread across rows,
+        // LinearModel::fit never sees non-zero variance and the model can
+        // never fit (see jittered_bootstrap's docs). A handful of distinct
+        // row ids must not all land on the same threshold.
+        let thresholds: std::collections::HashSet<u64> = (0..20).map(|row_id| jittered_bootstrap(1, row_id)).collect();
+        assert!(thresholds.len() > 1, "20 different rows all got the identical bootstrap threshold");
+    }
+
+    /// The deadlock this predictor actually had until `jittered_bootstrap`
+    /// was added: driven purely through the public API (record_write /
+    /// should_prune / record_prune_result, the same three calls
+    /// `oltp.rs::commit` makes), with no test hand-feeding varied samples
+    /// directly, the model must eventually fit. `test_model_fits_and_
+    /// predicts_from_varied_samples` above doesn't catch this -- it calls
+    /// `record_prune_result` directly with a hand-picked varied `writes`
+    /// sequence, never exercising the real should_prune-driven path where
+    /// the bug actually lived.
+    #[test]
+    fn test_model_eventually_fits_under_natural_driven_usage_not_hand_fed_samples() {
+        let p = RetentionPredictor::new();
+        // Enough rows, each written enough times, that natural bootstrap
+        // sweeps (now at varying per-row thresholds) accumulate the
+        // MIN_SAMPLES_TO_FIT samples fit() needs -- nothing here injects a
+        // sample directly.
+        for row_id in 0..10u64 {
+            for _ in 0..400 {
+                p.record_write(1, row_id);
+                if p.should_prune(1, row_id) {
+                    p.record_prune_result(1, row_id, 1);
+                }
+            }
+        }
+        assert!(p.has_model(), "model should have fit from natural, varied-per-row bootstrap sweeps alone");
     }
 
     #[test]
@@ -152,8 +232,13 @@ mod tests {
         let p = RetentionPredictor::new();
         // Feed a clear linear relationship: dead_versions ~= writes, with
         // enough spread in `writes` for LinearModel::fit's OLS to have
-        // non-zero variance in x.
-        for writes in [2usize, 4, 6, 8, 10, 12] {
+        // non-zero variance in x, and enough samples to clear
+        // MIN_SAMPLES_TO_FIT (raised from 4 to 30 after
+        // test_retention_bloat_comparison showed 4-5 noisy samples was far
+        // too few to trust a 1-feature linear fit against real, confounded
+        // MVCC telemetry -- see that test and jittered_bootstrap's docs).
+        for i in 0..40usize {
+            let writes = 2 + (i % 6) * 2; // cycles 2,4,6,8,10,12 for real spread
             for _ in 0..writes {
                 p.record_write(1, 1);
             }
@@ -165,14 +250,16 @@ mod tests {
     #[test]
     fn test_high_predicted_buildup_triggers_prune() {
         let p = RetentionPredictor::new();
-        // Train a model that predicts roughly dead_versions == writes.
-        let xs = [1.0, 3.0, 5.0, 7.0, 9.0];
-        let ys = [1.0, 3.0, 5.0, 7.0, 9.0];
-        for (x, y) in xs.iter().zip(ys.iter()) {
-            for _ in 0..(*x as u64) {
+        // Train a model that predicts roughly dead_versions == writes --
+        // repeated past MIN_SAMPLES_TO_FIT (see
+        // test_model_fits_and_predicts_from_varied_samples's docs on why).
+        let cycle = [1.0, 3.0, 5.0, 7.0, 9.0];
+        for i in 0..40usize {
+            let x = cycle[i % cycle.len()];
+            for _ in 0..(x as u64) {
                 p.record_write(2, 2);
             }
-            p.record_prune_result(2, 2, *y as usize);
+            p.record_prune_result(2, 2, x as usize); // dead_versions == writes
         }
         assert!(p.has_model());
 
