@@ -1,6 +1,9 @@
 # CONTRIBUTING
 
-Thank you for your interest in contributing to ShrestiDB! This document provides guidelines and instructions for contributing.
+ShrestiDB is proprietary software (see [LICENSE](LICENSE)) — this is not an
+open-source project and isn't accepting outside contributions. This guide is
+for internal engineering reference: coding conventions, dev workflow, and
+how changes get reviewed on this codebase.
 
 ## Code of Conduct
 
@@ -8,10 +11,9 @@ Be respectful, inclusive, and professional in all interactions.
 
 ## Getting Started
 
-1. **Fork the repository** on GitHub
-2. **Clone your fork** locally: `git clone https://github.com/YOUR_USERNAME/shrestidb.git`
-3. **Create a feature branch**: `git checkout -b feature/your-feature-name`
-4. **Set up development environment**:
+1. **Clone the repository**: `git clone <internal repo URL>`
+2. **Create a feature branch**: `git checkout -b feature/your-feature-name`
+3. **Set up development environment**:
    ```bash
    cargo build
    cargo test
@@ -299,12 +301,3 @@ valgrind cargo run --example learned_index_demo
 - Review existing issues and PRs
 - Ask in PR comments
 - Open a discussion issue
-
-## Recognition
-
-Contributors will be:
-- Added to CONTRIBUTORS.md
-- Mentioned in release notes
-- Credited in commit messages
-
-Thank you for contributing! 🎉

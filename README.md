@@ -641,18 +641,9 @@ don't read the exact digits as more precise than they are.)
   scale ceiling the first two fixes never touched. The two earlier fixes
   made a slow algorithm faster; the third replaced the algorithm.
 
-## 🤝 Contributing
-
-Contributions are welcome! Areas for improvement:
-
-1. **Performance**: Further optimization of hot paths
-2. **Features**: Advanced SQL support, distributed execution
-3. **Testing**: More comprehensive test coverage
-4. **Documentation**: Additional examples and guides
-
 ## 📝 License
 
-MIT License - See LICENSE file for details
+Proprietary — All Rights Reserved. See [LICENSE](LICENSE). This is closed-source software; see [CONTRIBUTING.md](CONTRIBUTING.md) for the internal engineering workflow.
 
 ## 👤 Author
 
@@ -664,20 +655,12 @@ Created by **v4life** as a demonstration of machine learning integration in data
 - Rossano Venturini for PGM-Index development
 - Rust community for excellent tools and libraries
 
-## 📞 Contact & Support
-
-For issues, questions, or suggestions:
-- Open an issue on GitHub
-- Check existing documentation in DESIGN.md
-- Review example workloads for usage patterns
-
 ---
 
 ## Quick Start
 
 ```bash
 # Clone and build
-git clone https://github.com/v4life/shrestidb.git
 cd shrestidb
 cargo build --release
 
