@@ -411,4 +411,67 @@ mod tests {
 
         assert!(handle.join().unwrap().is_ok());
     }
+
+    /// Documents a real property of the raw API, not a bug: OLTPEngine's
+    /// read()/write()/commit() primitives, used the naive way (read once,
+    /// compute, write, no re-read under lock), are vulnerable to lost
+    /// updates under real concurrency. read() never locks (by MVCC
+    /// design), so there's a window between a thread's read and its
+    /// write()'s lock acquisition where another thread can fully commit
+    /// -- a naive caller's write then overwrites that commit with a value
+    /// computed from stale data. Contrast with
+    /// executor::tests::test_concurrent_sql_updates_dont_lose_writes:
+    /// the SQL UPDATE path is safe because execute_update re-reads the
+    /// row's latest committed value under lock before computing the new
+    /// one -- that discipline lives in the caller, not this primitive.
+    #[test]
+    fn test_raw_primitives_naive_read_then_write_can_lose_updates() {
+        let engine = Arc::new(OLTPEngine::new());
+        engine.create_table(1);
+        let tx0 = engine.begin();
+        engine.write(tx0, insert(1, 1, "0")).unwrap();
+        engine.commit(tx0).unwrap();
+
+        const THREADS: usize = 8;
+        const INCREMENTS_PER_THREAD: usize = 25;
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let engine = engine.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..INCREMENTS_PER_THREAD {
+                    let tx = engine.begin();
+                    let current: i64 = engine
+                        .read(tx, 1, 1)
+                        .unwrap()
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    // NAIVE: no re-read under lock -- compute directly
+                    // from the value read before acquiring any lock.
+                    engine
+                        .write(tx, WriteOp::Update { table_id: 1, row_id: 1, data: (current + 1).to_string().into_bytes() })
+                        .unwrap();
+                    engine.commit(tx).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let checker = engine.begin();
+        let final_val: i64 = engine
+            .read(checker, 1, 1)
+            .unwrap()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap();
+        let expected = (THREADS * INCREMENTS_PER_THREAD) as i64;
+        assert!(
+            final_val < expected,
+            "expected naive read-then-write to lose some updates under real concurrency \
+             (got the full {expected} -- either this machine got extraordinarily lucky with \
+             thread scheduling, or the primitive's documented lack of protection has changed)"
+        );
+    }
 }

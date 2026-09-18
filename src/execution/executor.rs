@@ -1589,6 +1589,46 @@ mod tests {
         assert_eq!(executor.catalog.read().tables.len(), 0);
     }
 
+    /// Confirms the real SQL UPDATE path is safe against lost updates
+    /// under real concurrency -- execute_update re-reads a row's latest
+    /// committed value under its exclusive lock before computing the new
+    /// one, unlike OLTPEngine's raw primitives used naively (see
+    /// oltp::tests::test_raw_primitives_naive_read_then_write_can_lose_updates).
+    #[test]
+    fn test_concurrent_sql_updates_dont_lose_writes() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let executor = Arc::new(QueryExecutor::new(Catalog::new()));
+        executor.execute_sql("CREATE TABLE counters (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("INSERT INTO counters (id, val) VALUES (1, 0)").unwrap();
+
+        const THREADS: usize = 8;
+        const INCREMENTS_PER_THREAD: usize = 25;
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let executor = executor.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..INCREMENTS_PER_THREAD {
+                    executor.execute_sql("UPDATE counters SET val = val + 1 WHERE id = 1").unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // SELECT * so column order is unambiguous (id, val) -- SELECT val
+        // alone silently returns every column, a separate real bug found
+        // while debugging this (see the "always returns every column"
+        // finding reported separately).
+        let rows = executor.execute_sql("SELECT * FROM counters WHERE id = 1").unwrap();
+        let final_val: i64 = rows[0][1].parse().unwrap();
+        let expected = (THREADS * INCREMENTS_PER_THREAD) as i64;
+        eprintln!("diag: real SQL UPDATE increments -- expected {expected}, got {final_val}");
+        assert_eq!(final_val, expected, "the SQL UPDATE path lost concurrent updates");
+    }
+
     #[test]
     fn test_executor_transactional_read_write() {
         let executor = QueryExecutor::new(Catalog::new());
