@@ -185,7 +185,7 @@ impl QueryExecutor {
 
         match stmt {
             SQLStatement::Select(select) => {
-                let plan = self.planner.plan_select(&select, &self.stats.read());
+                let plan = self.planner.plan_select(&select, &self.stats.read())?;
                 self.execute(&plan)
             }
             SQLStatement::Insert(insert) => {
@@ -239,7 +239,7 @@ impl QueryExecutor {
 
         let kind = match stmt {
             SQLStatement::Select(select) => {
-                let plan = self.planner.plan_select(&select, &self.stats.read());
+                let plan = self.planner.plan_select(&select, &self.stats.read())?;
                 PreparedKind::Select(plan)
             }
             SQLStatement::Insert(insert) => PreparedKind::Insert(insert),
@@ -341,7 +341,7 @@ impl QueryExecutor {
     /// module doc.
     pub fn explain(&self, sql: &str) -> Result<PhysicalPlan> {
         match SQLParser::parse(sql)? {
-            SQLStatement::Select(select) => Ok(self.planner.plan_select(&select, &self.stats.read())),
+            SQLStatement::Select(select) => self.planner.plan_select(&select, &self.stats.read()),
             _ => Err(DatabaseError::ExecutionError("explain() only supports SELECT".to_string())),
         }
     }
@@ -582,7 +582,7 @@ impl QueryExecutor {
                     };
                     current = Some((merged_schema, merged_tuples));
                 }
-                LogicalPlanNode::Aggregate { columns, group_by, .. } => {
+                LogicalPlanNode::Aggregate { columns, group_by, having, .. } => {
                     let (schema, tuples) = current
                         .take()
                         .ok_or_else(|| DatabaseError::ExecutionError("Aggregate with no input".to_string()))?;
@@ -615,8 +615,62 @@ impl QueryExecutor {
                         groups
                     };
 
+                    // HAVING filters *groups*, evaluated after aggregation
+                    // -- unlike WHERE, it can reference an aggregate call
+                    // directly (`HAVING COUNT(*) > 1`), which isn't a real
+                    // schema column. `aggregate::extract_calls` rewrites
+                    // every such call to a bare placeholder identifier
+                    // (see its docs for why: `CompiledPredicate` splits
+                    // `(`/`)` into their own tokens, so `"COUNT(*)"` isn't
+                    // one atomic token to it without this), so what's left
+                    // is an ordinary comparison expression `CompiledPredicate`
+                    // already knows how to parse. Built once, before the
+                    // per-group loop, against a synthetic schema covering
+                    // every GROUP BY key plus every placeholder -- then
+                    // each group's placeholder values are computed the
+                    // same way `columns`' aggregate outputs are below.
+                    let having_plan = having.as_deref().map(|expr| {
+                        let (rewritten, having_aggs) = aggregate::extract_calls(expr);
+
+                        let mut synth_schema = TableSchema::new(schema.table_id, schema.name.clone());
+                        for g in group_by {
+                            if let Some(col) = schema.columns.iter().find(|c| &c.name == g) {
+                                synth_schema.add_column(col.clone());
+                            }
+                        }
+                        for (placeholder, func, _) in &having_aggs {
+                            let data_type =
+                                if *func == aggregate::AggregateFn::Count { DataType::Integer } else { DataType::Float };
+                            synth_schema.add_column(Column {
+                                id: 0,
+                                name: placeholder.clone(),
+                                data_type,
+                                nullable: true,
+                                primary_key: false,
+                            });
+                        }
+
+                        (row_codec::CompiledPredicate::compile(&rewritten, &synth_schema), having_aggs)
+                    });
+
                     let mut output_rows = Vec::with_capacity(groups.len());
                     for (key, group_tuples) in &groups {
+                        if let Some((compiled, having_aggs)) = &having_plan {
+                            let mut synth_values = key.clone();
+                            for (_, func, arg) in having_aggs {
+                                synth_values.push(aggregate::compute_aggregate(*func, arg.as_deref(), &schema, group_tuples));
+                            }
+                            let synth_tuple = Tuple { values: synth_values };
+                            // Same fail-open convention as Filter's WHERE
+                            // (row_codec::CompiledPredicate's docs): a
+                            // HAVING clause this simple grammar can't
+                            // parse keeps every group rather than
+                            // dropping all of them.
+                            if !compiled.as_ref().and_then(|c| c.eval(&synth_tuple)).unwrap_or(true) {
+                                continue;
+                            }
+                        }
+
                         let mut output = Vec::with_capacity(columns.len());
                         for col in columns {
                             if let Some(pos) = group_by.iter().position(|g| g == col) {
@@ -3057,6 +3111,48 @@ mod tests {
         assert_eq!(user1_row[1], "2");
         let user2_row = rows.iter().find(|r| r[0] == "2").unwrap();
         assert_eq!(user2_row[1], "1");
+    }
+
+    #[test]
+    fn test_having_filters_groups_by_aggregate_value() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor); // user 1: 2 orders; user 2: 1 order
+
+        let rows = executor
+            .execute_sql("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string(), "2".to_string()]]);
+    }
+
+    #[test]
+    fn test_having_can_reference_an_aggregate_not_in_the_select_list() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor); // user 1: total 15.0; user 2: total 20.0
+
+        let rows = executor
+            .execute_sql("SELECT user_id FROM orders GROUP BY user_id HAVING SUM(total) > 15")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["2".to_string()]]);
+    }
+
+    #[test]
+    fn test_having_can_combine_group_by_key_and_aggregate_with_and() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let rows = executor
+            .execute_sql("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING user_id = 1 AND COUNT(*) > 1")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string(), "2".to_string()]]);
+    }
+
+    #[test]
+    fn test_having_without_group_by_or_aggregate_select_is_a_hard_error() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let err = executor.execute_sql("SELECT * FROM orders HAVING total > 10");
+        assert!(err.is_err());
     }
 
     #[test]

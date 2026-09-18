@@ -33,6 +33,7 @@
 //! whatever sequence they're emitted — so this is a real reordering, not
 //! a number that gets computed and then ignored.
 
+use crate::error::{DatabaseError, Result};
 use crate::execution::aggregate;
 use crate::execution::operators::Value;
 use crate::execution::row_codec;
@@ -100,6 +101,13 @@ pub enum LogicalPlanNode {
         /// `GROUP BY` column names. Empty means a single ungrouped
         /// aggregate — the whole input collapses to one output row.
         group_by: Vec<String>,
+        /// The flattened `HAVING <expr>` clause, if any — filters groups
+        /// *after* aggregation, unlike `Filter`'s `WHERE` which runs
+        /// before. An earlier version of this planner had no field for
+        /// this at all: `select.having` was parsed and then never stored
+        /// anywhere, so `GROUP BY x HAVING COUNT(*) > 1` silently returned
+        /// every group instead of just the ones matching the predicate.
+        having: Option<String>,
         rows: usize,
     },
     /// Keep only `columns`, in this order, dropping everything else from
@@ -191,12 +199,12 @@ impl QueryPlanner {
     /// that was just parsed one call up is exactly the wasted-work
     /// pattern `row_codec::CompiledPredicate` existed to eliminate on the
     /// predicate side; this is the same fix on the planning side.
-    pub fn plan(&self, query: &str) -> PhysicalPlan {
+    pub fn plan(&self, query: &str) -> Result<PhysicalPlan> {
         match SQLParser::parse(query) {
             Ok(SQLStatement::Select(select)) => self.plan_select(&select, &HashMap::new()),
             // Not a SELECT, or failed to parse: nothing to build a read
             // plan for yet (writes and DDL don't have a plan shape here).
-            _ => PhysicalPlan {
+            _ => Ok(PhysicalPlan {
                 nodes: vec![LogicalPlanNode::Scan {
                     table_id: 0,
                     table_name: String::new(),
@@ -205,7 +213,7 @@ impl QueryPlanner {
                 }],
                 estimated_cost: 0.0,
                 estimated_rows: 0,
-            },
+            }),
         }
     }
 
@@ -214,7 +222,7 @@ impl QueryPlanner {
     /// parsed statement already exists. `stats` is keyed by
     /// `(table_name, column_name)`; an empty map degrades exactly to this
     /// planner's old always-constant behavior.
-    pub fn plan_select(&self, select: &SelectStatement, stats: &HashMap<(String, String), ColumnDistribution>) -> PhysicalPlan {
+    pub fn plan_select(&self, select: &SelectStatement, stats: &HashMap<(String, String), ColumnDistribution>) -> Result<PhysicalPlan> {
         // Any analyzed column's total_rows is the whole table's real row
         // count as of that ANALYZE (every column gets scanned together),
         // not just that one column's -- so the first stats entry found
@@ -335,8 +343,20 @@ impl QueryPlanner {
             nodes.push(LogicalPlanNode::Aggregate {
                 columns: select.columns.clone(),
                 group_by: select.group_by.clone(),
+                having: select.having.clone(),
                 rows,
             });
+        } else if select.having.is_some() {
+            // HAVING only means something over groups -- a query that
+            // isn't recognized as an aggregate query has no Aggregate node
+            // for it to attach to. Erroring here (rather than silently
+            // dropping select.having, which is exactly the bug this field
+            // exists to fix) matches how an unbound `?`/`$N` placeholder
+            // reaching execute_sql is also a hard error instead of a
+            // silent no-op.
+            return Err(DatabaseError::ExecutionError(
+                "HAVING requires GROUP BY or an all-aggregate SELECT list".to_string(),
+            ));
         }
 
         // ORDER BY: after Filter/Join/Aggregate, before Project -- a sort
@@ -366,11 +386,11 @@ impl QueryPlanner {
 
         let estimated_cost = self.cost_model.estimate_total_cost(&Self::to_operator_costs(&nodes));
 
-        PhysicalPlan {
+        Ok(PhysicalPlan {
             nodes,
             estimated_cost,
             estimated_rows: rows,
-        }
+        })
     }
 
     /// Map plan nodes to the cost model's operator representation so
@@ -437,14 +457,14 @@ mod tests {
     #[test]
     fn test_query_planner_creation() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM table1");
+        let plan = planner.plan("SELECT * FROM table1").unwrap();
         assert!(!plan.nodes.is_empty());
     }
 
     #[test]
     fn test_plan_reflects_real_table_name() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM orders");
+        let plan = planner.plan("SELECT * FROM orders").unwrap();
         match &plan.nodes[0] {
             LogicalPlanNode::Scan { table_name, .. } => assert_eq!(table_name, "orders"),
             other => panic!("expected a Scan node, got {other:?}"),
@@ -454,7 +474,7 @@ mod tests {
     #[test]
     fn test_plan_emits_filter_node_for_where_clause() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM users WHERE age > 18");
+        let plan = planner.plan("SELECT * FROM users WHERE age > 18").unwrap();
         assert!(plan
             .nodes
             .iter()
@@ -466,7 +486,7 @@ mod tests {
     #[test]
     fn test_plan_emits_join_node_for_join_query() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM users JOIN orders ON users.id = orders.user_id");
+        let plan = planner.plan("SELECT * FROM users JOIN orders ON users.id = orders.user_id").unwrap();
         assert!(plan
             .nodes
             .iter()
@@ -476,14 +496,14 @@ mod tests {
     #[test]
     fn test_plan_non_select_falls_back_to_empty_plan() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("DELETE FROM users WHERE id = 1");
+        let plan = planner.plan("DELETE FROM users WHERE id = 1").unwrap();
         assert_eq!(plan.estimated_rows, 0);
     }
 
     #[test]
     fn test_plan_emits_aggregate_node_when_all_columns_are_aggregates() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT COUNT(*), AVG(age) FROM users");
+        let plan = planner.plan("SELECT COUNT(*), AVG(age) FROM users").unwrap();
         assert!(plan
             .nodes
             .iter()
@@ -498,7 +518,7 @@ mod tests {
         // node at all, and execute() returned every column, same as
         // SELECT *.
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT name, age FROM users");
+        let plan = planner.plan("SELECT name, age FROM users").unwrap();
         match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Project { .. })) {
             Some(LogicalPlanNode::Project { columns, .. }) => {
                 assert_eq!(columns, &vec!["name".to_string(), "age".to_string()]);
@@ -510,7 +530,7 @@ mod tests {
     #[test]
     fn test_plan_does_not_emit_project_node_for_select_star() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM users");
+        let plan = planner.plan("SELECT * FROM users").unwrap();
         assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Project { .. })));
     }
 
@@ -519,7 +539,7 @@ mod tests {
         // Previously select.order_by was parsed into a real string and
         // then never consulted anywhere -- no Sort node at all.
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM users ORDER BY age DESC");
+        let plan = planner.plan("SELECT * FROM users ORDER BY age DESC").unwrap();
         match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Sort { .. })) {
             Some(LogicalPlanNode::Sort { keys, .. }) => {
                 assert_eq!(keys, &vec![("age".to_string(), false)]);
@@ -531,7 +551,7 @@ mod tests {
     #[test]
     fn test_plan_emits_sort_node_for_multi_column_order_by() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM users ORDER BY age, name DESC");
+        let plan = planner.plan("SELECT * FROM users ORDER BY age, name DESC").unwrap();
         match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Sort { .. })) {
             Some(LogicalPlanNode::Sort { keys, .. }) => {
                 assert_eq!(keys, &vec![("age".to_string(), true), ("name".to_string(), false)]);
@@ -545,7 +565,7 @@ mod tests {
         // Previously select.limit was parsed and then never consulted --
         // no Limit node at all.
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM users LIMIT 5");
+        let plan = planner.plan("SELECT * FROM users LIMIT 5").unwrap();
         match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Limit { .. })) {
             Some(LogicalPlanNode::Limit { limit, .. }) => assert_eq!(*limit, 5),
             _ => panic!("expected a Limit node"),
@@ -555,7 +575,7 @@ mod tests {
     #[test]
     fn test_plan_omits_sort_and_limit_nodes_when_absent() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT * FROM users");
+        let plan = planner.plan("SELECT * FROM users").unwrap();
         assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Sort { .. })));
         assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Limit { .. })));
     }
@@ -565,7 +585,7 @@ mod tests {
         let planner = QueryPlanner::new();
         // "name" alongside COUNT(*) with no GROUP BY at all is invalid --
         // must not be misdetected as a pure aggregate query.
-        let plan = planner.plan("SELECT name, COUNT(*) FROM users");
+        let plan = planner.plan("SELECT name, COUNT(*) FROM users").unwrap();
         assert!(!plan
             .nodes
             .iter()
@@ -575,7 +595,7 @@ mod tests {
     #[test]
     fn test_plan_emits_aggregate_node_for_group_by() {
         let planner = QueryPlanner::new();
-        let plan = planner.plan("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id");
+        let plan = planner.plan("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id").unwrap();
         match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Aggregate { .. })) {
             Some(LogicalPlanNode::Aggregate { columns, group_by, .. }) => {
                 assert_eq!(columns, &vec!["user_id".to_string(), "COUNT(*)".to_string()]);
@@ -590,7 +610,7 @@ mod tests {
         let planner = QueryPlanner::new();
         // "name" is neither an aggregate call nor a GROUP BY column --
         // still not a valid aggregate query shape even with GROUP BY present.
-        let plan = planner.plan("SELECT name, COUNT(*) FROM orders GROUP BY user_id");
+        let plan = planner.plan("SELECT name, COUNT(*) FROM orders GROUP BY user_id").unwrap();
         assert!(!plan
             .nodes
             .iter()
@@ -598,10 +618,31 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_carries_having_onto_the_aggregate_node() {
+        let planner = QueryPlanner::new();
+        let plan = planner
+            .plan("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1")
+            .unwrap();
+        match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Aggregate { .. })) {
+            Some(LogicalPlanNode::Aggregate { having, .. }) => {
+                assert_eq!(having.as_deref(), Some("COUNT(*) > 1"));
+            }
+            _ => panic!("expected an Aggregate node"),
+        }
+    }
+
+    #[test]
+    fn test_plan_rejects_having_without_group_by_or_aggregate_select() {
+        let planner = QueryPlanner::new();
+        let err = planner.plan("SELECT * FROM users HAVING age > 18");
+        assert!(err.is_err());
+    }
+
+    #[test]
     fn test_different_queries_yield_different_costs() {
         let planner = QueryPlanner::new();
-        let scan_only = planner.plan("SELECT * FROM users");
-        let filtered = planner.plan("SELECT * FROM users WHERE age > 18");
+        let scan_only = planner.plan("SELECT * FROM users").unwrap();
+        let filtered = planner.plan("SELECT * FROM users WHERE age > 18").unwrap();
         // A different query shape should actually change the estimate now,
         // instead of every query getting the same hardcoded 100.0/1000.
         assert_ne!(scan_only.estimated_cost, filtered.estimated_cost);

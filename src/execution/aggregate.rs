@@ -96,6 +96,69 @@ pub fn compute_aggregate(
     }
 }
 
+/// Find every aggregate call (`COUNT(*)`, `SUM(age)`, ...) in an arbitrary
+/// expression string -- unlike `parse_aggregate`, which only recognizes a
+/// column string that is *entirely* one aggregate call, this scans for
+/// aggregate calls embedded inside a larger expression (a `HAVING` clause
+/// such as `"COUNT(*) > 1"` or `"SUM(amount) > 100 AND dept = 'Eng'"`).
+///
+/// Each recognized call is replaced in the returned string with a bare
+/// placeholder identifier (`__having_agg_0`, `__having_agg_1`, ...) safe
+/// for `row_codec::tokenize_expr`/`CompiledPredicate` to treat as an
+/// ordinary column reference -- that machinery splits `(`/`)` into their
+/// own tokens unconditionally, so `"COUNT(*)"` would otherwise tokenize as
+/// six separate tokens instead of the one atomic identifier a comparison
+/// needs. The second return value maps each placeholder back to the
+/// aggregate that computes its value, in the order they appear.
+///
+/// Doesn't handle nested aggregate calls (not valid SQL anyway) or an
+/// aggregate whose argument itself contains parens; good enough for the
+/// single-comparison-per-aggregate shape `HAVING` clauses actually use.
+pub fn extract_calls(expr: &str) -> (String, Vec<(String, AggregateFn, Option<String>)>) {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut rewritten = String::with_capacity(expr.len());
+    let mut calls = Vec::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i].is_alphabetic() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '(' {
+                let mut depth = 1;
+                let mut j = i + 1;
+                while j < chars.len() && depth > 0 {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let call: String = chars[start..j].iter().collect();
+                match parse_aggregate(&call) {
+                    Some((func, arg)) => {
+                        let placeholder = format!("__having_agg_{}", calls.len());
+                        rewritten.push_str(&placeholder);
+                        calls.push((placeholder, func, arg));
+                    }
+                    None => rewritten.push_str(&call),
+                }
+                i = j;
+                continue;
+            }
+            rewritten.extend(&chars[start..i]);
+            continue;
+        }
+        rewritten.push(chars[i]);
+        i += 1;
+    }
+
+    (rewritten, calls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +253,32 @@ mod tests {
             compute_aggregate(AggregateFn::Sum, Some("height"), &schema, &tuples),
             Value::Null
         );
+    }
+
+    #[test]
+    fn test_extract_calls_rewrites_a_single_aggregate() {
+        let (rewritten, calls) = extract_calls("COUNT(*) > 1");
+        assert_eq!(rewritten, "__having_agg_0 > 1");
+        assert_eq!(calls, vec![("__having_agg_0".to_string(), AggregateFn::Count, None)]);
+    }
+
+    #[test]
+    fn test_extract_calls_handles_multiple_aggregates_and_a_plain_column() {
+        let (rewritten, calls) = extract_calls("SUM(amount) > 100 AND dept = 'Eng' AND COUNT(*) < 10");
+        assert_eq!(rewritten, "__having_agg_0 > 100 AND dept = 'Eng' AND __having_agg_1 < 10");
+        assert_eq!(
+            calls,
+            vec![
+                ("__having_agg_0".to_string(), AggregateFn::Sum, Some("amount".to_string())),
+                ("__having_agg_1".to_string(), AggregateFn::Count, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_calls_on_expression_with_no_aggregates_is_unchanged() {
+        let (rewritten, calls) = extract_calls("dept = 'Eng'");
+        assert_eq!(rewritten, "dept = 'Eng'");
+        assert!(calls.is_empty());
     }
 }

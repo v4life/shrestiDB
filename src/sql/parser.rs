@@ -113,6 +113,11 @@ pub struct SelectStatement {
     /// (Snowflake/DuckDB/ClickHouse syntax) isn't recognized and also
     /// comes through empty.
     pub group_by: Vec<String>,
+    /// The flattened `HAVING <expr>` clause, if any. Only meaningful
+    /// alongside `group_by` or an all-aggregate `columns` list -- the
+    /// planner rejects a `HAVING` on a non-aggregate query rather than
+    /// silently ignoring it (there'd be no groups to filter).
+    pub having: Option<String>,
     pub order_by: Option<String>,
     pub limit: Option<usize>,
 }
@@ -268,6 +273,7 @@ impl SQLParser {
             ast::GroupByExpr::Expressions(exprs, _) => exprs.iter().map(|e| e.to_string()).collect(),
             ast::GroupByExpr::All(_) => Vec::new(), // not recognized; see field docs
         };
+        let having = select.having.as_ref().map(|e| e.to_string());
         let order_by = query.order_by.as_ref().map(|o| o.to_string());
         let limit = query.limit_clause.as_ref().and_then(Self::extract_limit);
 
@@ -278,6 +284,7 @@ impl SQLParser {
             joins,
             where_clause,
             group_by,
+            having,
             order_by,
             limit,
         }))
@@ -522,6 +529,28 @@ mod tests {
         let stmt = SQLParser::parse(sql).unwrap();
         match stmt {
             SQLStatement::Select(s) => assert!(s.group_by.is_empty()),
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_having() {
+        let sql = "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1";
+        let stmt = SQLParser::parse(sql).unwrap();
+        match stmt {
+            SQLStatement::Select(s) => {
+                assert_eq!(s.having.as_deref(), Some("COUNT(*) > 1"));
+            }
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_without_having_is_none() {
+        let sql = "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id";
+        let stmt = SQLParser::parse(sql).unwrap();
+        match stmt {
+            SQLStatement::Select(s) => assert!(s.having.is_none()),
             _ => panic!("Expected SELECT statement"),
         }
     }

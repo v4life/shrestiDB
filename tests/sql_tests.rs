@@ -9,7 +9,7 @@ mod sql_tests {
     fn test_simple_select_parsing() {
         let planner = QueryPlanner::new();
         let query = "SELECT * FROM users WHERE age > 18";
-        let plan = planner.plan(query);
+        let plan = planner.plan(query).unwrap();
         
         assert!(!plan.nodes.is_empty());
     }
@@ -68,9 +68,9 @@ mod sql_tests {
     fn test_query_plan_generation() {
         let planner = QueryPlanner::new();
         
-        let plan1 = planner.plan("SELECT * FROM users");
-        let plan2 = planner.plan("SELECT id, name FROM users WHERE age > 18");
-        let plan3 = planner.plan("SELECT * FROM users JOIN orders ON users.id = orders.user_id");
+        let plan1 = planner.plan("SELECT * FROM users").unwrap();
+        let plan2 = planner.plan("SELECT id, name FROM users WHERE age > 18").unwrap();
+        let plan3 = planner.plan("SELECT * FROM users JOIN orders ON users.id = orders.user_id").unwrap();
         
         assert!(!plan1.nodes.is_empty());
         assert!(!plan2.nodes.is_empty());
