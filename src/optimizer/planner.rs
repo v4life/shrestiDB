@@ -102,6 +102,27 @@ pub enum LogicalPlanNode {
         group_by: Vec<String>,
         rows: usize,
     },
+    /// Keep only `columns`, in this order, dropping everything else from
+    /// each row — what `SELECT <col1>, <col2>` actually means. An earlier
+    /// version of this planner had no node for this at all: `select.columns`
+    /// was consulted only to detect an aggregate query (see `Aggregate`
+    /// above) and otherwise silently discarded, so a plain, non-aggregate
+    /// `SELECT` with an explicit column list always returned every column
+    /// — identical to `SELECT *` regardless of what was actually asked
+    /// for. Never emitted for `SELECT *` (nothing to drop) or an
+    /// aggregate query (`Aggregate` already produces exactly the
+    /// requested output shape on its own).
+    Project {
+        /// Resolved against whatever the current schema's column names
+        /// are at execution time (see `execution::executor::execute`'s
+        /// `Project` arm) — bare names for a single-table query, or
+        /// `"qualifier.column"` after a `JOIN`, matching how every other
+        /// column reference in this codebase's flattened predicates
+        /// already works. An unresolvable name is a hard error, not a
+        /// silently dropped column.
+        columns: Vec<String>,
+        rows: usize,
+    },
 }
 
 /// Physical query plan
@@ -274,12 +295,13 @@ impl QueryPlanner {
         // grouping columns -- anything else (a plain column that's neither)
         // is left as a plain, if not fully correct, row-returning plan
         // instead of pretending to aggregate.
-        if !select.columns.is_empty()
+        let is_aggregate_query = !select.columns.is_empty()
             && select
                 .columns
                 .iter()
-                .all(|c| aggregate::parse_aggregate(c).is_some() || select.group_by.contains(c))
-        {
+                .all(|c| aggregate::parse_aggregate(c).is_some() || select.group_by.contains(c));
+
+        if is_aggregate_query {
             rows = if select.group_by.is_empty() {
                 1 // no GROUP BY: aggregation always collapses to one row
             } else {
@@ -294,6 +316,11 @@ impl QueryPlanner {
                 group_by: select.group_by.clone(),
                 rows,
             });
+        } else if !(select.columns.len() == 1 && select.columns[0] == "*") {
+            // A real column list, not SELECT * -- see Project's docs for
+            // why this needs its own node rather than being silently
+            // ignored the way it used to be.
+            nodes.push(LogicalPlanNode::Project { columns: select.columns.clone(), rows });
         }
 
         let estimated_cost = self.cost_model.estimate_total_cost(&Self::to_operator_costs(&nodes));
@@ -322,6 +349,7 @@ impl QueryPlanner {
                         ..
                     } => (OperatorType::HashJoin, (*left_rows).max(*right_rows)),
                     LogicalPlanNode::Aggregate { rows, .. } => (OperatorType::Aggregate, *rows),
+                    LogicalPlanNode::Project { rows, .. } => (OperatorType::Filter, *rows),
                 };
                 let cost = OperatorCost::new(
                     op_type,
@@ -418,6 +446,29 @@ mod tests {
             .iter()
             .any(|n| matches!(n, LogicalPlanNode::Aggregate { .. })));
         assert_eq!(plan.estimated_rows, 1);
+    }
+
+    #[test]
+    fn test_plan_emits_project_node_for_explicit_column_list() {
+        // Previously select.columns was only ever consulted to detect an
+        // aggregate query -- a plain "SELECT name, age" got no projection
+        // node at all, and execute() returned every column, same as
+        // SELECT *.
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT name, age FROM users");
+        match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Project { .. })) {
+            Some(LogicalPlanNode::Project { columns, .. }) => {
+                assert_eq!(columns, &vec!["name".to_string(), "age".to_string()]);
+            }
+            _ => panic!("expected a Project node"),
+        }
+    }
+
+    #[test]
+    fn test_plan_does_not_emit_project_node_for_select_star() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT * FROM users");
+        assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Project { .. })));
     }
 
     #[test]

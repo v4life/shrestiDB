@@ -632,6 +632,35 @@ impl QueryExecutor {
                     }
                     current = Some((schema, output_rows));
                 }
+                LogicalPlanNode::Project { columns, .. } => {
+                    let (schema, tuples) = current
+                        .take()
+                        .ok_or_else(|| DatabaseError::ExecutionError("Project with no input".to_string()))?;
+
+                    // Resolved once, before touching any row -- the same
+                    // name must resolve for every row anyway, so there's
+                    // nothing to gain from re-resolving it per tuple (and
+                    // an unknown column should fail the whole statement,
+                    // not just skip silently for some rows).
+                    let indices: Vec<usize> = columns
+                        .iter()
+                        .map(|col| {
+                            schema.columns.iter().position(|c| &c.name == col).ok_or_else(|| {
+                                DatabaseError::ExecutionError(format!("Unknown column '{col}' in SELECT list"))
+                            })
+                        })
+                        .collect::<Result<Vec<usize>>>()?;
+
+                    let mut projected_schema = TableSchema::new(schema.table_id, schema.name.clone());
+                    for &idx in &indices {
+                        projected_schema.add_column(schema.columns[idx].clone());
+                    }
+                    let projected_tuples = tuples
+                        .into_iter()
+                        .map(|t| Tuple { values: indices.iter().map(|&i| t.values[i].clone()).collect() })
+                        .collect();
+                    current = Some((projected_schema, projected_tuples));
+                }
             }
         }
 
@@ -2232,6 +2261,56 @@ mod tests {
         assert_eq!(alice_payments, 2);
         let bob_payments = rows.iter().filter(|r| r.contains(&"Bob".to_string())).count();
         assert_eq!(bob_payments, 1);
+    }
+
+    #[test]
+    fn test_select_explicit_column_list_projects_only_those_columns() {
+        // Previously select.columns was only ever consulted to detect an
+        // aggregate query and otherwise discarded, so a plain non-aggregate
+        // SELECT with an explicit column list silently behaved exactly
+        // like SELECT * -- returning id/name/age instead of just name.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice (30), Bob (15)
+
+        let rows = executor.execute_sql("SELECT name FROM users WHERE age > 18").unwrap();
+        assert_eq!(rows, vec![vec!["Alice".to_string()]]);
+    }
+
+    #[test]
+    fn test_select_column_list_respects_requested_order() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice, id=1, age=30
+
+        // Table column order is id, name, age -- SELECT lists them
+        // reversed, and the output must follow the SELECT list, not the
+        // table's own column order.
+        let rows = executor.execute_sql("SELECT age, name, id FROM users WHERE id = 1").unwrap();
+        assert_eq!(rows, vec![vec!["30".to_string(), "Alice".to_string(), "1".to_string()]]);
+    }
+
+    #[test]
+    fn test_select_column_list_on_indexed_pk_lookup_still_projects() {
+        // WHERE id = <literal> is fused into an indexed scan (try_pk_index_scan)
+        // by execute()'s Scan arm -- confirms the Project node downstream
+        // of that fast path still correctly narrows the columns, not just
+        // the full-scan path.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let rows = executor.execute_sql("SELECT name FROM users WHERE id = 1").unwrap();
+        assert_eq!(rows, vec![vec!["Alice".to_string()]]);
+    }
+
+    #[test]
+    fn test_select_qualified_columns_after_join_projects_correctly() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_users(&executor); // ids 1 (Alice), 2 (Bob)
+        executor.execute_sql("INSERT INTO orders (id, user_id, total) VALUES (100, 1, 9.5)").unwrap();
+
+        let rows = executor
+            .execute_sql("SELECT users.name, orders.total FROM users JOIN orders ON users.id = orders.user_id")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["Alice".to_string(), "9.5".to_string()]]);
     }
 
     #[test]
