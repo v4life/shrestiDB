@@ -217,8 +217,16 @@ impl JoinOrderer {
         // this query, same conservative fallback as an unresolvable
         // condition.
         let all_inner = joins.iter().all(|j| j.kind == JoinKind::Inner);
-        let searchable =
-            all_inner && joins.len() <= 8 && !shapes.iter().any(|s| matches!(s, JoinShape::Unresolvable));
+        // USING/NATURAL is resolved against whatever's already been
+        // accumulated on the left by the time that join actually runs
+        // (see execution::executor's Join arm) -- so, unlike an ON
+        // condition naming fixed qualifiers, its real meaning can change
+        // depending on join order. Same conservative fallback.
+        let all_explicit = joins.iter().all(|j| j.equi_match.is_none());
+        let searchable = all_inner
+            && all_explicit
+            && joins.len() <= 8
+            && !shapes.iter().any(|s| matches!(s, JoinShape::Unresolvable));
         let chosen = if searchable {
             let mut known: HashSet<String> = HashSet::new();
             known.insert(from_qualifier.to_string());
@@ -345,12 +353,19 @@ mod tests {
             table: table.to_string(),
             alias: alias.map(str::to_string),
             condition: condition.map(str::to_string),
+            equi_match: None,
             kind: JoinKind::Inner,
         }
     }
 
     fn outer_join(table: &str, alias: Option<&str>, condition: Option<&str>, kind: JoinKind) -> JoinClause {
-        JoinClause { table: table.to_string(), alias: alias.map(str::to_string), condition: condition.map(str::to_string), kind }
+        JoinClause {
+            table: table.to_string(),
+            alias: alias.map(str::to_string),
+            condition: condition.map(str::to_string),
+            equi_match: None,
+            kind,
+        }
     }
 
     #[test]
@@ -471,6 +486,35 @@ mod tests {
             join("big", Some("b"), Some("u.id = b.u_id")),
             outer_join("small", Some("s"), Some("u.id = s.u_id"), JoinKind::Left),
         ];
+        let row_count_of = |q: &str| match q {
+            "u" => 100,
+            "b" => 100_000,
+            "s" => 100,
+            _ => 1000,
+        };
+        let distinct_count_of = |q: &str, _c: &str| match q {
+            "u" => Some(100),
+            "b" => Some(2),
+            "s" => Some(100),
+            _ => None,
+        };
+        let planned = orderer.find_optimal_order("u", 100, &joins, row_count_of, distinct_count_of, 0.1);
+        assert_eq!(planned.iter().map(|pj| pj.join_index).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_find_optimal_order_never_reorders_when_any_join_is_using_or_natural() {
+        let orderer = JoinOrderer::new();
+        // Same "reordering would look cheaper" shape again, but `small`
+        // is USING(...) this time -- its real meaning depends on
+        // whatever's already accumulated on the left when it runs, so
+        // reordering it is just as unsafe as reordering an outer join.
+        let mut joins = vec![
+            join("big", Some("b"), Some("u.id = b.u_id")),
+            join("small", Some("s"), Some("u.id = s.u_id")),
+        ];
+        joins[1].condition = None;
+        joins[1].equi_match = Some(crate::sql::parser::EquiMatch::Using(vec!["u_id".to_string()]));
         let row_count_of = |q: &str| match q {
             "u" => 100,
             "b" => 100_000,

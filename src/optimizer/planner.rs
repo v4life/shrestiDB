@@ -39,7 +39,7 @@ use crate::execution::row_codec;
 use crate::optimizer::cardinality::ColumnDistribution;
 use crate::optimizer::cost_model::{CostModel, OperatorCost, OperatorType};
 use crate::optimizer::join_reorder::JoinOrderer;
-use crate::sql::parser::{JoinKind, SQLParser, SQLStatement, SelectStatement};
+use crate::sql::parser::{EquiMatch, JoinKind, SQLParser, SQLStatement, SelectStatement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -64,10 +64,13 @@ pub enum LogicalPlanNode {
         /// The joined table's alias, if any — same role as `Scan::alias`.
         right_alias: Option<String>,
         /// The `ON` condition, flattened to a string (see `sql::parser`'s
-        /// `JoinClause`). `None` means an unconditional join (`CROSS JOIN`,
-        /// or a `USING`/`NATURAL` join — those aren't specially resolved,
-        /// so they degrade to the same thing as `CROSS JOIN`).
+        /// `JoinClause`). `None` when the join was unconditional (`CROSS
+        /// JOIN`), or written as `USING`/`NATURAL` (see `equi_match`).
         condition: Option<String>,
+        /// `USING`/`NATURAL`, when the join was written that way instead
+        /// of `ON` — see `sql::parser::EquiMatch`'s docs for why this
+        /// isn't resolved into `condition` before execution time.
+        equi_match: Option<EquiMatch>,
         left_rows: usize,
         right_rows: usize,
         /// `INNER`/`LEFT`/`RIGHT`/`FULL OUTER`, from `sql::parser::JoinClause::kind`
@@ -219,6 +222,7 @@ impl QueryPlanner {
                 right_table: join.table.clone(),
                 right_alias: join.alias.clone(),
                 condition: join.condition.clone(),
+                equi_match: join.equi_match.clone(),
                 left_rows: planned.left_rows,
                 right_rows: planned.right_rows,
                 kind: join.kind,

@@ -33,8 +33,6 @@ pub enum SQLStatement {
 /// a flattened string like `where_clause` (e.g. `"users.id = orders.user_id"`,
 /// or `"u.id = o.user_id"` if the query used aliases — see `alias`) — there's
 /// no expression tree kept around, just like everywhere else in this AST.
-/// `USING`/`NATURAL` joins aren't specially handled: their condition comes
-/// through as `None`, same as an explicit `CROSS JOIN`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinClause {
     pub table: String,
@@ -42,7 +40,22 @@ pub struct JoinClause {
     /// `condition` refers to this table by the alias when one is given —
     /// see `execution::executor::QueryExecutor::merge_schemas`.
     pub alias: Option<String>,
+    /// The `ON <expr>` condition, when the join was written that way.
+    /// Mutually exclusive with `equi_match` (a `USING`/`NATURAL` join has
+    /// no `ON` expression to flatten) — exactly one of the two is ever
+    /// `Some` for a real equi-join; both are `None` for an unconditional
+    /// join (`CROSS JOIN`, or a `NATURAL` join whose tables happen to
+    /// share no column names).
     pub condition: Option<String>,
+    /// `USING (...)` or `NATURAL`, when the join was written that way.
+    /// This parser has no catalog access, so it can't resolve which
+    /// columns that actually means here — see `EquiMatch`'s docs and
+    /// `execution::executor::QueryExecutor::execute`'s `Join` arm, which
+    /// resolves it against the real schemas at execution time, the
+    /// earliest point that information exists. An earlier version of
+    /// this struct discarded `USING`/`NATURAL` entirely, so both
+    /// silently executed as an unfiltered `CROSS JOIN`.
+    pub equi_match: Option<EquiMatch>,
     /// `INNER`/`LEFT`/`RIGHT`/`FULL OUTER` — see `JoinKind`'s docs. An
     /// earlier version of this struct didn't track this at all, so every
     /// join (however written) executed as `INNER JOIN`: an unmatched row
@@ -50,6 +63,22 @@ pub struct JoinClause {
     /// with `NULL`s on the other side, the standard SQL meaning of
     /// `LEFT`/`RIGHT`/`FULL OUTER`.
     pub kind: JoinKind,
+}
+
+/// How a `USING`/`NATURAL` join's equi-join columns are specified —
+/// resolved against real schemas at execution time, not here (see
+/// `JoinClause::equi_match`'s docs). Only a single shared/listed column
+/// is currently supported; more than one is a loud execution-time error
+/// rather than a silent partial match or an unfiltered cross join — a
+/// deliberate, documented scope boundary (this engine's join execution
+/// has no composite/multi-column hash key), not an oversight.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EquiMatch {
+    /// `JOIN ... USING (col, ...)` — the column names exactly as written.
+    Using(Vec<String>),
+    /// `NATURAL JOIN` — matches on whichever column name(s) both sides
+    /// happen to share, determined at execution time.
+    Natural,
 }
 
 /// Which side(s) of a join must still appear, padded with `NULL`s, when
@@ -220,11 +249,15 @@ impl SQLParser {
             .map(|t| {
                 t.joins
                     .iter()
-                    .map(|j| JoinClause {
-                        table: Self::table_factor_name(&j.relation),
-                        alias: Self::table_factor_alias(&j.relation),
-                        condition: Self::join_condition(&j.join_operator),
-                        kind: Self::join_kind(&j.join_operator),
+                    .map(|j| {
+                        let (condition, equi_match) = Self::join_condition(&j.join_operator);
+                        JoinClause {
+                            table: Self::table_factor_name(&j.relation),
+                            alias: Self::table_factor_alias(&j.relation),
+                            condition,
+                            equi_match,
+                            kind: Self::join_kind(&j.join_operator),
+                        }
                     })
                     .collect()
             })
@@ -250,19 +283,29 @@ impl SQLParser {
         }))
     }
 
-    /// Extract the `ON <expr>` condition from a join operator, regardless
-    /// of join type (`INNER`/`LEFT`/`RIGHT`/...). `None` for `USING`,
-    /// `NATURAL`, or no constraint (`CROSS JOIN`).
-    fn join_condition(op: &ast::JoinOperator) -> Option<String> {
+    /// Extract the join constraint from a join operator, regardless of
+    /// join type (`INNER`/`LEFT`/`RIGHT`/...) — an `ON <expr>` becomes
+    /// `condition`, a `USING`/`NATURAL` becomes `equi_match` (see that
+    /// type's docs for why this parser can't resolve it into a condition
+    /// string itself). Both `None` for no constraint (`CROSS JOIN`) or a
+    /// join kind this parser doesn't dig a constraint out of at all
+    /// (`CROSS APPLY`/`OUTER APPLY`/`ASOF` — non-standard, unsupported
+    /// syntax outside this match's variant list, distinct from `CROSS
+    /// JOIN`'s ordinary `JoinConstraint::None`).
+    fn join_condition(op: &ast::JoinOperator) -> (Option<String>, Option<EquiMatch>) {
         use ast::JoinOperator::*;
         let constraint = match op {
             Join(c) | Inner(c) | Left(c) | LeftOuter(c) | Right(c) | RightOuter(c) | FullOuter(c)
-            | CrossJoin(c) | Semi(c) | LeftSemi(c) => Some(c),
-            _ => None,
-        }?;
+            | CrossJoin(c) | Semi(c) | LeftSemi(c) | RightSemi(c) | Anti(c) | LeftAnti(c) | RightAnti(c) => c,
+            _ => return (None, None),
+        };
         match constraint {
-            ast::JoinConstraint::On(expr) => Some(expr.to_string()),
-            _ => None,
+            ast::JoinConstraint::On(expr) => (Some(expr.to_string()), None),
+            ast::JoinConstraint::Using(cols) => {
+                (None, Some(EquiMatch::Using(cols.iter().map(|c| c.to_string()).collect())))
+            }
+            ast::JoinConstraint::Natural => (None, Some(EquiMatch::Natural)),
+            ast::JoinConstraint::None => (None, None),
         }
     }
 

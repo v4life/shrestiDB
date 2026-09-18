@@ -42,8 +42,8 @@ use crate::optimizer::cardinality::ColumnDistribution;
 use crate::optimizer::planner::{LogicalPlanNode, PhysicalPlan, QueryPlanner};
 use crate::sql::binder::Binder;
 use crate::sql::parser::{
-    AnalyzeStatement, CreateIndexStatement, CreateTableStatement, DeleteStatement, InsertStatement, JoinKind,
-    SQLParser, SQLStatement, UpdateStatement,
+    AnalyzeStatement, CreateIndexStatement, CreateTableStatement, DeleteStatement, EquiMatch, InsertStatement,
+    JoinKind, SQLParser, SQLStatement, UpdateStatement,
 };
 use parking_lot::RwLock;
 
@@ -440,7 +440,7 @@ impl QueryExecutor {
                         .collect();
                     current = Some((schema, filtered));
                 }
-                LogicalPlanNode::Join { right_table, right_alias, condition, kind, .. } => {
+                LogicalPlanNode::Join { right_table, right_alias, condition, equi_match, kind, .. } => {
                     let (left_schema, left_tuples) = current
                         .take()
                         .ok_or_else(|| DatabaseError::ExecutionError("JOIN with no input".to_string()))?;
@@ -451,6 +451,36 @@ impl QueryExecutor {
                     let merged_schema =
                         Self::merge_schemas(&left_schema, left_prefix.as_deref(), &right_schema, &right_prefix);
                     let left_len = left_schema.columns.len();
+
+                    // USING/NATURAL has no ON expression to flatten (see
+                    // sql::parser::EquiMatch's docs) -- this parser has no
+                    // catalog access, so resolving which columns it
+                    // actually means has to happen here, the earliest
+                    // point the real schemas exist. Once resolved, it
+                    // becomes an ordinary condition string and flows
+                    // through the exact same logic below as a real ON
+                    // clause would -- including hash-join eligibility.
+                    // An earlier version of this engine discarded
+                    // USING/NATURAL entirely, so both silently executed
+                    // as an unfiltered CROSS JOIN.
+                    let condition: Option<String> = match equi_match {
+                        Some(EquiMatch::Using(cols)) => Some(Self::resolve_using_condition(
+                            cols,
+                            &left_schema,
+                            left_prefix.as_deref(),
+                            &right_schema,
+                            &right_prefix,
+                            right_table,
+                        )?),
+                        Some(EquiMatch::Natural) => Self::resolve_natural_condition(
+                            &left_schema,
+                            left_prefix.as_deref(),
+                            &right_schema,
+                            &right_prefix,
+                        )?,
+                        None => condition.clone(),
+                    };
+                    let condition = &condition;
 
                     // Resolve the condition once: which two merged-schema
                     // column indices it compares, and -- the shape hash
@@ -734,6 +764,102 @@ impl QueryExecutor {
         });
 
         Ok(Some((schema.clone(), tuples)))
+    }
+
+    /// A column's own name, stripping any `"qualifier."` prefix a prior
+    /// merge may have added (see `merge_schemas`) -- `"u.id"` and `"id"`
+    /// both give `"id"`. Needed because `USING`/`NATURAL` match by plain
+    /// column name, but `left_schema` may already be a merged, qualified
+    /// schema from an earlier join in the chain by the time a later
+    /// `USING`/`NATURAL` join runs, while `right_schema` (a fresh, single
+    /// table scan) never is.
+    fn base_column_name(name: &str) -> &str {
+        name.rsplit('.').next().unwrap_or(name)
+    }
+
+    /// Build the merged-schema token pair (e.g. `("u.id", "o.user_id")`)
+    /// for an equi-join on `left_col`/`right_col`, matching exactly how
+    /// `merge_schemas` will name them -- `left_col`'s name gets
+    /// `left_prefix` applied only when `left` isn't already a merged,
+    /// qualified schema (same rule `merge_schemas` itself follows).
+    fn equi_join_tokens(left_col: &Column, left_prefix: Option<&str>, right_col: &Column, right_prefix: &str) -> (String, String) {
+        let left_token = match left_prefix {
+            Some(prefix) => format!("{prefix}.{}", left_col.name),
+            None => left_col.name.clone(),
+        };
+        (left_token, format!("{right_prefix}.{}", right_col.name))
+    }
+
+    /// Resolve `JOIN ... USING (cols)` into an ordinary `"<left> = <right>"`
+    /// condition string, the same shape a real `ON` clause would produce
+    /// -- see this function's call site for why that's what lets the rest
+    /// of `execute`'s `Join` arm (hash-join eligibility included) run
+    /// completely unchanged from here. Only a single `USING` column is
+    /// supported: this engine's join execution has no composite/multi-
+    /// column hash key, so more than one is a clear error rather than a
+    /// silent partial match (joining on only the first column) or a
+    /// silent fallback to an unfiltered cross join.
+    fn resolve_using_condition(
+        cols: &[String],
+        left_schema: &TableSchema,
+        left_prefix: Option<&str>,
+        right_schema: &TableSchema,
+        right_prefix: &str,
+        right_table: &str,
+    ) -> Result<String> {
+        let [col] = cols else {
+            return Err(DatabaseError::ExecutionError(format!(
+                "JOIN ... USING with more than one column isn't supported yet (got {}); use an explicit ON condition instead",
+                cols.len()
+            )));
+        };
+        let left_col = left_schema
+            .columns
+            .iter()
+            .find(|c| Self::base_column_name(&c.name) == col.as_str())
+            .ok_or_else(|| DatabaseError::ExecutionError(format!("USING column '{col}' not found on the left side of the join")))?;
+        let right_col = right_schema
+            .columns
+            .iter()
+            .find(|c| &c.name == col)
+            .ok_or_else(|| DatabaseError::ExecutionError(format!("USING column '{col}' not found in table '{right_table}'")))?;
+        let (left_token, right_token) = Self::equi_join_tokens(left_col, left_prefix, right_col, right_prefix);
+        Ok(format!("{left_token} = {right_token}"))
+    }
+
+    /// Resolve `NATURAL JOIN` into an ordinary `"<left> = <right>"`
+    /// condition string -- see `resolve_using_condition`'s docs for why
+    /// that shape, and the same "exactly one column" scope limit (real
+    /// `NATURAL JOIN` matches on every shared column name; this engine
+    /// only ever matches on one). `Ok(None)` when the two tables share no
+    /// column names at all: real `NATURAL JOIN` semantics degrade to a
+    /// plain, unfiltered `CROSS JOIN` in that case -- not a bug, and not
+    /// this function's problem to reject.
+    fn resolve_natural_condition(
+        left_schema: &TableSchema,
+        left_prefix: Option<&str>,
+        right_schema: &TableSchema,
+        right_prefix: &str,
+    ) -> Result<Option<String>> {
+        let shared: Vec<(&Column, &Column)> = left_schema
+            .columns
+            .iter()
+            .filter_map(|lc| {
+                let base = Self::base_column_name(&lc.name);
+                right_schema.columns.iter().find(|rc| rc.name == base).map(|rc| (lc, rc))
+            })
+            .collect();
+        match shared.as_slice() {
+            [] => Ok(None),
+            [(left_col, right_col)] => {
+                let (left_token, right_token) = Self::equi_join_tokens(left_col, left_prefix, right_col, right_prefix);
+                Ok(Some(format!("{left_token} = {right_token}")))
+            }
+            _ => Err(DatabaseError::ExecutionError(format!(
+                "NATURAL JOIN with more than one shared column isn't supported yet ({} shared columns found); use an explicit ON condition instead",
+                shared.len()
+            ))),
+        }
     }
 
     /// Build the schema for a joined row: `left`'s columns followed by
@@ -2125,6 +2251,107 @@ mod tests {
         let rows = executor.execute_sql("SELECT * FROM a JOIN b ON a.tag = b.tag").unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows.iter().any(|r| r.contains(&"NULL".to_string())));
+    }
+
+    #[test]
+    fn test_using_join_matches_correctly_not_a_cross_product() {
+        // An earlier version of this engine discarded USING entirely,
+        // silently executing it as an unfiltered CROSS JOIN -- 2 a-rows x
+        // 3 b-rows = 6 rows, instead of the 2 rows a real equi-join on id
+        // produces here.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, val) VALUES (1, 10)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, val) VALUES (2, 20)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, val) VALUES (1, 100)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, val) VALUES (2, 200)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, val) VALUES (3, 300)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a JOIN b USING (id)").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r == &vec!["1".to_string(), "10".to_string(), "1".to_string(), "100".to_string()]));
+        assert!(rows.iter().any(|r| r == &vec!["2".to_string(), "20".to_string(), "2".to_string(), "200".to_string()]));
+    }
+
+    #[test]
+    fn test_natural_join_matches_on_shared_column() {
+        // Same silent-CROSS-JOIN bug as USING, for NATURAL JOIN's
+        // automatic shared-column matching (here: `id`, since `val`
+        // differs between the two rows -- a real NATURAL JOIN wouldn't
+        // match on `id` alone if `val` is also shared and different, but
+        // this table shape only shares `id`).
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, a_only INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, b_only INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, a_only) VALUES (1, 10)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, a_only) VALUES (2, 20)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, b_only) VALUES (1, 100)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, b_only) VALUES (3, 300)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a NATURAL JOIN b").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec!["1".to_string(), "10".to_string(), "1".to_string(), "100".to_string()]);
+    }
+
+    #[test]
+    fn test_natural_join_with_no_shared_columns_is_a_real_cross_join() {
+        // Not a bug: standard NATURAL JOIN semantics degrade to a plain
+        // CROSS JOIN when the two tables share no column names at all.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (a_id INT PRIMARY KEY)").unwrap();
+        executor.execute_sql("CREATE TABLE b (b_id INT PRIMARY KEY)").unwrap();
+        executor.execute_sql("INSERT INTO a (a_id) VALUES (1)").unwrap();
+        executor.execute_sql("INSERT INTO a (a_id) VALUES (2)").unwrap();
+        executor.execute_sql("INSERT INTO b (b_id) VALUES (10)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a NATURAL JOIN b").unwrap();
+        assert_eq!(rows.len(), 2); // 2 x 1, every combination
+    }
+
+    #[test]
+    fn test_using_join_with_multiple_columns_errors_loudly() {
+        // Composite-key USING isn't supported (this engine's join
+        // execution has no multi-column hash key) -- must be a clear
+        // error, not a silent partial match on just the first column.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, tag INT)").unwrap();
+        let err = executor.execute_sql("SELECT * FROM a JOIN b USING (id, tag)").unwrap_err();
+        assert!(err.to_string().contains("more than one column"));
+    }
+
+    #[test]
+    fn test_natural_join_with_multiple_shared_columns_errors_loudly() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, tag INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, tag INT)").unwrap();
+        let err = executor.execute_sql("SELECT * FROM a NATURAL JOIN b").unwrap_err();
+        assert!(err.to_string().contains("more than one shared column"));
+    }
+
+    #[test]
+    fn test_using_join_as_second_join_in_chain_matches_qualified_left_column() {
+        // By the time this second USING join runs, `left_schema` is
+        // already the merged, qualified output of the first join (its
+        // `id` column is really named "a.id") -- exercises
+        // base_column_name's qualifier-stripping, not just the simple
+        // unqualified-first-join case the other tests cover.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("CREATE TABLE c (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, val) VALUES (1, 10)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, val) VALUES (1, 100)").unwrap();
+        executor.execute_sql("INSERT INTO c (id, val) VALUES (1, 1000)").unwrap();
+        executor.execute_sql("INSERT INTO c (id, val) VALUES (2, 2000)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a JOIN b ON a.id = b.id JOIN c USING (id)").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            vec!["1".to_string(), "10".to_string(), "1".to_string(), "100".to_string(), "1".to_string(), "1000".to_string()]
+        );
     }
 
     #[test]

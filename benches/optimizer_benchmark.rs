@@ -75,6 +75,7 @@ fn benchmark_join_ordering(c: &mut Criterion) {
             table: format!("t{i}"),
             alias: Some(format!("t{i}")),
             condition: Some(format!("t0.id = t{i}.t0_id")),
+            equi_match: None,
             kind: shrestidb::sql::parser::JoinKind::Inner,
         })
         .collect();
