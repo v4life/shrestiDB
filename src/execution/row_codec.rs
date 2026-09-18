@@ -407,8 +407,14 @@ impl CompiledPredicate {
         Some(CompiledPredicate { expr })
     }
 
+    /// `Some(false)` covers both a real `False` and SQL's `NULL`-driven
+    /// `Unknown` (see `Tri::is_true`) — both mean "exclude this row",
+    /// same as every real database. Only a genuine structural failure
+    /// (an unresolvable column, an unrecognized operator) is `None`,
+    /// which callers fall back to their own default for — see this
+    /// type's docs.
     pub fn eval(&self, tuple: &Tuple) -> Option<bool> {
-        eval_bool_expr(&self.expr, tuple)
+        eval_bool_expr(&self.expr, tuple).map(Tri::is_true)
     }
 
     /// Same as `eval`, but for a `JOIN`'s nested loop specifically:
@@ -423,7 +429,7 @@ impl CompiledPredicate {
     /// predicate was compiled, so a resolved index at or past it refers
     /// to `right`, not `left`.
     pub fn eval_split(&self, left: &Tuple, left_len: usize, right: &Tuple) -> Option<bool> {
-        eval_bool_expr_split(&self.expr, left, left_len, right)
+        eval_bool_expr_split(&self.expr, left, left_len, right).map(Tri::is_true)
     }
 }
 
@@ -537,18 +543,18 @@ fn is_comparison_op(s: &str) -> bool {
     matches!(s, "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=")
 }
 
-fn eval_bool_expr(expr: &BoolExpr, tuple: &Tuple) -> Option<bool> {
+fn eval_bool_expr(expr: &BoolExpr, tuple: &Tuple) -> Option<Tri> {
     match expr {
         BoolExpr::Comparison { left_idx, op, right } => eval_comparison(*left_idx, op, right, tuple),
-        BoolExpr::And(l, r) => Some(eval_bool_expr(l, tuple)? && eval_bool_expr(r, tuple)?),
-        BoolExpr::Or(l, r) => Some(eval_bool_expr(l, tuple)? || eval_bool_expr(r, tuple)?),
+        BoolExpr::And(l, r) => Some(eval_bool_expr(l, tuple)?.and(eval_bool_expr(r, tuple)?)),
+        BoolExpr::Or(l, r) => Some(eval_bool_expr(l, tuple)?.or(eval_bool_expr(r, tuple)?)),
     }
 }
 
 /// No string work at all: `left_idx`/`right` were already resolved at
 /// parse time (see `ExprParser::parse_atom`), so this is index lookups
 /// and a reference comparison, not a schema scan.
-fn eval_comparison(left_idx: usize, op: &str, right: &ComparisonOperand, tuple: &Tuple) -> Option<bool> {
+fn eval_comparison(left_idx: usize, op: &str, right: &ComparisonOperand, tuple: &Tuple) -> Option<Tri> {
     let left_value = tuple.values.get(left_idx)?;
     let right_value = match right {
         ComparisonOperand::Column(idx) => tuple.values.get(*idx)?,
@@ -560,16 +566,16 @@ fn eval_comparison(left_idx: usize, op: &str, right: &ComparisonOperand, tuple: 
 
 // ── Split (unmerged left/right) evaluation, for CompiledPredicate::eval_split ──
 
-fn eval_bool_expr_split(expr: &BoolExpr, left: &Tuple, left_len: usize, right: &Tuple) -> Option<bool> {
+fn eval_bool_expr_split(expr: &BoolExpr, left: &Tuple, left_len: usize, right: &Tuple) -> Option<Tri> {
     match expr {
         BoolExpr::Comparison { left_idx, op, right: rhs } => {
             eval_comparison_split(*left_idx, op, rhs, left, left_len, right)
         }
         BoolExpr::And(l, r) => Some(
-            eval_bool_expr_split(l, left, left_len, right)? && eval_bool_expr_split(r, left, left_len, right)?,
+            eval_bool_expr_split(l, left, left_len, right)?.and(eval_bool_expr_split(r, left, left_len, right)?),
         ),
         BoolExpr::Or(l, r) => Some(
-            eval_bool_expr_split(l, left, left_len, right)? || eval_bool_expr_split(r, left, left_len, right)?,
+            eval_bool_expr_split(l, left, left_len, right)?.or(eval_bool_expr_split(r, left, left_len, right)?),
         ),
     }
 }
@@ -592,7 +598,7 @@ fn eval_comparison_split(
     left: &Tuple,
     left_len: usize,
     right_tuple: &Tuple,
-) -> Option<bool> {
+) -> Option<Tri> {
     let left_value = split_value(left_idx, left, left_len, right_tuple)?;
     let right_value = match right {
         ComparisonOperand::Column(idx) => split_value(*idx, left, left_len, right_tuple)?,
@@ -646,8 +652,69 @@ fn strip_quotes(s: &str) -> &str {
     s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(s)
 }
 
-fn compare(value: &Value, op: &str, literal: &Value) -> Option<bool> {
+/// SQL's three-valued comparison/boolean logic — `Unknown` is what a
+/// comparison against `NULL` produces (SQL `NULL`'s own meaning is "this
+/// value is unknown", so any comparison touching it is equally unknown,
+/// never simply `True` or `False`), kept distinct from `compare`/
+/// `eval_bool_expr`'s `Option::None`, which means something entirely
+/// different: "this engine couldn't structurally evaluate the predicate
+/// at all" (an unresolvable column, an unrecognized operator). Only
+/// `None` gets the existing "give up, don't filter the row out"
+/// fail-open treatment (see `CompiledPredicate`'s docs) — `Unknown` is a
+/// real, well-defined SQL answer, and `WHERE`/`JOIN ON` both exclude a
+/// row on `Unknown` exactly like `False` (see `Tri::is_true`), never
+/// `True`'s "give up and keep it" treatment. Conflating the two used to
+/// mean `WHERE fk > 100` with `fk` actually `NULL` **included** that row
+/// — the opposite of every real database's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tri {
+    True,
+    False,
+    Unknown,
+}
+
+impl Tri {
+    /// SQL's `AND` truth table: `False` short-circuits regardless of the
+    /// other operand (even `Unknown`); otherwise `Unknown` unless both
+    /// sides are `True`.
+    fn and(self, other: Tri) -> Tri {
+        match (self, other) {
+            (Tri::False, _) | (_, Tri::False) => Tri::False,
+            (Tri::True, Tri::True) => Tri::True,
+            _ => Tri::Unknown,
+        }
+    }
+
+    /// SQL's `OR` truth table: `True` short-circuits regardless of the
+    /// other operand; otherwise `Unknown` unless both sides are `False`.
+    fn or(self, other: Tri) -> Tri {
+        match (self, other) {
+            (Tri::True, _) | (_, Tri::True) => Tri::True,
+            (Tri::False, Tri::False) => Tri::False,
+            _ => Tri::Unknown,
+        }
+    }
+
+    /// What `WHERE`/`JOIN ON` actually keep a row for — only a real
+    /// `True`. Both `False` and `Unknown` mean "exclude", the same
+    /// outcome real SQL gives a `NULL`-involving predicate.
+    fn is_true(self) -> bool {
+        matches!(self, Tri::True)
+    }
+}
+
+fn compare(value: &Value, op: &str, literal: &Value) -> Option<Tri> {
     use std::cmp::Ordering;
+
+    // NULL compared any way is SQL UNKNOWN, not "can't evaluate" -- still
+    // validate the operator so an unrecognized one stays a real
+    // structural failure (None), same as the non-NULL path below.
+    if matches!(value, Value::Null) || matches!(literal, Value::Null) {
+        return match op {
+            "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=" => Some(Tri::Unknown),
+            _ => None,
+        };
+    }
 
     let ord = match (value, literal) {
         (Value::Integer(a), Value::Integer(b)) => a.partial_cmp(b),
@@ -660,12 +727,12 @@ fn compare(value: &Value, op: &str, literal: &Value) -> Option<bool> {
     }?;
 
     Some(match op {
-        "=" => ord == Ordering::Equal,
-        "!=" | "<>" => ord != Ordering::Equal,
-        "<" => ord == Ordering::Less,
-        "<=" => ord != Ordering::Greater,
-        ">" => ord == Ordering::Greater,
-        ">=" => ord != Ordering::Less,
+        "=" => if ord == Ordering::Equal { Tri::True } else { Tri::False },
+        "!=" | "<>" => if ord != Ordering::Equal { Tri::True } else { Tri::False },
+        "<" => if ord == Ordering::Less { Tri::True } else { Tri::False },
+        "<=" => if ord != Ordering::Greater { Tri::True } else { Tri::False },
+        ">" => if ord == Ordering::Greater { Tri::True } else { Tri::False },
+        ">=" => if ord != Ordering::Less { Tri::True } else { Tri::False },
         _ => return None,
     })
 }
@@ -813,6 +880,49 @@ mod tests {
             evaluate_predicate("name = 'Bob' OR name = 'Alice'", &schema, &row(1, "Carol", 30, true)),
             Some(false)
         );
+    }
+
+    fn row_with_null_age(id: i64, name: &str, active: bool) -> Tuple {
+        Tuple { values: vec![Value::Integer(id), Value::String(name.to_string()), Value::Null, Value::Boolean(active)] }
+    }
+
+    #[test]
+    fn test_comparison_against_null_is_excluded_not_included() {
+        // SQL: `NULL > 18` is UNKNOWN, and WHERE/JOIN both exclude
+        // UNKNOWN exactly like FALSE -- Some(false), never Some(true) and
+        // never None (a structural failure, a different thing entirely:
+        // see Tri's docs). An earlier version conflated the two, so a
+        // NULL-valued row was *kept* by a WHERE clause instead of
+        // excluded -- the opposite of every real database's answer.
+        let schema = schema();
+        let bob = row_with_null_age(1, "Bob", true);
+        assert_eq!(evaluate_predicate("age > 18", &schema, &bob), Some(false));
+        assert_eq!(evaluate_predicate("age <= 18", &schema, &bob), Some(false));
+        assert_eq!(evaluate_predicate("age = 30", &schema, &bob), Some(false));
+        // `!=`/`<>` don't "catch" NULL either -- also UNKNOWN, not TRUE.
+        assert_eq!(evaluate_predicate("age != 30", &schema, &bob), Some(false));
+    }
+
+    #[test]
+    fn test_or_short_circuits_true_even_with_an_unknown_operand() {
+        // The real three-valued-logic test: `TRUE OR UNKNOWN` must be
+        // TRUE, not swallowed into "false" the way a naive "any NULL
+        // means exclude the whole predicate" implementation would get
+        // wrong. `id = 1` is TRUE; `age > 1000` is UNKNOWN (age is NULL).
+        let schema = schema();
+        let bob = row_with_null_age(1, "Bob", true);
+        assert_eq!(evaluate_predicate("id = 1 OR age > 1000", &schema, &bob), Some(true));
+    }
+
+    #[test]
+    fn test_and_with_an_unknown_operand_is_excluded_regardless_of_the_other_side() {
+        // TRUE AND UNKNOWN = UNKNOWN (excluded); FALSE AND UNKNOWN =
+        // FALSE (also excluded, via short-circuit) -- both observably
+        // Some(false) at this boundary, which is correct either way.
+        let schema = schema();
+        let bob = row_with_null_age(1, "Bob", true);
+        assert_eq!(evaluate_predicate("id = 1 AND age > 1000", &schema, &bob), Some(false));
+        assert_eq!(evaluate_predicate("id = 99 AND age > 1000", &schema, &bob), Some(false));
     }
 
     #[test]

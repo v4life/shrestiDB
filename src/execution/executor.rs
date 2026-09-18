@@ -952,8 +952,19 @@ impl QueryExecutor {
         left_cols: usize,
         right_cols: usize,
     ) -> Vec<Tuple> {
+        // A NULL join-key value never equals anything -- not even
+        // another NULL (SQL's NULL means "unknown", and two unknowns
+        // aren't known to be equal). Build-side rows with a NULL key are
+        // deliberately never inserted, so a NULL-keyed probe row (or
+        // one that coincidentally shares its hash bucket) can never find
+        // a match for either -- both stay correctly unmatched (and, for
+        // an outer join, NULL-padded by append_unmatched below) rather
+        // than spuriously matching every other NULL on the same side.
         let mut table: HashMap<JoinHashKey, Vec<usize>> = HashMap::new();
         for (i, tuple) in build.iter().enumerate() {
+            if matches!(tuple.values[build_key_idx], Value::Null) {
+                continue;
+            }
             table.entry(JoinHashKey::from_value(&tuple.values[build_key_idx])).or_default().push(i);
         }
 
@@ -963,6 +974,9 @@ impl QueryExecutor {
         let mut probe_matched = vec![false; probe.len()];
         let mut merged = Vec::new();
         for (pi, p) in probe.iter().enumerate() {
+            if matches!(p.values[probe_key_idx], Value::Null) {
+                continue;
+            }
             let Some(indices) = table.get(&JoinHashKey::from_value(&p.values[probe_key_idx])) else {
                 continue;
             };
@@ -2352,6 +2366,78 @@ mod tests {
             rows[0],
             vec!["1".to_string(), "10".to_string(), "1".to_string(), "100".to_string(), "1".to_string(), "1000".to_string()]
         );
+    }
+
+    #[test]
+    fn test_where_excludes_null_comparisons_instead_of_including_them() {
+        // SQL: `NULL > 100` is UNKNOWN, and WHERE excludes UNKNOWN same
+        // as FALSE. An earlier version's Filter arm treated the
+        // "couldn't evaluate" fallback (.unwrap_or(true)) as covering
+        // this too, so a NULL-valued row was *kept* instead of excluded.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, fk INT)").unwrap();
+        executor.execute_sql("INSERT INTO t (id, fk) VALUES (1, NULL)").unwrap();
+        executor.execute_sql("INSERT INTO t (id, fk) VALUES (2, 5)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM t WHERE fk > 100").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_nested_loop_join_null_key_matches_nothing_not_everything() {
+        // Non-equality condition forces the nested-loop path (eval_split,
+        // not the hash-join's separate JoinHashKey mechanism). a.fk is
+        // NULL, so `a.fk < c.fk` is UNKNOWN for every c row -- must match
+        // none of them, not (the old, broken behavior) every one of them.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, fk INT)").unwrap();
+        executor.execute_sql("CREATE TABLE c (id INT PRIMARY KEY, fk INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, fk) VALUES (1, NULL)").unwrap();
+        executor.execute_sql("INSERT INTO c (id, fk) VALUES (50, 5)").unwrap();
+        executor.execute_sql("INSERT INTO c (id, fk) VALUES (51, 999)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a JOIN c ON a.fk < c.fk").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_hash_join_null_key_never_matches_another_null() {
+        // The hash-join path doesn't go through row_codec::compare at
+        // all -- it hashes join-key values directly (JoinHashKey), which
+        // treated Value::Null as an ordinary, matchable key equal to
+        // itself. Two independent NULLs on the join column spuriously
+        // matched each other, even though real SQL NULL never equals
+        // NULL. Reachable in practice via a chained LEFT JOIN's own
+        // NULL-padding flowing into a further equi-join, exercised here
+        // directly instead.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, fk INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, fk INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, fk) VALUES (1, NULL)").unwrap();
+        executor.execute_sql("INSERT INTO b (id, fk) VALUES (10, NULL)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a JOIN b ON a.fk = b.fk").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_left_join_null_padded_row_correctly_stays_unmatched_in_a_later_join() {
+        // The exact chained scenario the bug was found in: a LEFT JOIN's
+        // own NULL-padding (b.a_id is NULL for every a-row, since b is
+        // empty) must not spuriously match a third table's NULL-valued
+        // row on a later join.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, fk INT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, a_id INT)").unwrap();
+        executor.execute_sql("CREATE TABLE c (id INT PRIMARY KEY, fk INT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, fk) VALUES (1, 100)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, fk) VALUES (2, 200)").unwrap();
+        executor.execute_sql("INSERT INTO c (id, fk) VALUES (50, NULL)").unwrap();
+
+        let rows = executor
+            .execute_sql("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id JOIN c ON b.a_id = c.fk")
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
