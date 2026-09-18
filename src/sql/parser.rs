@@ -101,6 +101,12 @@ pub enum JoinKind {
 /// SELECT statement
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectStatement {
+    /// Whether `SELECT DISTINCT` was written (as opposed to plain `SELECT`).
+    /// `DISTINCT ON (...)` (Postgres-specific column-subset distinct)
+    /// isn't recognized and comes through as plain `distinct: true` with
+    /// the `ON` list silently unavailable -- same "not recognized" scope
+    /// limit as `GROUP BY ALL` on `group_by`, not a distinct bug of its own.
+    pub distinct: bool,
     /// Column expressions as written, or `["*"]` for `SELECT *`.
     pub columns: Vec<String>,
     pub from: String,
@@ -231,6 +237,13 @@ impl SQLParser {
             }
         };
 
+        // `ALL` (the explicit "keep duplicates" form, and also what's
+        // implied by omitting the keyword entirely) must not trigger
+        // dedup -- only `DISTINCT`, and `DISTINCT ON (...)`, which this
+        // parser recognizes but doesn't yet act on the column subset for
+        // (see the field's docs).
+        let distinct = matches!(select.distinct, Some(ast::Distinct::Distinct) | Some(ast::Distinct::On(_)));
+
         let columns = select
             .projection
             .iter()
@@ -278,6 +291,7 @@ impl SQLParser {
         let limit = query.limit_clause.as_ref().and_then(Self::extract_limit);
 
         Ok(SQLStatement::Select(SelectStatement {
+            distinct,
             columns,
             from,
             from_alias,
@@ -551,6 +565,33 @@ mod tests {
         let stmt = SQLParser::parse(sql).unwrap();
         match stmt {
             SQLStatement::Select(s) => assert!(s.having.is_none()),
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_distinct() {
+        let stmt = SQLParser::parse("SELECT DISTINCT user_id FROM orders").unwrap();
+        match stmt {
+            SQLStatement::Select(s) => assert!(s.distinct),
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_plain_select_is_not_distinct() {
+        let stmt = SQLParser::parse("SELECT user_id FROM orders").unwrap();
+        match stmt {
+            SQLStatement::Select(s) => assert!(!s.distinct),
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_all_is_not_distinct() {
+        let stmt = SQLParser::parse("SELECT ALL user_id FROM orders").unwrap();
+        match stmt {
+            SQLStatement::Select(s) => assert!(!s.distinct),
             _ => panic!("Expected SELECT statement"),
         }
     }

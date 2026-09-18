@@ -147,9 +147,19 @@ pub enum LogicalPlanNode {
         keys: Vec<(String, bool)>,
         rows: usize,
     },
+    /// `SELECT DISTINCT` — same story again: `select.distinct` was parsed
+    /// from `sqlparser`'s AST and then never stored on `SelectStatement`
+    /// at all, so `SELECT DISTINCT user_id FROM orders` returned every
+    /// row, duplicates included, identical to plain `SELECT`. Placed
+    /// after `Project` (or after `Sort` when there's no `Project` node,
+    /// i.e. `SELECT DISTINCT *`) so it dedups the query's actual final
+    /// row shape, not a wider pre-projection one — two rows that only
+    /// differ in a column `SELECT` doesn't return must still collapse to
+    /// one. Placed before `Limit`, so `LIMIT` caps the deduplicated set.
+    Distinct { rows: usize },
     /// `LIMIT <n>` — same story as `Sort`: parsed into `select.limit` and
     /// then silently ignored everywhere. Always the last node in a plan
-    /// when present, so it caps whatever `Sort`/`Project`/`Aggregate`
+    /// when present, so it caps whatever `Sort`/`Project`/`Aggregate`/`Distinct`
     /// already produced rather than racing them.
     Limit { limit: usize, rows: usize },
 }
@@ -377,7 +387,16 @@ impl QueryPlanner {
             nodes.push(LogicalPlanNode::Project { columns: select.columns.clone(), rows });
         }
 
-        // LIMIT: always last -- caps whatever Sort/Project/Aggregate
+        if select.distinct {
+            // No real cardinality data on how many rows collapse -- rows
+            // carries through unchanged, an intentional overestimate
+            // (same "don't invent a number nothing backs" stance as
+            // ORDER BY's rows pass-through above) rather than a guessed
+            // reduction.
+            nodes.push(LogicalPlanNode::Distinct { rows });
+        }
+
+        // LIMIT: always last -- caps whatever Sort/Project/Aggregate/Distinct
         // already produced rather than racing any of them.
         if let Some(limit) = select.limit {
             rows = rows.min(limit);
@@ -412,6 +431,7 @@ impl QueryPlanner {
                     LogicalPlanNode::Aggregate { rows, .. } => (OperatorType::Aggregate, *rows),
                     LogicalPlanNode::Project { rows, .. } => (OperatorType::Filter, *rows),
                     LogicalPlanNode::Sort { rows, .. } => (OperatorType::Sort, *rows),
+                    LogicalPlanNode::Distinct { rows, .. } => (OperatorType::Aggregate, *rows),
                     LogicalPlanNode::Limit { rows, .. } => (OperatorType::Limit, *rows),
                 };
                 let cost = OperatorCost::new(
@@ -636,6 +656,20 @@ mod tests {
         let planner = QueryPlanner::new();
         let err = planner.plan("SELECT * FROM users HAVING age > 18");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_plan_emits_distinct_node_for_select_distinct() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT DISTINCT user_id FROM orders").unwrap();
+        assert!(plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Distinct { .. })));
+    }
+
+    #[test]
+    fn test_plan_omits_distinct_node_for_plain_select() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT user_id FROM orders").unwrap();
+        assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Distinct { .. })));
     }
 
     #[test]

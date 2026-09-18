@@ -753,6 +753,30 @@ impl QueryExecutor {
                     });
                     current = Some((schema, tuples));
                 }
+                LogicalPlanNode::Distinct { .. } => {
+                    let (schema, tuples) = current
+                        .take()
+                        .ok_or_else(|| DatabaseError::ExecutionError("Distinct with no input".to_string()))?;
+
+                    // Order-preserving: keeps the first occurrence of each
+                    // distinct row, so a Sort that already ran (Distinct
+                    // is always placed after it -- see this node's docs)
+                    // stays honored rather than scrambled by a HashSet's
+                    // iteration order. Value doesn't implement Eq/Hash on
+                    // its own (Float(f64) can't) -- JoinHashKey already
+                    // solves exactly this for a single join column; here
+                    // it's reused per-value and collected into a Vec to
+                    // key a whole row instead of one column.
+                    let mut seen: std::collections::HashSet<Vec<JoinHashKey>> = std::collections::HashSet::new();
+                    let deduped: Vec<Tuple> = tuples
+                        .into_iter()
+                        .filter(|t| {
+                            let key: Vec<JoinHashKey> = t.values.iter().map(JoinHashKey::from_value).collect();
+                            seen.insert(key)
+                        })
+                        .collect();
+                    current = Some((schema, deduped));
+                }
                 LogicalPlanNode::Limit { limit, .. } => {
                     let (schema, mut tuples) = current
                         .take()
@@ -3111,6 +3135,53 @@ mod tests {
         assert_eq!(user1_row[1], "2");
         let user2_row = rows.iter().find(|r| r[0] == "2").unwrap();
         assert_eq!(user2_row[1], "1");
+    }
+
+    #[test]
+    fn test_select_distinct_removes_duplicate_rows() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor); // user_id: 1, 1, 2 -- one duplicate
+
+        let rows = executor.execute_sql("SELECT DISTINCT user_id FROM orders").unwrap();
+        let mut ids: Vec<&String> = rows.iter().map(|r| &r[0]).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn test_select_all_does_not_deduplicate() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        // The explicit opposite of DISTINCT -- must keep every row,
+        // duplicates included.
+        let rows = executor.execute_sql("SELECT ALL user_id FROM orders").unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_select_distinct_star_dedups_on_full_row() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        // No Project node for `SELECT *` -- Distinct must still work
+        // directly against whatever's current at that point in the plan.
+        // Every row's primary key differs here, so nothing actually
+        // collapses; this asserts DISTINCT * doesn't error or drop rows
+        // it shouldn't.
+        let rows = executor.execute_sql("SELECT DISTINCT * FROM orders").unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_select_distinct_preserves_order_by_result() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+
+        let rows = executor
+            .execute_sql("SELECT DISTINCT user_id FROM orders ORDER BY user_id DESC")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["2".to_string()], vec!["1".to_string()]]);
     }
 
     #[test]
