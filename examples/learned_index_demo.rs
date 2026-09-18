@@ -107,8 +107,18 @@ fn main() {
     }
 
     println!("\n=== Key Insights ===");
-    println!("1. PGM builds faster than B-Tree for large datasets");
-    println!("2. PGM lookups are significantly faster on sorted data");
-    println!("3. Space efficiency improves with PGM at larger scales");
-    println!("4. Learned models adapt to data distribution");
+    println!("1. Build time: PGM/RMI build roughly 10x faster than B-Tree at every size tested,");
+    println!("   real and consistent -- not scale-dependent the way lookup speedup is.");
+    println!("2. Lookup speed is scale-dependent, not a flat win: at 10K-100K records PGM is");
+    println!("   actually SLOWER than this codebase's real (splitting) B+Tree -- a few segments'");
+    println!("   worth of prediction+bounded-search overhead isn't worth it yet at that size.");
+    println!("   The crossover happens as data grows; only RMI (a single global linear model,");
+    println!("   cheaper per lookup than PGM's segment search) wins at every size tested here.");
+    println!("3. Memory footprint (not measured by this demo -- see `cargo test");
+    println!("   test_pgm_heap_bytes_grows_with_key_count`/`examples/memory_footprint.rs` for the");
+    println!("   real numbers): PGM stays a consistent ~4x smaller than this B+Tree regardless of");
+    println!("   scale, even under a realistic non-linear key distribution, not just the");
+    println!("   perfectly-sequential best case.");
+    println!("4. Learned models adapt to data distribution -- segment count above tracks how");
+    println!("   non-linear the actual key distribution is, not a fixed schedule.");
 }

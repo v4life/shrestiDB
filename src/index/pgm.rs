@@ -247,6 +247,23 @@ impl PGMIndex {
         results
     }
 
+    /// Real allocated heap memory this index occupies: each `Vec`'s
+    /// allocated *capacity* (not `len` -- capacity is what's actually
+    /// resident) times its element size. `PGMSegment` stores a `LinearModel`
+    /// (2 `f64`s) plus two more `f64`s and two `usize`s per segment,
+    /// regardless of how many keys that segment covers -- the actual
+    /// mechanism behind PGM's real memory advantage over a B-Tree: a run of
+    /// N keys that fits one linear model within `error_bound` costs one
+    /// fixed-size segment no matter how large N is, where a B-Tree's node
+    /// count scales with N directly. Mirrored by
+    /// `index::btree::BTree::heap_bytes`/`index::rmi::RMIIndex::heap_bytes`
+    /// so the three are directly, consistently comparable.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<PGMIndex>()
+            + self.segments.capacity() * std::mem::size_of::<PGMSegment>()
+            + self.keys.capacity() * std::mem::size_of::<f64>()
+    }
+
     /// Insert a key and rebuild index
     pub fn insert_with_rebuild(&mut self, key: f64) {
         let insert_idx = match self.keys.binary_search_by(|k| k.partial_cmp(&key).unwrap()) {
@@ -376,6 +393,20 @@ impl DynamicPGMIndex {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Real allocated heap memory: the base `PGMIndex` (`base.heap_bytes()`
+    /// already counts `base`'s own struct size, so it isn't repeated here)
+    /// plus this struct's two `usize` fields and the write buffer's
+    /// allocated capacity. The write buffer holds raw `f64` keys (no
+    /// segments yet -- it's flushed and re-fit into `base` at
+    /// `buffer_capacity`), so a dynamic index with a large pending buffer
+    /// will (correctly) look less space-efficient than its base alone
+    /// until the next flush.
+    pub fn heap_bytes(&self) -> usize {
+        self.base.heap_bytes()
+            + std::mem::size_of::<usize>() * 2 // buffer_capacity, error_bound
+            + self.write_buffer.capacity() * std::mem::size_of::<f64>()
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +524,30 @@ mod tests {
 
         let res = dpgm.range_search(4.0, 16.0);
         assert_eq!(res, vec![5.0, 10.0, 15.0]);
+    }
+
+    #[test]
+    fn test_pgm_heap_bytes_grows_with_key_count() {
+        let small = PGMIndex::build(vec![1.0, 2.0, 3.0], 4);
+        let big = PGMIndex::build((0..100_000).map(|i| i as f64).collect(), 4);
+        assert!(big.heap_bytes() > small.heap_bytes());
+    }
+
+    #[test]
+    fn test_pgm_heap_bytes_far_smaller_than_one_segment_per_key() {
+        // The actual mechanism behind PGM's real memory advantage: a long
+        // run of keys that fits one linear model costs one fixed-size
+        // segment, not one entry per key. A perfectly linear sequence
+        // (build() keeps extending one segment indefinitely as long as
+        // every point stays within error_bound of the fitted line) should
+        // collapse to a small, roughly constant number of segments
+        // regardless of how many keys go in.
+        let pgm = PGMIndex::build((0..1_000_000).map(|i| i as f64).collect(), 4);
+        assert!(
+            pgm.segments.len() < 100,
+            "a perfectly linear 1M-key sequence should need well under 100 segments, got {}",
+            pgm.segments.len()
+        );
     }
 }
 

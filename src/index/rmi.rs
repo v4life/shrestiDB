@@ -75,6 +75,21 @@ impl RMIIndex {
             .ok()
             .map(|offset| start + offset)
     }
+
+    /// Real allocated heap memory -- see `index::pgm::PGMIndex::heap_bytes`
+    /// for the accounting method this mirrors. Unlike `PGMIndex`, this
+    /// keeps a full `positions: Vec<usize>` alongside `keys` (one `usize`
+    /// per key, not per segment) -- a real, structural reason this
+    /// construction of RMI won't show the same per-key memory advantage
+    /// PGM's implicit array-index encoding gets, regardless of how
+    /// accurate either one's predictions are.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<RMIIndex>()
+            + self.stages.capacity() * std::mem::size_of::<RMIStage>()
+            + self.stages.iter().map(|s| s.models.capacity() * std::mem::size_of::<LinearModel>()).sum::<usize>()
+            + self.keys.capacity() * std::mem::size_of::<f64>()
+            + self.positions.capacity() * std::mem::size_of::<usize>()
+    }
 }
 
 #[cfg(test)]
@@ -100,5 +115,15 @@ mod tests {
         let rmi = RMIIndex::new(vec![stage], keys, positions);
         let predicted = rmi.search(3.0);
         assert!(predicted < 5);
+    }
+
+    #[test]
+    fn test_rmi_heap_bytes_grows_with_key_count() {
+        let small = RMIIndex::new(vec![RMIStage::new(vec![LinearModel::new(1.0, 0.0)])], vec![1.0], vec![0]);
+        let n = 100_000;
+        let keys: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let positions: Vec<usize> = (0..n).collect();
+        let big = RMIIndex::new(vec![RMIStage::new(vec![LinearModel::new(1.0, 0.0)])], keys, positions);
+        assert!(big.heap_bytes() > small.heap_bytes());
     }
 }
