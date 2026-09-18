@@ -57,6 +57,17 @@ pub enum LogicalPlanNode {
     },
     Filter {
         predicate: String,
+        /// `predicate` pre-split into `(left, op, right)` — see
+        /// `row_codec::split_comparison` — when it's a single comparison;
+        /// `None` for a compound `AND`/`OR` predicate, or anything else
+        /// `split_comparison` can't reduce to one triple. Computed once,
+        /// here, at plan time (itself just one tokenize, reused for the
+        /// life of a prepared statement) so neither
+        /// `QueryExecutor::execute_prepared`'s parameter substitution nor
+        /// `execute`'s indexed-scan eligibility check has to re-tokenize
+        /// this same string from scratch on every single execution — see
+        /// both call sites.
+        split: Option<(String, String, String)>,
         rows: usize,
     },
     Join {
@@ -231,15 +242,22 @@ impl QueryPlanner {
         }
 
         if let Some(predicate) = select.where_clause.clone() {
+            // Split once, reused two ways below: the cardinality estimate
+            // (when applicable) and the Filter node's own `split` field
+            // (see that field's docs for why -- avoiding a second
+            // tokenize of this same string at execute time, on every
+            // single prepared-statement execution).
+            let split = row_codec::split_comparison(&predicate);
+
             // A real, data-driven estimate only when the filter is a
-            // single <column> <op> <literal> comparison (see
-            // row_codec::split_comparison) against a table nothing has
-            // been JOINed to yet (a post-join filter's columns live in a
-            // merged, qualified schema this planner doesn't resolve) and
-            // a distribution is on record for that exact column. Every
-            // other shape keeps the fixed default it always used.
+            // single <column> <op> <literal> comparison against a table
+            // nothing has been JOINed to yet (a post-join filter's
+            // columns live in a merged, qualified schema this planner
+            // doesn't resolve) and a distribution is on record for that
+            // exact column. Every other shape keeps the fixed default it
+            // always used.
             let real_estimate = if select.joins.is_empty() {
-                row_codec::split_comparison(&predicate).and_then(|(left, op, right)| {
+                split.clone().and_then(|(left, op, right)| {
                     let dist = stats.get(&(select.from.clone(), left))?;
                     let value = literal_for_distribution(&right, dist)?;
                     dist.estimate_row_count(&op, &value, rows)
@@ -248,7 +266,7 @@ impl QueryPlanner {
                 None
             };
             rows = real_estimate.unwrap_or_else(|| (rows as f64 * Self::DEFAULT_FILTER_SELECTIVITY) as usize);
-            nodes.push(LogicalPlanNode::Filter { predicate, rows });
+            nodes.push(LogicalPlanNode::Filter { predicate, split, rows });
         }
 
         // Treat this as an aggregate query when every projected column is

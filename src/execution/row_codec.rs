@@ -158,31 +158,45 @@ pub fn substitute_placeholders(field: &str, params: &[Value], next_positional: &
     let tokens = tokenize_expr(field);
     let mut out = Vec::with_capacity(tokens.len());
     for token in tokens {
-        match placeholder_kind(&token) {
-            Some(PlaceholderKind::Positional) => {
-                let value = params.get(*next_positional).ok_or_else(|| {
-                    DatabaseError::ExecutionError(format!(
-                        "prepared statement expects at least {} parameter(s), got {}",
-                        *next_positional + 1,
-                        params.len()
-                    ))
-                })?;
-                out.push(literal_repr(value));
-                *next_positional += 1;
-            }
-            Some(PlaceholderKind::Indexed(n)) => {
-                let value = params.get(n - 1).ok_or_else(|| {
-                    DatabaseError::ExecutionError(format!(
-                        "prepared statement references ${n} but only {} parameter(s) were given",
-                        params.len()
-                    ))
-                })?;
-                out.push(literal_repr(value));
-            }
-            None => out.push(token),
-        }
+        out.push(substitute_token(&token, params, next_positional)?);
     }
     Ok(out.join(" "))
+}
+
+/// The single-token version of `substitute_placeholders` — for a caller
+/// that already knows a field is exactly one token (most usefully,
+/// `split_comparison`'s `(left, op, right)`, see
+/// `QueryExecutor::execute_prepared`'s `Filter` case), so there's nothing
+/// left to tokenize: `token` is either a placeholder (substituted) or a
+/// literal/column name already (passed through unchanged). Skipping
+/// `tokenize_expr` entirely here is the point — it's the same
+/// char-by-char scan `substitute_placeholders` just did on this same
+/// text, redundant work `execute_prepared` used to pay for on every
+/// single prepared-statement execution, not just once at `prepare` time.
+pub fn substitute_token(token: &str, params: &[Value], next_positional: &mut usize) -> Result<String> {
+    match placeholder_kind(token) {
+        Some(PlaceholderKind::Positional) => {
+            let value = params.get(*next_positional).ok_or_else(|| {
+                DatabaseError::ExecutionError(format!(
+                    "prepared statement expects at least {} parameter(s), got {}",
+                    *next_positional + 1,
+                    params.len()
+                ))
+            })?;
+            *next_positional += 1;
+            Ok(literal_repr(value))
+        }
+        Some(PlaceholderKind::Indexed(n)) => {
+            let value = params.get(n - 1).ok_or_else(|| {
+                DatabaseError::ExecutionError(format!(
+                    "prepared statement references ${n} but only {} parameter(s) were given",
+                    params.len()
+                ))
+            })?;
+            Ok(literal_repr(value))
+        }
+        None => Ok(token.to_string()),
+    }
 }
 
 /// An `UPDATE ... SET` assignment's right-hand side, compiled once so it
@@ -1119,5 +1133,45 @@ mod tests {
         let mut next = 0;
         let params = vec![Value::Integer(18)];
         assert!(substitute_placeholders("age > ? AND name = ?", &params, &mut next).is_err());
+    }
+
+    #[test]
+    fn test_substitute_token_matches_substitute_placeholders_token_by_token() {
+        // substitute_token is substitute_placeholders' per-token step,
+        // pulled out so a caller that already knows a field is exactly
+        // one token (split_comparison's (left, op, right)) can substitute
+        // without tokenizing at all -- see QueryExecutor::execute_prepared's
+        // Filter case. Applying it to each of "id = ?"'s own tokens must
+        // give the same result substitute_placeholders gives the whole
+        // string, just without the redundant re-tokenize.
+        let params = vec![Value::Integer(42)];
+
+        let mut next_a = 0;
+        let whole = substitute_placeholders("id = ?", &params, &mut next_a).unwrap();
+
+        let mut next_b = 0;
+        let left = substitute_token("id", &params, &mut next_b).unwrap();
+        let op = substitute_token("=", &params, &mut next_b).unwrap();
+        let right = substitute_token("?", &params, &mut next_b).unwrap();
+
+        assert_eq!(whole, format!("{left} {op} {right}"));
+        assert_eq!(next_a, next_b);
+    }
+
+    #[test]
+    fn test_substitute_token_indexed_placeholder() {
+        let params = vec![Value::Integer(18), Value::String("Bob".to_string())];
+        let mut next = 0;
+        assert_eq!(substitute_token("$2", &params, &mut next).unwrap(), "'Bob'");
+        // $N never advances the positional counter -- same rule
+        // substitute_placeholders itself follows.
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn test_substitute_token_non_placeholder_passes_through_unchanged() {
+        let mut next = 0;
+        assert_eq!(substitute_token("id", &[], &mut next).unwrap(), "id");
+        assert_eq!(next, 0);
     }
 }

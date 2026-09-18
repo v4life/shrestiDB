@@ -276,8 +276,21 @@ impl QueryExecutor {
                 let mut bound_plan = plan.clone();
                 for node in &mut bound_plan.nodes {
                     match node {
-                        LogicalPlanNode::Filter { predicate, .. } => {
-                            *predicate = row_codec::substitute_placeholders(predicate, params, &mut next)?;
+                        LogicalPlanNode::Filter { predicate, split, .. } => {
+                            // When the predicate was already split at
+                            // plan time (a single comparison -- see
+                            // LogicalPlanNode::Filter::split's docs),
+                            // substitute each token directly instead of
+                            // re-tokenizing the whole string: the shape
+                            // is already known, so there's nothing left
+                            // to parse, only values to fill in.
+                            if let Some((left, op, right)) = split {
+                                *left = row_codec::substitute_token(left, params, &mut next)?;
+                                *right = row_codec::substitute_token(right, params, &mut next)?;
+                                *predicate = format!("{left} {op} {right}");
+                            } else {
+                                *predicate = row_codec::substitute_placeholders(predicate, params, &mut next)?;
+                            }
                         }
                         LogicalPlanNode::Join { condition: Some(cond), .. } => {
                             *cond = row_codec::substitute_placeholders(cond, params, &mut next)?;
@@ -415,8 +428,16 @@ impl QueryExecutor {
         while let Some(node) = nodes.next() {
             match node {
                 LogicalPlanNode::Scan { table_name, alias, .. } => {
-                    if let Some(LogicalPlanNode::Filter { predicate, .. }) = nodes.peek() {
-                        if let Some(indexed) = self.try_indexed_scan(table_name, predicate)? {
+                    if let Some(LogicalPlanNode::Filter { predicate, split, .. }) = nodes.peek() {
+                        // Reuse the plan-time split when available --
+                        // avoids re-tokenizing `predicate` a second time
+                        // here on top of whatever already produced it
+                        // (see LogicalPlanNode::Filter::split's docs).
+                        let indexed = match split {
+                            Some((left, op, right)) => self.try_indexed_scan_split(table_name, left, op, right)?,
+                            None => self.try_indexed_scan(table_name, predicate)?,
+                        };
+                        if let Some(indexed) = indexed {
                             nodes.next(); // the Filter is already applied by the index lookup
                             current = Some(indexed);
                             current_qualifier = Some(alias.clone().unwrap_or_else(|| table_name.clone()));
@@ -645,18 +666,40 @@ impl QueryExecutor {
     /// decides visibility. `Ok(None)` for anything not shaped this way
     /// (non-PK column, `!=`, an unparseable predicate, ...): the caller
     /// falls back to a full scan, which is always correct, just slower.
+    ///
+    /// Thin wrapper around `try_indexed_scan_split` for a caller that only
+    /// has the flattened predicate string, not an already-split one (see
+    /// that function's docs for why a caller would ever have one).
     fn try_indexed_scan(&self, table_name: &str, predicate: &str) -> Result<Option<(TableSchema, Vec<Tuple>)>> {
-        let schema = self.catalog.read().get_table(table_name).cloned().ok_or_else(|| {
-            DatabaseError::ExecutionError(format!("Unknown table '{table_name}'"))
-        })?;
         let Some((left, op, right)) = row_codec::split_comparison(predicate) else {
             return Ok(None);
         };
+        self.try_indexed_scan_split(table_name, &left, &op, &right)
+    }
 
-        if let Some(result) = self.try_pk_index_scan(&schema, &left, &op, &right)? {
-            return Ok(Some(result));
+    /// Same as `try_indexed_scan`, but for a caller that already has
+    /// `predicate` split into `(left, op, right)` — `execute`'s `Scan`
+    /// arm, when the following `Filter` node's plan-time `split` (see
+    /// `LogicalPlanNode::Filter::split`) is available, so it doesn't have
+    /// to tokenize the same string `try_indexed_scan` would otherwise
+    /// tokenize all over again.
+    fn try_indexed_scan_split(
+        &self,
+        table_name: &str,
+        left: &str,
+        op: &str,
+        right: &str,
+    ) -> Result<Option<(TableSchema, Vec<Tuple>)>> {
+        let schema = self.catalog.read().get_table(table_name).cloned().ok_or_else(|| {
+            DatabaseError::ExecutionError(format!("Unknown table '{table_name}'"))
+        })?;
+
+        if let Some(tuples) = self.try_pk_index_scan(&schema, left, op, right)? {
+            return Ok(Some((schema, tuples)));
         }
-        self.try_secondary_index_scan(&schema, &left, &op, &right, predicate)
+        let full_predicate = format!("{left} {op} {right}");
+        let tuples = self.try_secondary_index_scan(&schema, left, op, right, &full_predicate)?;
+        Ok(tuples.map(|tuples| (schema, tuples)))
     }
 
     /// Primary-key path: uses `MVCCTable::index_range` (the learned PGM
@@ -665,13 +708,14 @@ impl QueryExecutor {
     /// candidates against the predicate is needed here: a row's PK can
     /// never change (`execute_update` rejects that), so a candidate row id
     /// in `[min, max]` is definitionally correct, not just probably so.
-    fn try_pk_index_scan(
-        &self,
-        schema: &TableSchema,
-        left: &str,
-        op: &str,
-        right: &str,
-    ) -> Result<Option<(TableSchema, Vec<Tuple>)>> {
+    ///
+    /// Returns just the matching tuples, not `schema` alongside them —
+    /// `schema` is only ever read here, never needed back: the caller
+    /// (`try_indexed_scan_split`) already owns it and pairs it with
+    /// whichever path actually produced tuples itself, rather than this
+    /// function cloning its own copy just to hand back what the caller
+    /// already had.
+    fn try_pk_index_scan(&self, schema: &TableSchema, left: &str, op: &str, right: &str) -> Result<Option<Vec<Tuple>>> {
         let Some(pk_col) = schema.columns.iter().find(|c| c.primary_key) else {
             return Ok(None);
         };
@@ -699,7 +743,7 @@ impl QueryExecutor {
         let table_id = schema.table_id as u64;
         let candidates = match self.oltp.store.get_table(table_id) {
             Some(table) => table.index_range(min, max),
-            None => return Ok(Some((schema.clone(), Vec::new()))), // registered but never written to
+            None => return Ok(Some(Vec::new())), // registered but never written to
         };
         let candidates: std::collections::HashSet<u64> = candidates.into_iter().collect();
 
@@ -711,7 +755,7 @@ impl QueryExecutor {
                 .collect::<Vec<_>>()
         });
 
-        Ok(Some((schema.clone(), tuples)))
+        Ok(Some(tuples))
     }
 
     /// Secondary-index path: uses a `SecondaryIndex` registered via
@@ -723,6 +767,9 @@ impl QueryExecutor {
     /// Every candidate is therefore re-checked with the exact predicate
     /// before being included, not just assumed correct because the index
     /// produced it.
+    ///
+    /// Returns just the matching tuples, not `schema` -- see
+    /// `try_pk_index_scan`'s docs for why.
     fn try_secondary_index_scan(
         &self,
         schema: &TableSchema,
@@ -730,7 +777,7 @@ impl QueryExecutor {
         op: &str,
         right: &str,
         full_predicate: &str,
-    ) -> Result<Option<(TableSchema, Vec<Tuple>)>> {
+    ) -> Result<Option<Vec<Tuple>>> {
         let table_id = schema.table_id as u64;
         let candidates = {
             let indexes = self.secondary_indexes.read();
@@ -763,7 +810,7 @@ impl QueryExecutor {
                 .collect::<Vec<_>>()
         });
 
-        Ok(Some((schema.clone(), tuples)))
+        Ok(Some(tuples))
     }
 
     /// A column's own name, stripping any `"qualifier."` prefix a prior
@@ -1708,6 +1755,35 @@ mod tests {
         // not baked in from the first execution.
         let rows = executor.execute_prepared(&stmt, &[Value::Integer(10)]).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_prepared_select_pk_lookup_uses_indexed_scan_and_rebinds_correctly() {
+        // WHERE id = ? (id is the primary key) exercises the full
+        // optimized path together: execute_prepared substitutes the
+        // Filter's plan-time split (LogicalPlanNode::Filter::split)
+        // directly instead of re-tokenizing, and execute's Scan arm
+        // reuses that same split to reach try_indexed_scan_split without
+        // tokenizing the rebuilt predicate string a second time either.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // id 1 = Alice, id 2 = Bob
+
+        let stmt = executor.prepare("SELECT * FROM users WHERE id = ?").unwrap();
+
+        let rows = executor.execute_prepared(&stmt, &[Value::Integer(1)]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Alice".to_string()));
+
+        // Re-execute with a different bound value -- proves the cached,
+        // already-split plan node is substituted fresh each call, not
+        // reused stale from the first execution.
+        let rows = executor.execute_prepared(&stmt, &[Value::Integer(2)]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Bob".to_string()));
+
+        // No match: empty, not an error -- same as the non-prepared path.
+        let rows = executor.execute_prepared(&stmt, &[Value::Integer(999)]).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]

@@ -46,9 +46,11 @@ where a fixed-constant heuristic was off by **10x** (see
 That 36.8x lookup number is a real, component-level win, not yet an
 end-to-end one: tested through the full SQL path against SQLite at the
 same 1M-row scale (many point lookups, the scenario built to give it
-the best chance), ShrestiDB is **5.71x slower**, not faster — real
-per-statement overhead around the index currently swallows what the
-search itself saves (see [Point Lookup Latency vs
+the best chance), ShrestiDB is **4.54x slower**, not faster — real
+per-statement overhead around the index (down from 5.71x after removing
+a redundant re-tokenization and an unnecessary schema clone found by
+profiling the gap) still swallows what the search itself saves (see
+[Point Lookup Latency vs
 SQLite](#point-lookup-latency-vs-sqlite-does-the-index-speedup-survive-the-full-sql-path)).
 Reported here because a real negative result is still a real result.
 An earlier version of this table quoted round marketing-style figures
@@ -487,10 +489,10 @@ materializing a large result:
 
 | | Total (20K lookups) | Per lookup |
 |---|---|---|
-| SQLite | 22.05ms | 1.10µs |
-| ShrestiDB | 125.93ms | 6.30µs |
+| SQLite | 21.29ms | 1.06µs |
+| ShrestiDB | 96.65ms | 4.83µs |
 
-**ShrestiDB is 5.71x slower, not faster.** The component-level 36.8x
+**ShrestiDB is 4.54x slower, not faster.** The component-level 36.8x
 lookup advantage over this codebase's own B-Tree is real (see [Index
 Build Performance](#index-build-performance)) — but it doesn't survive
 the full SQL execution path: real per-statement overhead (a
@@ -503,6 +505,26 @@ win in isolation, but this engine doesn't yet have a scenario where a
 user would actually experience it as "faster than SQLite" end to end —
 that requires shrinking the fixed per-query overhead around the index,
 not a faster index.
+
+**Profiled and partially closed.** A stage-by-stage breakdown (each
+stage timed by calling the real internal code directly) showed the
+index search itself is only ~10% of total lookup time — never the
+bottleneck. The two largest identified costs were a redundant
+re-tokenization of the same predicate string (`execute_prepared`
+substituting `"id = ?"` into `"id = 1234"`, then `execute`'s indexed-scan
+check re-parsing that same string right back apart — ~26% combined) and
+an unnecessary `TableSchema` clone on every lookup inside the index-scan
+path (its caller already owned one). Both are fixed: the query planner
+now splits a single-comparison predicate into `(left, op, right)` once,
+at plan time (`LogicalPlanNode::Filter::split`), reused by both
+parameter substitution and the indexed-scan check instead of each
+re-tokenizing it independently; the schema clone was simply redundant
+and removed. Real result: **6.30µs → 4.83µs per lookup (a 23%
+reduction)**, moving the SQLite gap from 5.71x to 4.54x. Still slower,
+not yet a win — the remaining cost is spread across smaller items
+(`Vec<u8>` cloning on every row read, `PhysicalPlan` cloning per
+execution, general dispatch overhead) with no single dominant target
+left to fix.
 
 ### Real Cardinality Estimation (vs. a fixed constant)
 Real numbers from [`examples/cardinality_demo.rs`](examples/cardinality_demo.rs)
