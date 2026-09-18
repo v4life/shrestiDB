@@ -661,6 +661,51 @@ impl QueryExecutor {
                         .collect();
                     current = Some((projected_schema, projected_tuples));
                 }
+                LogicalPlanNode::Sort { keys, .. } => {
+                    let (schema, mut tuples) = current
+                        .take()
+                        .ok_or_else(|| DatabaseError::ExecutionError("Sort with no input".to_string()))?;
+
+                    // Resolved once, like Project -- an ORDER BY column
+                    // that doesn't exist fails the whole statement rather
+                    // than being silently skipped mid-sort. Ordering by an
+                    // aggregate expression itself (ORDER BY COUNT(*)) hits
+                    // this same error: Aggregate's output schema isn't
+                    // (yet) renamed to its own result columns, only a
+                    // GROUP BY key's name survives unchanged from the
+                    // pre-aggregation schema -- a known, documented scope
+                    // limit, not a silent wrong order.
+                    let resolved: Vec<(usize, bool)> = keys
+                        .iter()
+                        .map(|(col, ascending)| {
+                            schema
+                                .columns
+                                .iter()
+                                .position(|c| &c.name == col)
+                                .map(|idx| (idx, *ascending))
+                                .ok_or_else(|| DatabaseError::ExecutionError(format!("Unknown column '{col}' in ORDER BY")))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+
+                    tuples.sort_by(|a, b| {
+                        for &(idx, ascending) in &resolved {
+                            let ord = row_codec::compare_for_sort(&a.values[idx], &b.values[idx]);
+                            let ord = if ascending { ord } else { ord.reverse() };
+                            if ord != std::cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                    current = Some((schema, tuples));
+                }
+                LogicalPlanNode::Limit { limit, .. } => {
+                    let (schema, mut tuples) = current
+                        .take()
+                        .ok_or_else(|| DatabaseError::ExecutionError("Limit with no input".to_string()))?;
+                    tuples.truncate(*limit);
+                    current = Some((schema, tuples));
+                }
             }
         }
 
@@ -2311,6 +2356,79 @@ mod tests {
             .execute_sql("SELECT users.name, orders.total FROM users JOIN orders ON users.id = orders.user_id")
             .unwrap();
         assert_eq!(rows, vec![vec!["Alice".to_string(), "9.5".to_string()]]);
+    }
+
+    #[test]
+    fn test_order_by_sorts_ascending_by_default() {
+        // select.order_by used to be parsed and then never consulted --
+        // rows came back in arbitrary storage order regardless.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice (30), Bob (15)
+
+        let rows = executor.execute_sql("SELECT name FROM users ORDER BY age").unwrap();
+        assert_eq!(rows, vec![vec!["Bob".to_string()], vec!["Alice".to_string()]]);
+    }
+
+    #[test]
+    fn test_order_by_desc_reverses_order() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let rows = executor.execute_sql("SELECT name FROM users ORDER BY age DESC").unwrap();
+        assert_eq!(rows, vec![vec!["Alice".to_string()], vec!["Bob".to_string()]]);
+    }
+
+    #[test]
+    fn test_order_by_column_not_in_select_list_still_works() {
+        // Real SQL allows sorting by a column that isn't projected --
+        // Sort must run before Project drops it, not after.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let rows = executor.execute_sql("SELECT name FROM users ORDER BY age DESC").unwrap();
+        assert_eq!(rows, vec![vec!["Alice".to_string()], vec!["Bob".to_string()]]);
+    }
+
+    #[test]
+    fn test_limit_truncates_result() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let rows = executor.execute_sql("SELECT * FROM users LIMIT 1").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_order_by_then_limit_returns_the_correct_top_n() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice (30), Bob (15)
+        executor.execute_sql("INSERT INTO users (id, name, age) VALUES (3, 'Carol', 45)").unwrap();
+
+        let rows = executor.execute_sql("SELECT name FROM users ORDER BY age DESC LIMIT 2").unwrap();
+        assert_eq!(rows, vec![vec!["Carol".to_string()], vec!["Alice".to_string()]]);
+    }
+
+    #[test]
+    fn test_order_by_multi_column_breaks_ties_with_second_key() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, grp INT, val INT)").unwrap();
+        executor.execute_sql("INSERT INTO t (id, grp, val) VALUES (1, 1, 20)").unwrap();
+        executor.execute_sql("INSERT INTO t (id, grp, val) VALUES (2, 1, 10)").unwrap();
+        executor.execute_sql("INSERT INTO t (id, grp, val) VALUES (3, 2, 5)").unwrap();
+
+        let rows = executor.execute_sql("SELECT id FROM t ORDER BY grp, val").unwrap();
+        assert_eq!(rows, vec![vec!["2".to_string()], vec!["1".to_string()], vec!["3".to_string()]]);
+    }
+
+    #[test]
+    fn test_order_by_sorts_null_first() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+        executor.execute_sql("INSERT INTO t (id, val) VALUES (1, 5)").unwrap();
+        executor.execute_sql("INSERT INTO t (id, val) VALUES (2, NULL)").unwrap();
+
+        let rows = executor.execute_sql("SELECT id FROM t ORDER BY val").unwrap();
+        assert_eq!(rows, vec![vec!["2".to_string()], vec!["1".to_string()]]);
     }
 
     #[test]

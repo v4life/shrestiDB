@@ -458,6 +458,65 @@ pub fn split_comparison(predicate: &str) -> Option<(String, String, String)> {
     Some((left, op, right))
 }
 
+/// Parse a flattened `ORDER BY <expr> [ASC|DESC], ...` clause (see
+/// `sql::parser::SelectStatement::order_by`'s docs — `sqlparser`'s own
+/// `Display` renders the whole clause, `"ORDER BY"` keyword included, so
+/// that prefix is stripped here rather than at every call site) into
+/// `(column, ascending)` pairs, in priority order — the first pair breaks
+/// ties using the second, and so on, standard multi-column `ORDER BY`
+/// semantics.
+///
+/// `NULLS FIRST`/`NULLS LAST` isn't recognized: a `NULLS` token (or
+/// `FIRST`/`LAST` alongside it) is simply not `DESC`, so it's silently
+/// treated as ascending's absence of a direction keyword rather than
+/// honored — this engine's own fixed `NULL`-ordering convention
+/// (`compare_for_sort`, `NULL` always sorts before every non-`NULL`
+/// value regardless of `ASC`/`DESC`) applies uniformly instead. A
+/// documented scope limit, not a silent correctness gap: nothing here
+/// claims to support a clause it doesn't parse.
+pub fn parse_order_by(raw: &str) -> Vec<(String, bool)> {
+    let raw = raw.strip_prefix("ORDER BY").unwrap_or(raw).trim();
+    raw.split(',')
+        .filter_map(|part| {
+            let tokens: Vec<&str> = part.split_whitespace().collect();
+            let (name, rest) = tokens.split_first()?;
+            let ascending = !rest.iter().any(|t| t.eq_ignore_ascii_case("DESC"));
+            Some(((*name).to_string(), ascending))
+        })
+        .collect()
+}
+
+/// Order two values for `ORDER BY` — same-type comparisons behave
+/// naturally (numeric, lexicographic for strings, `false < true` for
+/// booleans); a numeric comparison across `Integer`/`Float` widens to
+/// `f64`, matching `compare`'s own cross-numeric-type rule. `NULL`
+/// always sorts before every non-`NULL` value (SQLite's convention,
+/// picked since this codebase's own comparisons throughout this session
+/// have used SQLite as the reference engine) — applied the same way
+/// regardless of `ASC`/`DESC` on that key, which the caller reverses the
+/// *whole* ordering for, `NULL` placement included, matching how real
+/// databases treat `NULL`s under `DESC` by default. A comparison across
+/// otherwise-incomparable types (e.g. `String` vs `Boolean` — shouldn't
+/// happen for a real column, which has one fixed `DataType`) has no
+/// defined order, so it's treated as equal: a stable sort keeps those
+/// rows in whatever relative order they arrived in, rather than
+/// panicking or guessing.
+pub fn compare_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Integer(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::Integer(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
+}
+
 // ── Boolean expression grammar over comparisons ───────────────────────────
 //
 //   or_expr  := and_expr ("OR" and_expr)*

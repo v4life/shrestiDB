@@ -123,6 +123,27 @@ pub enum LogicalPlanNode {
         columns: Vec<String>,
         rows: usize,
     },
+    /// `ORDER BY <col> [ASC|DESC], ...` — an earlier version of this
+    /// planner parsed `select.order_by` into a real string and then never
+    /// consulted it anywhere; rows came back in whatever order the
+    /// storage layer happened to produce them, `ORDER BY` clause or not.
+    /// Placed after `Filter`/`Join`/`Aggregate` but before `Project`, so
+    /// a sort key that isn't in the `SELECT` list (`SELECT name FROM t
+    /// ORDER BY age`) is still available to sort by — real SQL allows
+    /// that, and narrowing columns first would break it.
+    Sort {
+        /// `(column, ascending)` pairs in priority order — see
+        /// `row_codec::parse_order_by`, which produced this list, and
+        /// `row_codec::compare_for_sort` for the actual per-value
+        /// ordering `execution::executor::execute`'s `Sort` arm uses.
+        keys: Vec<(String, bool)>,
+        rows: usize,
+    },
+    /// `LIMIT <n>` — same story as `Sort`: parsed into `select.limit` and
+    /// then silently ignored everywhere. Always the last node in a plan
+    /// when present, so it caps whatever `Sort`/`Project`/`Aggregate`
+    /// already produced rather than racing them.
+    Limit { limit: usize, rows: usize },
 }
 
 /// Physical query plan
@@ -316,11 +337,31 @@ impl QueryPlanner {
                 group_by: select.group_by.clone(),
                 rows,
             });
-        } else if !(select.columns.len() == 1 && select.columns[0] == "*") {
+        }
+
+        // ORDER BY: after Filter/Join/Aggregate, before Project -- a sort
+        // key that isn't in the SELECT list (SELECT name FROM t ORDER BY
+        // age) must still be available to sort by, and Project would
+        // already have dropped it.
+        if let Some(order_by) = &select.order_by {
+            let keys = row_codec::parse_order_by(order_by);
+            if !keys.is_empty() {
+                nodes.push(LogicalPlanNode::Sort { keys, rows });
+            }
+        }
+
+        if !is_aggregate_query && !(select.columns.len() == 1 && select.columns[0] == "*") {
             // A real column list, not SELECT * -- see Project's docs for
             // why this needs its own node rather than being silently
             // ignored the way it used to be.
             nodes.push(LogicalPlanNode::Project { columns: select.columns.clone(), rows });
+        }
+
+        // LIMIT: always last -- caps whatever Sort/Project/Aggregate
+        // already produced rather than racing any of them.
+        if let Some(limit) = select.limit {
+            rows = rows.min(limit);
+            nodes.push(LogicalPlanNode::Limit { limit, rows });
         }
 
         let estimated_cost = self.cost_model.estimate_total_cost(&Self::to_operator_costs(&nodes));
@@ -350,6 +391,8 @@ impl QueryPlanner {
                     } => (OperatorType::HashJoin, (*left_rows).max(*right_rows)),
                     LogicalPlanNode::Aggregate { rows, .. } => (OperatorType::Aggregate, *rows),
                     LogicalPlanNode::Project { rows, .. } => (OperatorType::Filter, *rows),
+                    LogicalPlanNode::Sort { rows, .. } => (OperatorType::Sort, *rows),
+                    LogicalPlanNode::Limit { rows, .. } => (OperatorType::Limit, *rows),
                 };
                 let cost = OperatorCost::new(
                     op_type,
@@ -469,6 +512,52 @@ mod tests {
         let planner = QueryPlanner::new();
         let plan = planner.plan("SELECT * FROM users");
         assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Project { .. })));
+    }
+
+    #[test]
+    fn test_plan_emits_sort_node_for_order_by() {
+        // Previously select.order_by was parsed into a real string and
+        // then never consulted anywhere -- no Sort node at all.
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT * FROM users ORDER BY age DESC");
+        match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Sort { .. })) {
+            Some(LogicalPlanNode::Sort { keys, .. }) => {
+                assert_eq!(keys, &vec![("age".to_string(), false)]);
+            }
+            _ => panic!("expected a Sort node"),
+        }
+    }
+
+    #[test]
+    fn test_plan_emits_sort_node_for_multi_column_order_by() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT * FROM users ORDER BY age, name DESC");
+        match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Sort { .. })) {
+            Some(LogicalPlanNode::Sort { keys, .. }) => {
+                assert_eq!(keys, &vec![("age".to_string(), true), ("name".to_string(), false)]);
+            }
+            _ => panic!("expected a Sort node"),
+        }
+    }
+
+    #[test]
+    fn test_plan_emits_limit_node_for_limit_clause() {
+        // Previously select.limit was parsed and then never consulted --
+        // no Limit node at all.
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT * FROM users LIMIT 5");
+        match plan.nodes.iter().find(|n| matches!(n, LogicalPlanNode::Limit { .. })) {
+            Some(LogicalPlanNode::Limit { limit, .. }) => assert_eq!(*limit, 5),
+            _ => panic!("expected a Limit node"),
+        }
+    }
+
+    #[test]
+    fn test_plan_omits_sort_and_limit_nodes_when_absent() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("SELECT * FROM users");
+        assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Sort { .. })));
+        assert!(!plan.nodes.iter().any(|n| matches!(n, LogicalPlanNode::Limit { .. })));
     }
 
     #[test]
