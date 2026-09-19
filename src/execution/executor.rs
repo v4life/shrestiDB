@@ -454,11 +454,30 @@ impl QueryExecutor {
                     // Compiled once, outside the loop -- see
                     // row_codec::CompiledPredicate's docs on why that
                     // matters for anything past a handful of rows.
-                    let compiled = row_codec::CompiledPredicate::compile(predicate, &schema);
-                    let filtered = tuples
-                        .into_iter()
-                        .filter(|t| compiled.as_ref().and_then(|c| c.eval(t)).unwrap_or(true))
-                        .collect();
+                    //
+                    // A `None` here used to fall open (`unwrap_or(true)`,
+                    // every row kept) -- meant as a conservative default
+                    // for a genuine structural parse failure, but
+                    // `CompiledPredicate`'s tiny grammar (comparisons,
+                    // `AND`/`OR`) also returns `None` for any real,
+                    // well-formed SQL this engine just doesn't implement
+                    // yet -- `LIKE`, `IN`, `BETWEEN`, and so on. A
+                    // "conservative" default that means `WHERE name LIKE
+                    // 'A%'` silently returns *every* row is the opposite
+                    // of conservative. Now a hard error instead -- the
+                    // same "unsupported, not silently wrong" discipline
+                    // already applied to `HAVING`/`ORDER BY`/etc.
+                    // elsewhere in this codebase's history.
+                    let compiled = row_codec::CompiledPredicate::compile(predicate, &schema).ok_or_else(|| {
+                        DatabaseError::ExecutionError(format!("Unsupported WHERE clause: '{predicate}'"))
+                    })?;
+                    // A per-row `None` here (distinct from the compile
+                    // failure above) means this specific row's values
+                    // couldn't be compared for some structural reason --
+                    // excluded, not kept, matching how `NULL`/`Unknown`
+                    // is already excluded (`row_codec::Tri`) rather than
+                    // given the old "give up and keep it" treatment.
+                    let filtered = tuples.into_iter().filter(|t| compiled.eval(t).unwrap_or(false)).collect();
                     current = Some((schema, filtered));
                 }
                 LogicalPlanNode::Join { right_table, right_alias, condition, equi_match, kind, .. } => {
@@ -543,9 +562,26 @@ impl QueryExecutor {
                         // exactly the cost that made this join 350-500x
                         // slower than SQLite/Postgres on the same query
                         // (see row_codec::CompiledPredicate's docs).
+                        //
+                        // `None` here must mean "no condition at all"
+                        // (a genuine `CROSS JOIN`) -- never "a condition
+                        // was given but couldn't compile," which an
+                        // earlier version conflated with the real cross
+                        // join case via `Option::and_then`, so `JOIN ...
+                        // ON a.x LIKE b.y` silently ran as an unfiltered
+                        // cross join (every pair kept) instead of
+                        // erroring on the unsupported operator. `map` +
+                        // `transpose` keeps that distinction: `Some(cond)`
+                        // that fails to compile is now a hard error, not
+                        // absorbed into the "no condition" case.
                         let compiled_condition = condition
                             .as_ref()
-                            .and_then(|cond| row_codec::CompiledPredicate::compile(cond, &merged_schema));
+                            .map(|cond| {
+                                row_codec::CompiledPredicate::compile(cond, &merged_schema).ok_or_else(|| {
+                                    DatabaseError::ExecutionError(format!("Unsupported JOIN condition: '{cond}'"))
+                                })
+                            })
+                            .transpose()?;
 
                         // A row pair's values are only cloned into a
                         // merged Tuple once it's known to match -- cloning
@@ -565,8 +601,14 @@ impl QueryExecutor {
                         for (li, l) in left_tuples.iter().enumerate() {
                             for (ri, r) in right_tuples.iter().enumerate() {
                                 let keep = match &compiled_condition {
-                                    Some(compiled) => compiled.eval_split(l, left_len, r).unwrap_or(true),
-                                    None => true, // CROSS JOIN, or a condition that didn't compile
+                                    // A per-pair `None` (the condition
+                                    // compiled fine, but this specific
+                                    // pair's values couldn't be compared)
+                                    // excludes the pair rather than
+                                    // keeping it -- same reasoning as the
+                                    // Filter node's per-row default.
+                                    Some(compiled) => compiled.eval_split(l, left_len, r).unwrap_or(false),
+                                    None => true, // genuine CROSS JOIN -- no condition was given at all
                                 };
                                 if keep {
                                     left_matched[li] = true;
@@ -629,29 +671,40 @@ impl QueryExecutor {
                     // every GROUP BY key plus every placeholder -- then
                     // each group's placeholder values are computed the
                     // same way `columns`' aggregate outputs are below.
-                    let having_plan = having.as_deref().map(|expr| {
-                        let (rewritten, having_aggs) = aggregate::extract_calls(expr);
+                    let having_plan = having
+                        .as_deref()
+                        .map(|expr| {
+                            let (rewritten, having_aggs) = aggregate::extract_calls(expr);
 
-                        let mut synth_schema = TableSchema::new(schema.table_id, schema.name.clone());
-                        for g in group_by {
-                            if let Some(col) = schema.columns.iter().find(|c| &c.name == g) {
-                                synth_schema.add_column(col.clone());
+                            let mut synth_schema = TableSchema::new(schema.table_id, schema.name.clone());
+                            for g in group_by {
+                                if let Some(col) = schema.columns.iter().find(|c| &c.name == g) {
+                                    synth_schema.add_column(col.clone());
+                                }
                             }
-                        }
-                        for (placeholder, func, _) in &having_aggs {
-                            let data_type =
-                                if *func == aggregate::AggregateFn::Count { DataType::Integer } else { DataType::Float };
-                            synth_schema.add_column(Column {
-                                id: 0,
-                                name: placeholder.clone(),
-                                data_type,
-                                nullable: true,
-                                primary_key: false,
-                            });
-                        }
+                            for (placeholder, func, _) in &having_aggs {
+                                let data_type =
+                                    if *func == aggregate::AggregateFn::Count { DataType::Integer } else { DataType::Float };
+                                synth_schema.add_column(Column {
+                                    id: 0,
+                                    name: placeholder.clone(),
+                                    data_type,
+                                    nullable: true,
+                                    primary_key: false,
+                                });
+                            }
 
-                        (row_codec::CompiledPredicate::compile(&rewritten, &synth_schema), having_aggs)
-                    });
+                            // A `None` here used to fall open (every
+                            // group kept) -- the same class of bug fixed
+                            // for `WHERE` above: a `HAVING` clause using
+                            // an operator this grammar doesn't implement
+                            // is a real, well-formed clause, not a
+                            // structural parse failure safe to shrug off.
+                            let compiled = row_codec::CompiledPredicate::compile(&rewritten, &synth_schema)
+                                .ok_or_else(|| DatabaseError::ExecutionError(format!("Unsupported HAVING clause: '{expr}'")))?;
+                            Ok::<_, DatabaseError>((compiled, having_aggs))
+                        })
+                        .transpose()?;
 
                     let mut output_rows = Vec::with_capacity(groups.len());
                     for (key, group_tuples) in &groups {
@@ -661,12 +714,11 @@ impl QueryExecutor {
                                 synth_values.push(aggregate::compute_aggregate(*func, arg.as_deref(), &schema, group_tuples));
                             }
                             let synth_tuple = Tuple { values: synth_values };
-                            // Same fail-open convention as Filter's WHERE
-                            // (row_codec::CompiledPredicate's docs): a
-                            // HAVING clause this simple grammar can't
-                            // parse keeps every group rather than
-                            // dropping all of them.
-                            if !compiled.as_ref().and_then(|c| c.eval(&synth_tuple)).unwrap_or(true) {
+                            // A per-group `None` (compiled fine, this
+                            // group's synthetic values couldn't be
+                            // compared) excludes the group -- same
+                            // reasoning as Filter's per-row default.
+                            if !compiled.eval(&synth_tuple).unwrap_or(false) {
                                 continue;
                             }
                         }
@@ -1445,7 +1497,8 @@ impl QueryExecutor {
                     "Updating the primary key column is not supported".to_string(),
                 ));
             }
-            let compiled = row_codec::CompiledAssignment::compile(raw_value, &schema, schema.columns[idx].data_type);
+            let compiled = row_codec::CompiledAssignment::compile(raw_value, &schema, schema.columns[idx].data_type)
+                .ok_or_else(|| DatabaseError::ExecutionError(format!("Unsupported SET expression: '{col_name} = {raw_value}'")))?;
             assignments.push((idx, compiled));
         }
 
@@ -1454,7 +1507,27 @@ impl QueryExecutor {
 
         let tx = self.oltp.begin();
         let rows = self.candidate_rows_for_write(tx, table_id, &schema, &update.where_clause);
-        let compiled_where = update.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p, &schema));
+        // A `None` here must mean "no WHERE clause at all" (update every
+        // row, correct) -- never "a WHERE clause was given but couldn't
+        // compile," which used to fall open the same way Filter's WHERE
+        // did (see that node's docs): `UPDATE t SET x = 1 WHERE name
+        // LIKE 'A%'` would silently update *every* row, not just the
+        // matching ones. `map` + `transpose` keeps the two apart -- a
+        // present-but-uncompilable clause is now a hard error, raised
+        // before the transaction touches anything (this runs before the
+        // loop below acquires a single lock).
+        let compiled_where = update
+            .where_clause
+            .as_ref()
+            .map(|p| {
+                row_codec::CompiledPredicate::compile(p, &schema)
+                    .ok_or_else(|| DatabaseError::ExecutionError(format!("Unsupported WHERE clause: '{p}'")))
+            })
+            .transpose()
+            .map_err(|e| {
+                self.oltp.abort(tx);
+                e
+            })?;
 
         let mut affected = 0usize;
         // See execute_insert: secondary indexes are only updated once the
@@ -1469,8 +1542,11 @@ impl QueryExecutor {
             // avoids locking every row in the table for a narrow UPDATE.
             // A row that passes here still gets its value re-read and
             // re-checked below, under its own lock, before anything is
-            // actually written -- see this method's doc comment.
-            let matches = compiled_where.as_ref().and_then(|c| c.eval(&tuple)).unwrap_or(true);
+            // actually written -- see this method's doc comment. A
+            // per-row `None` (compiled fine, this row's values couldn't
+            // be compared) excludes the row, same reasoning as Filter's
+            // per-row default.
+            let matches = compiled_where.as_ref().map(|c| c.eval(&tuple).unwrap_or(false)).unwrap_or(true);
             if !matches {
                 continue;
             }
@@ -1494,7 +1570,7 @@ impl QueryExecutor {
             let Ok(mut tuple) = bincode::deserialize::<Tuple>(&latest_bytes) else {
                 continue;
             };
-            let still_matches = compiled_where.as_ref().and_then(|c| c.eval(&tuple)).unwrap_or(true);
+            let still_matches = compiled_where.as_ref().map(|c| c.eval(&tuple).unwrap_or(false)).unwrap_or(true);
             if !still_matches {
                 continue;
             }
@@ -1545,7 +1621,22 @@ impl QueryExecutor {
 
         let tx = self.oltp.begin();
         let rows = self.candidate_rows_for_write(tx, table_id, &schema, &delete.where_clause);
-        let compiled_where = delete.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p, &schema));
+        // See execute_update's identical construction for why `None`
+        // must mean "no WHERE clause" and not "uncompilable WHERE
+        // clause" -- the same bug here meant `DELETE FROM t WHERE name
+        // LIKE 'A%'` silently deleted *every* row in the table.
+        let compiled_where = delete
+            .where_clause
+            .as_ref()
+            .map(|p| {
+                row_codec::CompiledPredicate::compile(p, &schema)
+                    .ok_or_else(|| DatabaseError::ExecutionError(format!("Unsupported WHERE clause: '{p}'")))
+            })
+            .transpose()
+            .map_err(|e| {
+                self.oltp.abort(tx);
+                e
+            })?;
 
         let mut affected = 0usize;
         for (row_id, bytes) in rows {
@@ -1553,7 +1644,7 @@ impl QueryExecutor {
                 continue;
             };
 
-            let matches = compiled_where.as_ref().and_then(|c| c.eval(&tuple)).unwrap_or(true);
+            let matches = compiled_where.as_ref().map(|c| c.eval(&tuple).unwrap_or(false)).unwrap_or(true);
             if !matches {
                 continue;
             }
@@ -1763,14 +1854,23 @@ impl QueryExecutor {
 
     /// Map one INSERT value row (raw strings, in either explicit-column or
     /// schema-column order) into typed `Value`s in schema column order.
+    ///
+    /// Each value must actually parse as a real literal (or `NULL`) of
+    /// its column's declared type -- `row_codec::parse_literal_checked`,
+    /// not the looser `parse_value`, which silently defaulted an
+    /// unparseable value to `Value::Null` instead of erroring. Verified
+    /// empirically before this was fixed: `INSERT INTO items (id, price)
+    /// VALUES (1, ABS(-9.99))` silently inserted `price = NULL` rather
+    /// than rejecting the unsupported expression -- the same root cause,
+    /// and the same fix, as `CompiledAssignment`'s (see that type's docs).
     fn order_insert_row(insert: &InsertStatement, schema: &TableSchema, row: &[String]) -> Result<Vec<Value>> {
+        let checked = |raw: &str, data_type: DataType| {
+            row_codec::parse_literal_checked(raw, data_type)
+                .ok_or_else(|| DatabaseError::ExecutionError(format!("Unsupported value expression: '{raw}'")))
+        };
+
         if insert.columns.is_empty() {
-            return Ok(schema
-                .columns
-                .iter()
-                .zip(row)
-                .map(|(c, v)| row_codec::parse_value(v, c.data_type))
-                .collect());
+            return schema.columns.iter().zip(row).map(|(c, v)| checked(v, c.data_type)).collect();
         }
 
         let mut ordered = vec![Value::Null; schema.columns.len()];
@@ -1780,7 +1880,7 @@ impl QueryExecutor {
                 .iter()
                 .position(|c| &c.name == col_name)
                 .ok_or_else(|| DatabaseError::ExecutionError(format!("Unknown column '{col_name}'")))?;
-            ordered[idx] = row_codec::parse_value(raw, schema.columns[idx].data_type);
+            ordered[idx] = checked(raw, schema.columns[idx].data_type)?;
         }
         Ok(ordered)
     }
@@ -2166,6 +2266,36 @@ mod tests {
     }
 
     #[test]
+    fn test_update_set_with_unsupported_function_call_errors_instead_of_writing_null() {
+        // Verified empirically before the fix: this silently wrote
+        // Alice's age to NULL instead of erroring.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+        let err = executor.execute_sql("UPDATE users SET age = ABS(age) WHERE name = 'Alice'").unwrap_err();
+        assert!(err.to_string().contains("Unsupported SET expression"));
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"30".to_string()), "Alice's age must be untouched, not silently NULLed");
+    }
+
+    #[test]
+    fn test_update_set_string_column_with_unsupported_function_call_errors_instead_of_writing_garbage() {
+        // Verified empirically before the fix: this silently wrote the
+        // literal, unparsed text "UPPER(name)" into Alice's name column.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+        let err = executor.execute_sql("UPDATE users SET name = UPPER(name) WHERE name = 'Alice'").unwrap_err();
+        assert!(err.to_string().contains("Unsupported SET expression"));
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert!(
+            rows.iter().any(|r| r.contains(&"Alice".to_string())),
+            "Alice's name must be untouched, not overwritten with the unparsed expression text"
+        );
+    }
+
+    #[test]
     fn test_update_arithmetic_expression_increments_column() {
         // Before CompiledAssignment existed, "age + 1" wasn't a valid
         // literal, so this silently wrote NULL to every matched row
@@ -2363,10 +2493,157 @@ mod tests {
         );
     }
 
+    // ── Unsupported WHERE/JOIN-condition operators must hard-error, not fall open ──
+    //
+    // A whole class of severe, silent bugs: an earlier version of Filter/
+    // HAVING/JOIN/UPDATE/DELETE treated "this predicate didn't compile"
+    // (CompiledPredicate::compile returned None) as "keep everything" --
+    // a default meant for a genuine structural parse failure, but
+    // CompiledPredicate's tiny grammar (comparisons plus AND/OR) returns
+    // that same None for any real, well-formed SQL it doesn't implement:
+    // LIKE, IN, BETWEEN, and so on. `WHERE name LIKE 'A%'` silently
+    // returned every row instead of erroring -- and for DELETE
+    // specifically, silently deleted every row in the table (verified
+    // empirically before this fix: DELETE FROM users WHERE name LIKE
+    // 'A%' removed both seeded rows, not just the matching one).
+
+    #[test]
+    fn test_select_with_like_where_errors_instead_of_returning_everything() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let err = executor.execute_sql("SELECT * FROM users WHERE name LIKE 'A%'").unwrap_err();
+        assert!(err.to_string().contains("Unsupported WHERE clause"));
+    }
+
+    #[test]
+    fn test_select_with_in_where_errors_instead_of_returning_everything() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let err = executor.execute_sql("SELECT * FROM users WHERE id IN (1)").unwrap_err();
+        assert!(err.to_string().contains("Unsupported WHERE clause"));
+    }
+
+    #[test]
+    fn test_select_with_between_where_errors_instead_of_returning_everything() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let err = executor.execute_sql("SELECT * FROM users WHERE age BETWEEN 20 AND 40").unwrap_err();
+        assert!(err.to_string().contains("Unsupported WHERE clause"));
+    }
+
+    #[test]
+    fn test_delete_with_like_where_errors_instead_of_deleting_everything() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+        let err = executor.execute_sql("DELETE FROM users WHERE name LIKE 'A%'").unwrap_err();
+        assert!(err.to_string().contains("Unsupported WHERE clause"));
+
+        // Nothing was deleted -- the error must be raised before any row
+        // is touched, not partway through.
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2, "DELETE must not have removed anything after erroring on the WHERE clause");
+    }
+
+    #[test]
+    fn test_update_with_like_where_errors_instead_of_updating_everything() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+        let err = executor.execute_sql("UPDATE users SET age = 0 WHERE name LIKE 'A%'").unwrap_err();
+        assert!(err.to_string().contains("Unsupported WHERE clause"));
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert!(rows.iter().any(|r| r.contains(&"30".to_string())), "Alice's age must be untouched");
+        assert!(rows.iter().any(|r| r.contains(&"15".to_string())), "Bob's age must be untouched");
+    }
+
+    #[test]
+    fn test_having_with_like_errors_instead_of_keeping_every_group() {
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor);
+        let err = executor
+            .execute_sql("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING user_id LIKE '1'")
+            .unwrap_err();
+        assert!(err.to_string().contains("Unsupported HAVING clause"));
+    }
+
+    #[test]
+    fn test_join_with_like_condition_errors_instead_of_running_as_cross_join() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY, tag TEXT)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY, tag TEXT)").unwrap();
+        executor.execute_sql("INSERT INTO a (id, tag) VALUES (1, 'x')").unwrap();
+        executor.execute_sql("INSERT INTO b (id, tag) VALUES (1, 'x')").unwrap();
+
+        let err = executor.execute_sql("SELECT * FROM a JOIN b ON a.tag LIKE b.tag").unwrap_err();
+        assert!(err.to_string().contains("Unsupported JOIN condition"));
+    }
+
+    #[test]
+    fn test_select_with_no_where_clause_still_returns_every_row() {
+        // Regression guard for the fix above: `None` (genuinely no WHERE
+        // clause) must still mean "keep everything" -- only a *present*,
+        // uncompilable clause should error.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_with_no_where_clause_still_deletes_every_row() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let result = executor.execute_sql("DELETE FROM users").unwrap();
+        assert_eq!(result, vec![vec!["2".to_string()]]);
+    }
+
+    #[test]
+    fn test_join_with_no_condition_still_runs_as_a_real_cross_join() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
+        executor.execute_sql("CREATE TABLE b (id INT PRIMARY KEY)").unwrap();
+        executor.execute_sql("INSERT INTO a (id) VALUES (1)").unwrap();
+        executor.execute_sql("INSERT INTO a (id) VALUES (2)").unwrap();
+        executor.execute_sql("INSERT INTO b (id) VALUES (10)").unwrap();
+
+        let rows = executor.execute_sql("SELECT * FROM a JOIN b").unwrap();
+        assert_eq!(rows.len(), 2, "a genuine CROSS JOIN (no ON clause at all) must still produce the full cross product");
+    }
+
     #[test]
     fn test_update_unknown_table_errors() {
         let executor = QueryExecutor::new(users_catalog());
         assert!(executor.execute_sql("UPDATE ghosts SET x = 1").is_err());
+    }
+
+    #[test]
+    fn test_insert_with_unsupported_expression_value_errors_instead_of_writing_null() {
+        // Verified empirically before the fix: this silently inserted
+        // price = NULL instead of erroring on the unsupported expression.
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE items (id INT PRIMARY KEY, price FLOAT)").unwrap();
+        let err = executor.execute_sql("INSERT INTO items (id, price) VALUES (1, ABS(-9.99))").unwrap_err();
+        assert!(err.to_string().contains("Unsupported value expression"));
+
+        let rows = executor.execute_sql("SELECT * FROM items").unwrap();
+        assert!(rows.is_empty(), "the row must not have been inserted at all, not inserted with a NULL price");
+    }
+
+    #[test]
+    fn test_insert_with_explicit_null_value_still_works() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE items (id INT PRIMARY KEY, price FLOAT)").unwrap();
+        executor.execute_sql("INSERT INTO items (id, price) VALUES (1, NULL)").unwrap();
+        let rows = executor.execute_sql("SELECT * FROM items").unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string(), "NULL".to_string()]]);
+    }
+
+    #[test]
+    fn test_insert_with_unquoted_text_for_string_column_errors_instead_of_storing_it() {
+        let executor = QueryExecutor::new(Catalog::new());
+        executor.execute_sql("CREATE TABLE items (id INT PRIMARY KEY, label VARCHAR(50))").unwrap();
+        let err = executor.execute_sql("INSERT INTO items (id, label) VALUES (1, UPPER(x))").unwrap_err();
+        assert!(err.to_string().contains("Unsupported value expression"));
     }
 
     #[test]

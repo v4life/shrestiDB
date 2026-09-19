@@ -56,6 +56,44 @@ pub fn parse_value(raw: &str, data_type: DataType) -> Value {
     }
 }
 
+/// Like `parse_value`, but returns `None` instead of silently defaulting
+/// to `Value::Null` when `token` doesn't actually look like a literal of
+/// `data_type` -- the real fix for two real, verified bugs sharing the
+/// same root cause: `CompiledAssignment::compile`'s literal fallback
+/// (`UPDATE ... SET age = ABS(age)` silently wrote every matched row's
+/// `age` to `NULL`; `SET name = UPPER(name)` silently wrote the literal,
+/// unparsed text `"UPPER(name)"` into the column), and `INSERT`'s own
+/// value parsing (`order_insert_row`, `execution::executor`) — `INSERT
+/// INTO items (id, price) VALUES (1, ABS(-9.99))` silently inserted
+/// `price = NULL`, verified before this existed. The explicit `NULL`
+/// keyword (case-insensitive, matching SQL) is recognized first, so a
+/// genuine `SET col = NULL` / `INSERT ... VALUES (..., NULL, ...)` keeps
+/// working -- it's the one case `parse_value`'s ambiguous
+/// "unparseable becomes Null" behavior happened to get right, kept
+/// intentionally here rather than accidentally.
+///
+/// Stricter than `parse_value` for `String` specifically: a `String`
+/// column only accepts a properly single-quoted token as a literal, not
+/// arbitrary unquoted text -- `parse_value` accepted any raw text handed
+/// to it (there's nothing else a `String` column's value *could* fail to
+/// be), which is exactly how `UPPER(name)`'s unparsed text ended up
+/// stored verbatim as a string value instead of being rejected.
+pub fn parse_literal_checked(token: &str, data_type: DataType) -> Option<Value> {
+    let token = token.trim();
+    if token.eq_ignore_ascii_case("NULL") {
+        return Some(Value::Null);
+    }
+    match data_type {
+        DataType::Integer | DataType::Timestamp => token.parse::<i64>().ok().map(Value::Integer),
+        DataType::Float => token.parse::<f64>().ok().map(Value::Float),
+        DataType::Boolean => token.parse::<bool>().ok().map(Value::Boolean),
+        DataType::String => token
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .map(|s| Value::String(s.to_string())),
+    }
+}
+
 /// Render a `Value` back to a plain string (for `QueryExecutor::execute`'s
 /// `Vec<Vec<String>>` result rows).
 pub fn value_to_string(value: &Value) -> String {
@@ -214,10 +252,15 @@ pub fn substitute_token(token: &str, params: &[Value], next_positional: &mut usi
 /// were before this statement's other assignments ran*, so
 /// `SET a = b, b = a` swaps the two rather than leaving both equal to the
 /// original `b`. Anything shaped differently (nested arithmetic, a
-/// function call, ...) falls back to being parsed as one literal typed by
-/// the target column, exactly the old behavior: silently `Value::Null`
-/// rather than an error, the same soft-failure convention `parse_value`
-/// already uses.
+/// function call, ...) is a compile error (`compile` returns `None`) --
+/// an earlier version of this fallback matched `parse_value`'s own
+/// soft-failure convention and silently treated it as a literal `NULL`
+/// instead: `UPDATE users SET age = ABS(age)` wrote every matched row's
+/// `age` to `NULL`, and — worse — `UPDATE users SET name = UPPER(name)`
+/// wrote the literal, unparsed text `"UPPER(name)"` into every matched
+/// row's `name` column, both verified empirically before this was fixed.
+/// The same "unsupported, not silently wrong" fix already applied to
+/// `WHERE`/`HAVING`/`JOIN ON` elsewhere in this module's history.
 ///
 /// Before this type existed, `execute_update` passed every assignment's
 /// raw string straight to `parse_value`, which only understands a plain
@@ -243,33 +286,40 @@ enum ValueOperand {
 }
 
 impl CompiledAssignment {
-    /// `target_type` is the assigned column's declared type — used only
-    /// for the plain-literal fallback path, to match `parse_value`'s
-    /// existing behavior exactly (e.g. the literal `5` assigned to a
-    /// `Float` column becomes `Value::Float(5.0)`, not `Value::Integer`).
+    /// `target_type` is the assigned column's declared type — used for
+    /// the plain-literal fallback path (e.g. the literal `5` assigned to
+    /// a `Float` column becomes `Value::Float(5.0)`, not `Value::Integer`).
     /// An arithmetic expression's own operands are typed by their own
     /// shape instead (quoted = string, otherwise int/float/bool),
     /// independent of the target column, since the two operands can
     /// legitimately have different natural types (an `Integer` column
     /// plus a `Float` literal, say).
-    pub fn compile(expr: &str, schema: &TableSchema, target_type: DataType) -> CompiledAssignment {
+    ///
+    /// `None` means `expr` isn't any of the shapes this understands --
+    /// the caller's job to turn into a real error, not to substitute a
+    /// value for (see this type's docs on why the old fallback of
+    /// silently writing `Value::Null`, or worse, the assignment's own
+    /// unparsed text, was a real, serious bug).
+    pub fn compile(expr: &str, schema: &TableSchema, target_type: DataType) -> Option<CompiledAssignment> {
         let tokens = tokenize_expr(expr);
         match tokens.as_slice() {
             [left, op_tok, right] => {
                 if let Some(op) = arith_op(op_tok) {
                     if let (Some(left), Some(right)) = (resolve_operand(left, schema), resolve_operand(right, schema)) {
-                        return CompiledAssignment { kind: AssignmentKind::Arithmetic { left, op, right } };
+                        return Some(CompiledAssignment { kind: AssignmentKind::Arithmetic { left, op, right } });
                     }
                 }
             }
             [single] => {
                 if let Some(idx) = schema.columns.iter().position(|c| &c.name == single) {
-                    return CompiledAssignment { kind: AssignmentKind::ColumnRef(idx) };
+                    return Some(CompiledAssignment { kind: AssignmentKind::ColumnRef(idx) });
                 }
+                return parse_literal_checked(single, target_type)
+                    .map(|v| CompiledAssignment { kind: AssignmentKind::Literal(v) });
             }
             _ => {}
         }
-        CompiledAssignment { kind: AssignmentKind::Literal(parse_value(expr, target_type)) }
+        None
     }
 
     /// Evaluate against `tuple`'s *pre-statement* values — see the type
@@ -1053,7 +1103,7 @@ mod tests {
         // The pre-existing behavior -- a bare literal, unchanged by
         // CompiledAssignment's arithmetic support.
         let schema = schema();
-        let compiled = CompiledAssignment::compile("31", &schema, DataType::Integer);
+        let compiled = CompiledAssignment::compile("31", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(31));
     }
 
@@ -1063,21 +1113,21 @@ mod tests {
         // isn't a valid literal, so the old parse_value-only path failed
         // soft to NULL instead of computing anything.
         let schema = schema();
-        let compiled = CompiledAssignment::compile("age + 1", &schema, DataType::Integer);
+        let compiled = CompiledAssignment::compile("age + 1", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(31));
     }
 
     #[test]
     fn test_compiled_assignment_column_minus_literal() {
         let schema = schema();
-        let compiled = CompiledAssignment::compile("age - 5", &schema, DataType::Integer);
+        let compiled = CompiledAssignment::compile("age - 5", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(25));
     }
 
     #[test]
     fn test_compiled_assignment_column_times_literal() {
         let schema = schema();
-        let compiled = CompiledAssignment::compile("age * 2", &schema, DataType::Integer);
+        let compiled = CompiledAssignment::compile("age * 2", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(60));
     }
 
@@ -1085,29 +1135,71 @@ mod tests {
     fn test_compiled_assignment_column_to_column() {
         // "SET age = id" -- both operands are columns.
         let schema = schema();
-        let compiled = CompiledAssignment::compile("id", &schema, DataType::Integer);
+        let compiled = CompiledAssignment::compile("id", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(7, "Bob", 30, true)), Value::Integer(7));
 
-        let compiled = CompiledAssignment::compile("id + age", &schema, DataType::Integer);
+        let compiled = CompiledAssignment::compile("id + age", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(7, "Bob", 30, true)), Value::Integer(37));
     }
 
     #[test]
     fn test_compiled_assignment_division_by_zero_is_null() {
+        // Compiles fine ("age / 0" is a valid arithmetic shape) -- the
+        // Null comes from evaluating it, a legitimate per-value result
+        // distinct from a compile-time rejection.
         let schema = schema();
-        let compiled = CompiledAssignment::compile("age / 0", &schema, DataType::Integer);
+        let compiled = CompiledAssignment::compile("age / 0", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Null);
     }
 
     #[test]
-    fn test_compiled_assignment_unsupported_shape_falls_back_to_null() {
-        // More than one operator -- not a shape this understands, so it
-        // falls back to parsing the whole string as one literal, which
-        // fails and produces Value::Null (parse_value's existing
-        // soft-failure convention), not an error.
+    fn test_compiled_assignment_unsupported_shape_is_a_compile_error() {
+        // More than one operator -- not a shape this understands. An
+        // earlier version fell back to parsing the whole string as one
+        // literal, which failed and silently produced Value::Null
+        // instead of an error -- the real bug this type exists to fix
+        // (see its doc comment). Now a compile-time None instead.
         let schema = schema();
-        let compiled = CompiledAssignment::compile("age + 1 + 1", &schema, DataType::Integer);
+        assert!(CompiledAssignment::compile("age + 1 + 1", &schema, DataType::Integer).is_none());
+    }
+
+    #[test]
+    fn test_compiled_assignment_function_call_is_a_compile_error_not_null_or_garbage() {
+        // The two real, verified-before-the-fix bugs this type's doc
+        // comment documents: a function call assigned to a numeric
+        // column used to silently write NULL, and to a string column
+        // used to silently write the function call's own unparsed text
+        // as if it were a literal string. Both are now compile errors.
+        let schema = schema();
+        assert!(CompiledAssignment::compile("ABS(age)", &schema, DataType::Integer).is_none());
+
+        let mut string_schema = TableSchema::new(1, "users".to_string());
+        string_schema.add_column(Column { id: 1, name: "name".to_string(), data_type: DataType::String, nullable: false, primary_key: false });
+        assert!(CompiledAssignment::compile("UPPER(name)", &string_schema, DataType::String).is_none());
+    }
+
+    #[test]
+    fn test_compiled_assignment_explicit_null_literal_still_works() {
+        // The one case parse_value's old ambiguous "unparseable becomes
+        // Null" behavior happened to get right -- kept working
+        // intentionally (see parse_literal_checked's docs), not by
+        // accident, now that everything else unparseable is a hard error.
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("NULL", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Null);
+    }
+
+    #[test]
+    fn test_compiled_assignment_unquoted_text_on_string_column_is_a_compile_error() {
+        // parse_value used to accept ANY raw text for a String column,
+        // quoted or not -- exactly how an unsupported expression's own
+        // text (e.g. "UPPER(name)") ended up stored verbatim. A String
+        // literal must be properly quoted now.
+        let mut string_schema = TableSchema::new(1, "users".to_string());
+        string_schema.add_column(Column { id: 1, name: "name".to_string(), data_type: DataType::String, nullable: false, primary_key: false });
+        assert!(CompiledAssignment::compile("Bob", &string_schema, DataType::String).is_none());
+        let compiled = CompiledAssignment::compile("'Bob'", &string_schema, DataType::String).unwrap();
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::String("Bob".to_string()));
     }
 
     #[test]
@@ -1116,7 +1208,7 @@ mod tests {
         // surrounding whitespace to split on), so it must stay on the
         // plain-literal path, not be misread as a two-token expression.
         let schema = schema();
-        let compiled = CompiledAssignment::compile("-5", &schema, DataType::Integer);
+        let compiled = CompiledAssignment::compile("-5", &schema, DataType::Integer).unwrap();
         assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(-5));
     }
 
