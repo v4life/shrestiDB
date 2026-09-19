@@ -2579,6 +2579,44 @@ mod tests {
     }
 
     #[test]
+    fn test_where_integer_column_compared_to_non_numeric_literal_errors() {
+        // Verified before the fix: this silently compiled fine and
+        // matched zero rows instead of erroring on the type-mismatched
+        // literal -- a real predicate mistake disguised as an
+        // unremarkable empty result.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+        let err = executor.execute_sql("SELECT * FROM users WHERE age = 'thirty'").unwrap_err();
+        assert!(err.to_string().contains("Unsupported WHERE clause"));
+    }
+
+    #[test]
+    fn test_where_string_column_compared_to_unquoted_value_errors() {
+        // A forgotten-quotes typo -- 'Bob' used to silently work as an
+        // unquoted literal (parse_value accepted any raw text for a
+        // String column), which also silently masked a real typo like
+        // WHERE name = Bo (missing the final letter) matching nothing
+        // instead of erroring.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let err = executor.execute_sql("SELECT * FROM users WHERE name = Bob").unwrap_err();
+        assert!(err.to_string().contains("Unsupported WHERE clause"));
+    }
+
+    #[test]
+    fn test_where_column_equals_null_literal_compiles_and_matches_nothing() {
+        // Non-standard (real SQL wants IS NULL), but this engine already
+        // recognized NULL as a literal in a WHERE comparison before the
+        // stricter parse_literal_checked existed -- must keep compiling,
+        // now because NULL is recognized explicitly rather than because
+        // every unparseable token defaulted there.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let rows = executor.execute_sql("SELECT * FROM users WHERE age = NULL").unwrap();
+        assert!(rows.is_empty(), "NULL = NULL is UNKNOWN in SQL, so this must match nothing, not error");
+    }
+
+    #[test]
     fn test_select_with_no_where_clause_still_returns_every_row() {
         // Regression guard for the fix above: `None` (genuinely no WHERE
         // clause) must still mean "keep everything" -- only a *present*,

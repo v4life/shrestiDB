@@ -642,7 +642,19 @@ impl<'a> ExprParser<'a> {
         let left_idx = self.schema.columns.iter().position(|c| c.name == left)?;
         let right = match self.schema.columns.iter().position(|c| c.name == right) {
             Some(right_idx) => ComparisonOperand::Column(right_idx),
-            None => ComparisonOperand::Literal(parse_value(&right, self.schema.columns[left_idx].data_type)),
+            // `parse_literal_checked`, not `parse_value` -- a token that
+            // doesn't actually look like a literal of the left column's
+            // type (a typo, a forgotten quote, a comparison against the
+            // wrong type entirely) must fail the whole predicate to
+            // compile, the same "unsupported, not silently wrong"
+            // discipline as everywhere else in this module now. The old
+            // `parse_value` here meant `WHERE age = 'thirty'` (an
+            // Integer column against a non-numeric literal) silently
+            // compiled fine and matched zero rows -- not dangerous the
+            // way the fail-*open* bugs elsewhere in this module's
+            // history were, but still a real predicate error disguised
+            // as an unremarkable empty result.
+            None => ComparisonOperand::Literal(parse_literal_checked(&right, self.schema.columns[left_idx].data_type)?),
         };
         Some(BoolExpr::Comparison { left_idx, op, right })
     }
