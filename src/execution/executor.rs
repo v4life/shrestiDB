@@ -914,15 +914,42 @@ impl QueryExecutor {
         Ok(Some(tuples))
     }
 
-    /// Secondary-index path: uses a `SecondaryIndex` registered via
-    /// `CREATE INDEX`, if one exists for `left`'s column on this table.
-    /// Unlike the PK path, a candidate here genuinely can be stale — an
-    /// `UPDATE` adds a new index entry for a row's new value but never
-    /// removes the old one (see `secondary_index` module docs), so a
-    /// candidate's *current* value might not actually match anymore.
-    /// Every candidate is therefore re-checked with the exact predicate
-    /// before being included, not just assumed correct because the index
+    /// Candidate row ids from a `SecondaryIndex` registered via `CREATE
+    /// INDEX`, if one exists for `left`'s column on this table and `op`
+    /// has a useful index range (`!=` doesn't). Just row ids -- no I/O,
+    /// no deserialization -- shared between `try_secondary_index_scan`
+    /// (`SELECT`, which fetches/deserializes/filters them into `Tuple`s)
+    /// and `candidate_rows_for_write` (`UPDATE`/`DELETE`, which already
+    /// does its own fetch/deserialize/re-verify on whatever candidate set
+    /// it's given, full-scan or indexed).
+    ///
+    /// A candidate here genuinely can be stale — an `UPDATE` adds a new
+    /// index entry for a row's new value but never removes the old one
+    /// (see `secondary_index` module docs), so a candidate's *current*
+    /// value might not actually match anymore. Every caller of this is
+    /// responsible for re-checking the real predicate before treating a
+    /// candidate as a match, not assuming correct because the index
     /// produced it.
+    fn secondary_index_candidates(&self, table_id: u64, schema: &TableSchema, left: &str, op: &str, right: &str) -> Option<Vec<u64>> {
+        let indexes = self.secondary_indexes.read();
+        let index = indexes.get(&(table_id, left.to_string()))?;
+        let col = schema.columns.iter().find(|c| c.name == left)?;
+        let literal = row_codec::parse_value(right, col.data_type);
+        use std::ops::Bound;
+        Some(match op {
+            "=" => index.equals(&literal),
+            ">" => index.range(Bound::Excluded(literal), Bound::Unbounded),
+            ">=" => index.range(Bound::Included(literal), Bound::Unbounded),
+            "<" => index.range(Bound::Unbounded, Bound::Excluded(literal)),
+            "<=" => index.range(Bound::Unbounded, Bound::Included(literal)),
+            _ => return None, // e.g. "!=" has no useful index range
+        })
+    }
+
+    /// Secondary-index path for `SELECT`: uses `secondary_index_candidates`
+    /// (see its docs, including why every candidate is re-checked below
+    /// rather than trusted outright), then fetches, deserializes, and
+    /// filters them into real `Tuple`s.
     ///
     /// Returns just the matching tuples, not `schema` -- see
     /// `try_pk_index_scan`'s docs for why.
@@ -935,24 +962,8 @@ impl QueryExecutor {
         full_predicate: &str,
     ) -> Result<Option<Vec<Tuple>>> {
         let table_id = schema.table_id as u64;
-        let candidates = {
-            let indexes = self.secondary_indexes.read();
-            let Some(index) = indexes.get(&(table_id, left.to_string())) else {
-                return Ok(None);
-            };
-            let Some(col) = schema.columns.iter().find(|c| c.name == left) else {
-                return Ok(None);
-            };
-            let literal = row_codec::parse_value(right, col.data_type);
-            use std::ops::Bound;
-            match op {
-                "=" => index.equals(&literal),
-                ">" => index.range(Bound::Excluded(literal), Bound::Unbounded),
-                ">=" => index.range(Bound::Included(literal), Bound::Unbounded),
-                "<" => index.range(Bound::Unbounded, Bound::Excluded(literal)),
-                "<=" => index.range(Bound::Unbounded, Bound::Included(literal)),
-                _ => return Ok(None), // e.g. "!=" has no useful index range
-            }
+        let Some(candidates) = self.secondary_index_candidates(table_id, schema, left, op, right) else {
+            return Ok(None);
         };
         let candidates: std::collections::HashSet<u64> = candidates.into_iter().collect();
         let compiled = row_codec::CompiledPredicate::compile(full_predicate, schema);
@@ -1306,6 +1317,78 @@ impl QueryExecutor {
         Ok(affected)
     }
 
+    /// Row source for `UPDATE`/`DELETE`'s initial candidate scan: the full
+    /// table by default, or — when `where_clause` reduces to `<column>
+    /// <op> <literal>` against an indexed column — a narrower candidate
+    /// set from that index instead, skipping the full-table
+    /// bincode-deserialize-and-filter pass entirely.
+    ///
+    /// `SELECT` already had both of these accelerations
+    /// (`try_pk_index_scan`/`try_secondary_index_scan`), but
+    /// `UPDATE`/`DELETE` never reused either — first found via the
+    /// primary-key case, while building a workload that does many
+    /// single-row `UPDATE ... WHERE id = ?` calls and it being
+    /// unexpectedly slow: every one of them deserialized and
+    /// predicate-checked *every* row in the table, no matter how narrow
+    /// the `WHERE` clause was. The same gap existed identically for a
+    /// `CREATE INDEX`-ed column, just never separately noticed until
+    /// checked for directly.
+    ///
+    /// Two tiers, tried in order:
+    /// 1. Exact `<primary key column> = <literal>` — a direct point read
+    ///    by row id (a row id always *is* its table's primary-key value;
+    ///    see `execution::mvcc_store::MVCCTable`'s docs). No
+    ///    re-verification concern here: a row's primary key can never
+    ///    change (`execute_update` rejects that), so this candidate is
+    ///    definitionally correct, not just probably so — same reasoning
+    ///    as `try_pk_index_scan`'s.
+    /// 2. `secondary_index_candidates` for any other indexed column and
+    ///    any of `=`/`>`/`>=`/`<`/`<=`. These candidates genuinely can be
+    ///    stale (see that function's docs) — but that's not a new risk
+    ///    introduced here: both callers already re-verify every candidate
+    ///    against the real predicate (and, for `UPDATE`, re-read under an
+    ///    exclusive lock) before writing anything, exactly as they did
+    ///    against a full scan's candidates before either tier existed. A
+    ///    wrong or stale candidate from either tier can therefore never
+    ///    produce a wrong result, only wasted-or-not-wasted work — which
+    ///    is also why neither tier needs to match every shape `SELECT`'s
+    ///    versions handle (a compound `AND`/`OR` `WHERE`, for instance):
+    ///    the full-scan fallback below stays correct regardless.
+    fn candidate_rows_for_write(
+        &self,
+        tx: TransactionId,
+        table_id: u64,
+        schema: &TableSchema,
+        where_clause: &Option<String>,
+    ) -> Vec<(u64, Vec<u8>)> {
+        if let Some(predicate) = where_clause {
+            if let Some((left, op, right)) = row_codec::split_comparison(predicate) {
+                if op == "=" {
+                    if let Some(pk_col) = schema.columns.iter().find(|c| c.primary_key) {
+                        if left == pk_col.name {
+                            if let Value::Integer(pk_value) = row_codec::parse_value(&right, pk_col.data_type) {
+                                return match self.oltp.read(tx, table_id, pk_value as u64) {
+                                    Ok(Some(bytes)) => vec![(pk_value as u64, bytes)],
+                                    _ => Vec::new(),
+                                };
+                            }
+                        }
+                    }
+                }
+                if let Some(candidates) = self.secondary_index_candidates(table_id, schema, &left, &op, &right) {
+                    return candidates
+                        .into_iter()
+                        .filter_map(|row_id| match self.oltp.read(tx, table_id, row_id) {
+                            Ok(Some(bytes)) => Some((row_id, bytes)),
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+        }
+        self.oltp.scan_table(tx, table_id)
+    }
+
     /// Execute an UPDATE: scans the table within one transaction, applies
     /// the SET assignments to every row matching WHERE (all rows if there's
     /// no WHERE), and writes each changed row back under its existing row
@@ -1335,58 +1418,6 @@ impl QueryExecutor {
     /// narrow `WHERE` would be its own regression); the `WHERE` clause is
     /// re-checked against the re-read value too, in case a concurrent
     /// commit changed a column it depends on in between.
-    /// Row source for `UPDATE`/`DELETE`'s initial candidate scan: the full
-    /// table by default, or — when `where_clause` is exactly `<primary
-    /// key column> = <literal>` — a single direct point read by row id
-    /// (a row id always *is* its table's primary-key value; see
-    /// `execution::mvcc_store::MVCCTable`'s docs), skipping the
-    /// full-table bincode-deserialize-and-filter pass entirely.
-    ///
-    /// `SELECT` already had this exact acceleration (`try_pk_index_scan`,
-    /// via the learned PK index), but `UPDATE`/`DELETE` never did — found
-    /// while building a workload that does many single-row `UPDATE ...
-    /// WHERE id = ?` calls and it being unexpectedly slow: every one of
-    /// them deserialized and predicate-checked *every* row in the table,
-    /// no matter how narrow the `WHERE` clause was.
-    ///
-    /// Deliberately narrower in scope than `try_pk_index_scan`'s SELECT
-    /// path: only exact `=` is accelerated (a range comparison like `>`
-    /// still falls back to the full scan below). The full scan stays
-    /// correct for every shape this doesn't recognize, so there's no
-    /// pressure to match every case SELECT's version handles — this
-    /// exists for the common case that actually matters here, a
-    /// single-row `UPDATE`/`DELETE` by primary key, not full parity.
-    /// Whatever this returns is still only a *candidate* set — both
-    /// callers already re-verify against the real predicate (and, for
-    /// `UPDATE`, re-read under an exclusive lock) before writing
-    /// anything, exactly as they did against a full scan's candidates
-    /// before this existed, so a wrong or stale candidate here can never
-    /// produce a wrong result, only wasted-or-not-wasted work.
-    fn candidate_rows_for_write(
-        &self,
-        tx: TransactionId,
-        table_id: u64,
-        schema: &TableSchema,
-        where_clause: &Option<String>,
-    ) -> Vec<(u64, Vec<u8>)> {
-        if let Some(predicate) = where_clause {
-            if let Some((left, op, right)) = row_codec::split_comparison(predicate) {
-                if op == "=" {
-                    if let Some(pk_col) = schema.columns.iter().find(|c| c.primary_key) {
-                        if left == pk_col.name {
-                            if let Value::Integer(pk_value) = row_codec::parse_value(&right, pk_col.data_type) {
-                                return match self.oltp.read(tx, table_id, pk_value as u64) {
-                                    Ok(Some(bytes)) => vec![(pk_value as u64, bytes)],
-                                    _ => Vec::new(),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.oltp.scan_table(tx, table_id)
-    }
 
     fn execute_update(&self, update: UpdateStatement) -> Result<usize> {
         let schema = self.catalog.read().get_table(&update.table).cloned().ok_or_else(|| {
@@ -3578,6 +3609,114 @@ mod tests {
         let rows = executor.execute_sql("SELECT * FROM users WHERE name = 'Robert'").unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].contains(&"15".to_string()));
+    }
+
+    #[test]
+    fn test_update_by_secondary_indexed_equality_uses_the_index_correctly() {
+        // WHERE name = <literal> on an indexed, non-PK column is exactly
+        // the shape candidate_rows_for_write's second tier (secondary
+        // index candidates) accelerates -- asserts the same correct
+        // result as the general full-scan path, not just that it's fast.
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let result = executor.execute_sql("UPDATE users SET age = 99 WHERE name = 'Alice'").unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"99".to_string()));
+        let bob = rows.iter().find(|r| r.contains(&"Bob".to_string())).unwrap();
+        assert!(bob.contains(&"15".to_string())); // untouched
+    }
+
+    #[test]
+    fn test_update_by_secondary_index_does_not_act_on_a_stale_candidate() {
+        // secondary_index_candidates can be stale -- an UPDATE adds a new
+        // index entry for a row's new value but never removes the old one
+        // (see secondary_index module docs). This asserts
+        // candidate_rows_for_write's re-verification (unchanged from the
+        // full-scan path's own re-check) still catches that, rather than
+        // the new acceleration trusting a stale candidate into a wrong
+        // write.
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+        seed_users(&executor); // Alice 30, Bob 15
+
+        // Bob's old name ("Bob") stays in the index as a stale entry
+        // after this rename.
+        executor.execute_sql("UPDATE users SET name = 'Robert' WHERE name = 'Bob'").unwrap();
+
+        // A second UPDATE against the now-stale "Bob" entry must affect
+        // nothing -- the row it points at no longer actually has that name.
+        let result = executor.execute_sql("UPDATE users SET age = 0 WHERE name = 'Bob'").unwrap();
+        assert_eq!(result, vec![vec!["0".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users WHERE name = 'Robert'").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"15".to_string()), "Robert's age must be unchanged by the no-op UPDATE against the stale 'Bob' entry");
+    }
+
+    #[test]
+    fn test_delete_by_secondary_indexed_equality_uses_the_index_correctly() {
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let result = executor.execute_sql("DELETE FROM users WHERE name = 'Alice'").unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Bob".to_string()));
+    }
+
+    #[test]
+    fn test_update_by_secondary_indexed_range_uses_the_index_correctly() {
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_age ON users (age)").unwrap();
+        seed_users(&executor); // Alice 30, Bob 15
+
+        let result = executor.execute_sql("UPDATE users SET age = 0 WHERE age > 20").unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"0".to_string()));
+        let bob = rows.iter().find(|r| r.contains(&"Bob".to_string())).unwrap();
+        assert!(bob.contains(&"15".to_string())); // untouched
+    }
+
+    #[test]
+    fn test_update_by_secondary_index_is_not_a_full_table_scan() {
+        // Real regression coverage, same shape as
+        // test_update_by_primary_key_is_not_a_full_table_scan: 3,000
+        // single-row UPDATEs by an indexed, non-PK column against a
+        // 3,000-row table is O(n) total with the index (each call touches
+        // one row's candidate set) but O(n^2) with a full scan.
+        let executor = QueryExecutor::new(users_catalog());
+        executor.execute_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+        let insert_stmt = executor.prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)").unwrap();
+        let n = 3000;
+        for id in 0..n {
+            executor
+                .execute_prepared(&insert_stmt, &[Value::Integer(id), Value::String(format!("user{id}")), Value::Integer(20)])
+                .unwrap();
+        }
+
+        let update_stmt = executor.prepare("UPDATE users SET age = ? WHERE name = ?").unwrap();
+        let start = std::time::Instant::now();
+        for id in 0..n {
+            executor
+                .execute_prepared(&update_stmt, &[Value::Integer(21), Value::String(format!("user{id}"))])
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs_f64() < 2.0,
+            "{n} single-row UPDATEs by an indexed column took {elapsed:.2?} -- looks like the full-scan path again"
+        );
     }
 
     #[test]
