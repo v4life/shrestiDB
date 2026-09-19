@@ -24,6 +24,7 @@ A relational database kernel written in Rust that leverages machine learning mod
 - **Real `HAVING`**: `select.having` was parsed by `sql::parser` and then never stored on `SelectStatement` at all — `GROUP BY user_id HAVING COUNT(*) > 1` silently returned every group, not just the ones matching the predicate. Fixed by carrying `having` through to `LogicalPlanNode::Aggregate` and filtering each group after aggregation, against a synthetic per-group schema covering both `GROUP BY` keys and any aggregate call the `HAVING` clause references — including one that isn't in the `SELECT` list at all (`SELECT user_id FROM orders GROUP BY user_id HAVING SUM(total) > 15` works, even with `SUM` unprojected). A `HAVING` clause on a query that isn't `GROUP BY`/all-aggregate is a hard plan-time error, not a silent no-op — the same discipline as an unbound `?`/`$N` placeholder reaching `execute_sql`.
 - **Real `SELECT DISTINCT`**: the fourth field in a row found parsed and then silently discarded this session — `select.distinct` was read from `sqlparser`'s AST and never stored anywhere, so `SELECT DISTINCT user_id FROM orders` returned every row, duplicates included, identical to plain `SELECT`. Fixed with a real `Distinct` node (`optimizer::planner::LogicalPlanNode::Distinct`), placed after `Project`/`Sort` and before `Limit` so it dedups the query's actual final row shape in whatever order `ORDER BY` already produced, not a wider pre-projection one. Correctly leaves `SELECT ALL` (the explicit opposite) alone, and doesn't confuse it with plain `SELECT`'s implicit non-distinct default. `DISTINCT ON (...)` (a Postgres extension) is recognized as `DISTINCT` but its column-subset argument isn't honored — a documented scope limit, not a different bug.
 - **Real `OFFSET`**: the fifth in a row — `OFFSET` had no field on `SelectStatement` at all, so `LIMIT 1 OFFSET 1` behaved identically to `LIMIT 1`, silently returning the first row instead of skipping it. Fixed by threading `select.offset` onto `LogicalPlanNode::Limit` alongside `limit`, skipped before the cap is applied (standard SQL order). `OFFSET` with no `LIMIT` (skip N, keep everything after) works too, and an `OFFSET` past every row is an empty result, not an error.
+- **`UPDATE`/`DELETE` now use the primary-key index**: found while building [the monotonic-key ingestion proof of concept](#proof-of-concept-a-monotonic-key-ingestion-niche) — `UPDATE ... WHERE id = ?` and `DELETE ... WHERE id = ?` never consulted the PK index at all, unconditionally deserializing and predicate-checking *every* row in the table on every call, no matter how narrow `WHERE` was (`SELECT` already had this exact acceleration, `try_pk_index_scan`, but it was never reused for writes). Fixed with `QueryExecutor::candidate_rows_for_write`: a direct point read for exact primary-key equality, falling back to the full scan for every other `WHERE` shape — narrow and safe by construction, since both callers already re-verify every candidate against the real predicate before writing anything, exactly as they did against a full scan's candidates before. Real, measured effect: 2,121 single-row `UPDATE`s went from 17.19s to 18.43ms — about 930x.
 
 ### Storage
 - **Write-Ahead Log**: Durable, real crash recovery — a plain append-only log (`execution::wal`) that every write goes through, replayed to rebuild the in-memory store on restart. See [`execution::recovery`](src/execution/recovery.rs).
@@ -96,6 +97,50 @@ be about. Discovered while building the memory-footprint comparison
 above, `index::btree::BTree` is now a real, node-splitting B+Tree — see
 that module's doc comment for the full story, and every number on this
 page that involves a "B-Tree" comparison has been re-measured against it.
+
+## 🎯 Proof of Concept: a monotonic-key ingestion niche
+If ShrestiDB isn't chasing SQLite/Postgres parity on raw query speed (it
+isn't — see [Point Lookup Latency vs
+SQLite](#point-lookup-latency-vs-sqlite-does-the-index-speedup-survive-the-full-sql-path)),
+what's the real, defensible thing it's good at? Not a number that shines
+in isolation, but a concrete scenario, end to end, through the actual SQL
+engine: a memory- and maintenance-efficient store for **monotonic-key,
+high-volume ingestion** — event logs, IoT telemetry, order/transaction
+streams. Two real wins, demonstrated together, on live engine state, in
+[`examples/monotonic_ingestion_niche.rs`](examples/monotonic_ingestion_niche.rs)
+(`cargo run --release --example monotonic_ingestion_niche`):
+
+An `events` table (`id INT PRIMARY KEY, device_id, value, processed`) is
+bulk-loaded with 500,000 rows via real prepared-statement `INSERT`s, then
+a realistic minority of events (5,000 of 500,000 — most events process
+cleanly on the first try, a minority get retried, an uneven number of
+times each) go through a retry storm of 52,648 real `UPDATE`s:
+
+| | Result |
+|---|---|
+| Ingest | 500,000 events, 19,752 rows/sec (see the caveat below) |
+| **Memory**: live PGM PK index vs. a real B+Tree over the same 500,000 ids | 3.82 MB vs. 16.15 MB — **4.2x smaller** |
+| Retry storm | 5,000 events, 52,648 real `UPDATE`s, 461ms |
+| **Retention**: dead MVCC versions left resident after the storm | 7,164 total — 1.43 per retried event, bounded automatically, no manual `VACUUM` |
+
+Two things worth being upfront about, found *while building this*, not
+polished away:
+
+- **A real bug, fixed**: `UPDATE`/`DELETE` never consulted the primary-key
+  index at all — every `UPDATE ... WHERE id = ?` did a full
+  deserialize-and-scan of the entire table, the exact acceleration
+  `SELECT` already had (`try_pk_index_scan`) just never reused for writes.
+  Before the fix, this example's smaller original retry storm (2,121
+  updates) took **17.19 seconds**; after, **18.43ms** — about 930x. See
+  the `UPDATE`/`DELETE` bullet above and
+  `QueryExecutor::candidate_rows_for_write`.
+- **A real limit, not fixed**: ingest throughput at 500,000 rows (19,752
+  rows/sec) is genuinely lower than at smaller scale, because
+  `DynamicPGMIndex` — the live PK index every `INSERT` goes through —
+  rebuilds its base PGM segments from scratch every 64 buffered inserts
+  (`index::pgm::DynamicPGMIndex::flush_buffer`), real O(n²)-ish bulk-load
+  cost at this scale. Flagged as a follow-up, not silently worked around
+  by shrinking the demo until the number looked better.
 
 ## 🏗️ Architecture
 
@@ -200,6 +245,7 @@ shrestidb/
     ├── oltp.rs                         # TPC-C-lite OLTP benchmark (New-Order/Payment)
     ├── learned_index_demo.rs           # Learned index showcase (PGM/RMI/B+Tree)
     ├── memory_footprint.rs             # Real PGM/RMI vs B+Tree memory footprint at scale
+    ├── monotonic_ingestion_niche.rs    # Proof of concept: memory + retention, real SQL, one workload
     ├── vs_sqlite.rs                    # Real comparison vs SQLite (in-process)
     ├── vs_sqlite_point_lookup.rs       # Point-lookup latency vs SQLite, full SQL path
     └── vs_postgres.rs                  # Real comparison vs Postgres (client/server)
@@ -396,6 +442,7 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture, algorithm description
 - [x] In-memory MVCC store with Write-Ahead Log recovery
 - [x] Learned index structures (RMI, PGM), real and measured against this codebase's own real (node-splitting) B+Tree — both lookup speed (scale-dependent, RMI winning at every size tested) and memory footprint (PGM ~4.2x smaller, consistent at every scale)
 - [x] Learned MVCC retention scheduling (`RetentionPredictor`), real and wired into every commit — a real training-data bug (the model could never fit under any realistic driven workload) found and fixed this session
+- [x] `UPDATE`/`DELETE` primary-key index acceleration (`candidate_rows_for_write`) — a real, ~930x measured fix, found while building the monotonic-key ingestion proof of concept below
 - [x] Basic SQL parsing and type system
 - [x] Real cardinality estimation (`ANALYZE`, PGM-fitted per-column distributions)
 - [x] Cost model consulted for real plan cost estimates

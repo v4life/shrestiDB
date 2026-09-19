@@ -1,8 +1,9 @@
 //! ShrestiDB vs SQLite: does the learned index's lookup speedup actually
 //! show up end-to-end, against a real competitor, in some scenario?
 //!
-//! `examples/learned_index_demo.rs` already shows PGM/RMI beating this
-//! codebase's own B-Tree by up to 36.8x on raw lookups -- but that's a
+//! `examples/learned_index_demo.rs` already shows RMI beating this
+//! codebase's own real B+Tree by up to ~9.8x on raw lookups at 1M records
+//! (PGM specifically is slower below 1M) -- but that's a
 //! component-level number, isolated from everything a real query pays for
 //! (parsing, row materialization, transaction/lock overhead). The one
 //! place `vs_sqlite.rs` tries to show an index advantage end-to-end (its

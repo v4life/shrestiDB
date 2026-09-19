@@ -17,8 +17,8 @@
 //! committed values (`QueryExecutor::execute_analyze`, driven by
 //! `ANALYZE <table>`), not synthesized. For a numeric column it reuses
 //! this codebase's own proven learned-index technique — `PGMIndex`,
-//! already shown to beat a B-tree by up to 36.8x on lookups — as a
-//! piecewise-linear model of the column's empirical CDF:
+//! already shown to use ~4.2x less memory than a real B+Tree at every
+//! scale tested — as a piecewise-linear model of the column's empirical CDF:
 //! `PGMIndex::predicted_rank(x)` estimates how many rows have a value
 //! `<= x`, whether or not `x` was ever actually in the data, which is
 //! exactly what a range predicate's selectivity needs. For a categorical

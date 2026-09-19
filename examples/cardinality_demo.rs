@@ -7,7 +7,8 @@
 //! costs on realistic, skewed data, and what a real, `ANALYZE`-driven
 //! estimate looks like instead — reusing this project's own proven
 //! learned-index technique (`PGMIndex`, already shown elsewhere in this
-//! repo to beat a B-tree by up to 36.8x on lookups) as a piecewise-linear
+//! repo to use ~4.2x less memory than a real B+Tree at every scale
+//! tested) as a piecewise-linear
 //! model of the column's empirical CDF, rather than a synthetic
 //! stand-in. See `optimizer::cardinality::ColumnDistribution` for the
 //! full mechanism, and that module's doc comment for why an earlier
