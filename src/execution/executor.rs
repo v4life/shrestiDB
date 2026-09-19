@@ -1335,6 +1335,59 @@ impl QueryExecutor {
     /// narrow `WHERE` would be its own regression); the `WHERE` clause is
     /// re-checked against the re-read value too, in case a concurrent
     /// commit changed a column it depends on in between.
+    /// Row source for `UPDATE`/`DELETE`'s initial candidate scan: the full
+    /// table by default, or — when `where_clause` is exactly `<primary
+    /// key column> = <literal>` — a single direct point read by row id
+    /// (a row id always *is* its table's primary-key value; see
+    /// `execution::mvcc_store::MVCCTable`'s docs), skipping the
+    /// full-table bincode-deserialize-and-filter pass entirely.
+    ///
+    /// `SELECT` already had this exact acceleration (`try_pk_index_scan`,
+    /// via the learned PK index), but `UPDATE`/`DELETE` never did — found
+    /// while building a workload that does many single-row `UPDATE ...
+    /// WHERE id = ?` calls and it being unexpectedly slow: every one of
+    /// them deserialized and predicate-checked *every* row in the table,
+    /// no matter how narrow the `WHERE` clause was.
+    ///
+    /// Deliberately narrower in scope than `try_pk_index_scan`'s SELECT
+    /// path: only exact `=` is accelerated (a range comparison like `>`
+    /// still falls back to the full scan below). The full scan stays
+    /// correct for every shape this doesn't recognize, so there's no
+    /// pressure to match every case SELECT's version handles — this
+    /// exists for the common case that actually matters here, a
+    /// single-row `UPDATE`/`DELETE` by primary key, not full parity.
+    /// Whatever this returns is still only a *candidate* set — both
+    /// callers already re-verify against the real predicate (and, for
+    /// `UPDATE`, re-read under an exclusive lock) before writing
+    /// anything, exactly as they did against a full scan's candidates
+    /// before this existed, so a wrong or stale candidate here can never
+    /// produce a wrong result, only wasted-or-not-wasted work.
+    fn candidate_rows_for_write(
+        &self,
+        tx: TransactionId,
+        table_id: u64,
+        schema: &TableSchema,
+        where_clause: &Option<String>,
+    ) -> Vec<(u64, Vec<u8>)> {
+        if let Some(predicate) = where_clause {
+            if let Some((left, op, right)) = row_codec::split_comparison(predicate) {
+                if op == "=" {
+                    if let Some(pk_col) = schema.columns.iter().find(|c| c.primary_key) {
+                        if left == pk_col.name {
+                            if let Value::Integer(pk_value) = row_codec::parse_value(&right, pk_col.data_type) {
+                                return match self.oltp.read(tx, table_id, pk_value as u64) {
+                                    Ok(Some(bytes)) => vec![(pk_value as u64, bytes)],
+                                    _ => Vec::new(),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.oltp.scan_table(tx, table_id)
+    }
+
     fn execute_update(&self, update: UpdateStatement) -> Result<usize> {
         let schema = self.catalog.read().get_table(&update.table).cloned().ok_or_else(|| {
             DatabaseError::ExecutionError(format!("Unknown table '{}'", update.table))
@@ -1369,7 +1422,7 @@ impl QueryExecutor {
         self.oltp.create_table(table_id);
 
         let tx = self.oltp.begin();
-        let rows = self.oltp.scan_table(tx, table_id);
+        let rows = self.candidate_rows_for_write(tx, table_id, &schema, &update.where_clause);
         let compiled_where = update.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p, &schema));
 
         let mut affected = 0usize;
@@ -1460,7 +1513,7 @@ impl QueryExecutor {
         self.oltp.create_table(table_id);
 
         let tx = self.oltp.begin();
-        let rows = self.oltp.scan_table(tx, table_id);
+        let rows = self.candidate_rows_for_write(tx, table_id, &schema, &delete.where_clause);
         let compiled_where = delete.where_clause.as_ref().and_then(|p| row_codec::CompiledPredicate::compile(p, &schema));
 
         let mut affected = 0usize;
@@ -2195,6 +2248,88 @@ mod tests {
 
         let rows = executor.execute_sql("SELECT * FROM users").unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_update_by_primary_key_equality_uses_the_fast_path_correctly() {
+        // WHERE id = <literal> is exactly the shape candidate_rows_for_write
+        // accelerates (a direct point read instead of a full table scan) --
+        // this asserts the fast path produces the same correct result as
+        // the general one, not just that it's fast.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let result = executor.execute_sql("UPDATE users SET age = 99 WHERE id = 1").unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"99".to_string()));
+        let bob = rows.iter().find(|r| r.contains(&"Bob".to_string())).unwrap();
+        assert!(bob.contains(&"15".to_string())); // untouched
+    }
+
+    #[test]
+    fn test_update_by_primary_key_equality_on_nonexistent_id_affects_nothing() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let result = executor.execute_sql("UPDATE users SET age = 99 WHERE id = 999").unwrap();
+        assert_eq!(result, vec![vec!["0".to_string()]]);
+    }
+
+    #[test]
+    fn test_delete_by_primary_key_equality_uses_the_fast_path_correctly() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let result = executor.execute_sql("DELETE FROM users WHERE id = 1").unwrap();
+        assert_eq!(result, vec![vec!["1".to_string()]]);
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(&"Bob".to_string()));
+    }
+
+    #[test]
+    fn test_delete_by_primary_key_equality_on_nonexistent_id_affects_nothing() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+
+        let result = executor.execute_sql("DELETE FROM users WHERE id = 999").unwrap();
+        assert_eq!(result, vec![vec!["0".to_string()]]);
+        assert_eq!(executor.execute_sql("SELECT * FROM users").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_update_by_primary_key_is_not_a_full_table_scan() {
+        // Real regression coverage for the bug candidate_rows_for_write
+        // fixes: UPDATE/DELETE used to scan and bincode-deserialize every
+        // row in the table on every call, regardless of how narrow WHERE
+        // was. 3,000 single-row `UPDATE ... WHERE id = ?` calls against a
+        // 3,000-row table is O(n) total with the point-read fast path
+        // (each call touches one row) but O(n^2) with a full scan (each
+        // call touches all n) -- at this n the two are seconds apart, not
+        // a close call a generous bound might flake on.
+        let executor = QueryExecutor::new(users_catalog());
+        let insert_stmt = executor.prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)").unwrap();
+        let n = 3000;
+        for id in 0..n {
+            executor
+                .execute_prepared(&insert_stmt, &[Value::Integer(id), Value::String(format!("user{id}")), Value::Integer(20)])
+                .unwrap();
+        }
+
+        let update_stmt = executor.prepare("UPDATE users SET age = ? WHERE id = ?").unwrap();
+        let start = std::time::Instant::now();
+        for id in 0..n {
+            executor.execute_prepared(&update_stmt, &[Value::Integer(21), Value::Integer(id)]).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs_f64() < 2.0,
+            "{n} single-row UPDATEs by primary key took {elapsed:.2?} -- looks like the full-scan path again, not the point-read fast path"
+        );
     }
 
     #[test]

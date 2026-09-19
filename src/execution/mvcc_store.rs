@@ -199,6 +199,15 @@ impl MVCCTable {
         self.rows.read().get(&row_id).map(|c| c.versions.len()).unwrap_or(0)
     }
 
+    /// Real allocated heap memory this table's primary-key index (the
+    /// live `DynamicPGMIndex` every real INSERT/read actually goes
+    /// through, not a structure built separately for measurement) is
+    /// currently using — see `index::pgm::DynamicPGMIndex::heap_bytes`.
+    /// `0` before this table's first insert (no index built yet).
+    pub fn pk_index_heap_bytes(&self) -> usize {
+        self.pk_index.lock().as_ref().map(|i| i.heap_bytes()).unwrap_or(0)
+    }
+
     /// Sweep dead versions out of one row's chain. See `VersionChain::prune`
     /// for the safety argument. Returns the number removed.
     pub(crate) fn prune_row(&self, row_id: RowId, horizon: u64) -> usize {
