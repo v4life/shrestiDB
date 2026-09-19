@@ -295,6 +295,20 @@ impl QueryExecutor {
                         LogicalPlanNode::Join { condition: Some(cond), .. } => {
                             *cond = row_codec::substitute_placeholders(cond, params, &mut next)?;
                         }
+                        LogicalPlanNode::Aggregate { having: Some(having), .. } => {
+                            // A `?`/`$N` in HAVING (e.g. `GROUP BY x
+                            // HAVING COUNT(*) > ?`) used to fall through
+                            // this match entirely (the old catch-all `_`
+                            // arm), leaving the literal placeholder text
+                            // in place -- CompiledPredicate::compile
+                            // would then reject it as an unrecognized
+                            // token and this statement would always hard
+                            // error, never actually substitute the bound
+                            // value. See scan_statement_placeholders'
+                            // matching fix (this same gap existed in
+                            // param counting too).
+                            *having = row_codec::substitute_placeholders(having, params, &mut next)?;
+                        }
                         _ => {}
                     }
                 }
@@ -371,6 +385,17 @@ impl QueryExecutor {
                 }
                 if let Some(predicate) = &select.where_clause {
                     row_codec::scan_placeholders(predicate, &mut positional, &mut indexed)?;
+                }
+                // HAVING after WHERE -- Aggregate comes after Filter in
+                // the physical plan's node order (see this function's
+                // docs on why that order matters here). A placeholder in
+                // HAVING (e.g. `GROUP BY x HAVING COUNT(*) > ?`) used to
+                // go uncounted here entirely -- prepare() would silently
+                // under-report param_count, and execute_prepared had no
+                // matching substitution arm for it either (see that
+                // function's Aggregate case).
+                if let Some(having) = &select.having {
+                    row_codec::scan_placeholders(having, &mut positional, &mut indexed)?;
                 }
             }
             SQLStatement::Insert(insert) => {
@@ -3696,6 +3721,76 @@ mod tests {
             .execute_sql("SELECT DISTINCT user_id FROM orders ORDER BY user_id DESC")
             .unwrap();
         assert_eq!(rows, vec![vec!["2".to_string()], vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_prepared_having_with_placeholder_substitutes_correctly() {
+        // Verified before the fix: a `?` in HAVING fell through
+        // execute_prepared's substitution entirely (no matching arm),
+        // and once that was added on its own, substitute_placeholders'
+        // rejoin-with-spaces reconstruction ("COUNT ( * ) > 1") broke
+        // aggregate::extract_calls' recognition of the call -- both real
+        // bugs, fixed together.
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        seed_orders(&executor); // user 1: 2 orders; user 2: 1 order
+
+        let stmt = executor
+            .prepare("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > ?")
+            .unwrap();
+
+        let rows = executor.execute_prepared(&stmt, &[Value::Integer(1)]).unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string(), "2".to_string()]]);
+
+        // Same prepared statement, a different threshold -- proves this
+        // is real substitution on each call, not a value baked in once.
+        let rows = executor.execute_prepared(&stmt, &[Value::Integer(0)]).unwrap();
+        let mut user_ids: Vec<&String> = rows.iter().map(|r| &r[0]).collect();
+        user_ids.sort();
+        assert_eq!(user_ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn test_prepare_counts_a_having_placeholder_in_param_count() {
+        // scan_statement_placeholders' matching gap: a HAVING-only
+        // placeholder used to go uncounted, so param_count would be 0
+        // for a statement that actually needs one parameter.
+        let executor = QueryExecutor::new(users_and_orders_catalog());
+        let stmt = executor
+            .prepare("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > ?")
+            .unwrap();
+        let err = executor.execute_prepared(&stmt, &[]).unwrap_err();
+        assert!(err.to_string().contains("expects 1 parameter"));
+    }
+
+    #[test]
+    fn test_limit_with_placeholder_errors_instead_of_being_silently_dropped() {
+        // Verified before the fix: SELECT * FROM users LIMIT ? silently
+        // returned every row (LIMIT discarded entirely, indistinguishable
+        // from no LIMIT clause at all) -- even through execute_sql
+        // directly, with no prepare() involved, unlike every other
+        // placeholder location this engine already rejected outright.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let err = executor.execute_sql("SELECT * FROM users LIMIT ?").unwrap_err();
+        assert!(err.to_string().contains("LIMIT must be a literal"));
+    }
+
+    #[test]
+    fn test_offset_with_placeholder_errors_instead_of_being_silently_dropped() {
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor);
+        let err = executor.execute_sql("SELECT * FROM users OFFSET ?").unwrap_err();
+        assert!(err.to_string().contains("OFFSET must be a literal"));
+    }
+
+    #[test]
+    fn test_limit_offset_with_literal_integers_still_works() {
+        // Regression guard for the fix above: a real, literal LIMIT/OFFSET
+        // must not have become collateral damage.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice(1) 30, Bob(2) 15
+        let rows = executor.execute_sql("SELECT * FROM users ORDER BY id LIMIT 1 OFFSET 1").unwrap();
+        assert_eq!(rows, vec![vec!["2".to_string(), "Bob".to_string(), "15".to_string()]]);
     }
 
     #[test]

@@ -291,8 +291,8 @@ impl SQLParser {
         };
         let having = select.having.as_ref().map(|e| e.to_string());
         let order_by = query.order_by.as_ref().map(|o| o.to_string());
-        let limit = query.limit_clause.as_ref().and_then(Self::extract_limit);
-        let offset = query.limit_clause.as_ref().and_then(Self::extract_offset).unwrap_or(0);
+        let limit = Self::extract_limit(query.limit_clause.as_ref())?;
+        let offset = Self::extract_offset(query.limit_clause.as_ref())?;
 
         Ok(SQLStatement::Select(SelectStatement {
             distinct,
@@ -366,29 +366,45 @@ impl SQLParser {
         }
     }
 
-    fn extract_limit(clause: &ast::LimitClause) -> Option<usize> {
-        match clause {
-            ast::LimitClause::LimitOffset { limit, .. } => {
-                limit.as_ref().and_then(Self::expr_as_usize)
-            }
-            _ => None,
-        }
+    /// `None` when there's no `LIMIT` clause at all. A `LIMIT` clause
+    /// that *is* present but isn't a literal integer (`LIMIT ?` -- a
+    /// placeholder, since this engine has no real support for binding
+    /// one into `LIMIT`/`OFFSET`; or any other expression) is a hard
+    /// error, not silently dropped -- an earlier version returned `None`
+    /// for that case too, indistinguishable from "no `LIMIT` clause was
+    /// written," so `SELECT * FROM t LIMIT ?` (even through `execute_sql`
+    /// directly, with no `prepare` involved at all) silently returned
+    /// *every* row instead of erroring on the unsupported placeholder.
+    fn extract_limit(clause: Option<&ast::LimitClause>) -> Result<Option<usize>> {
+        let Some(ast::LimitClause::LimitOffset { limit: Some(expr), .. }) = clause else {
+            return Ok(None);
+        };
+        Self::expr_as_usize(expr).map(Some).ok_or_else(|| {
+            DatabaseError::ParseError(format!("LIMIT must be a literal non-negative integer, got: '{expr}'"))
+        })
     }
 
-    /// `OFFSET <n>` — MySQL's `LIMIT <offset>, <limit>` form
+    /// `0` when there's no `OFFSET` clause at all (the default `OFFSET 0`
+    /// real SQL implies). Same hard-error treatment as `extract_limit`
+    /// for a present-but-non-literal `OFFSET` -- see that function's docs.
+    ///
+    /// MySQL's `LIMIT <offset>, <limit>` form
     /// (`ast::LimitClause::OffsetCommaLimit`) isn't recognized here any
-    /// more than `extract_limit` recognizes its `limit` half; both return
-    /// `None` for it rather than silently misreading one number as the
-    /// other. `GenericDialect` (what this parser uses throughout) doesn't
-    /// parse that MySQL-specific comma form in the first place, so this
-    /// isn't reachable today regardless.
-    fn extract_offset(clause: &ast::LimitClause) -> Option<usize> {
-        match clause {
-            ast::LimitClause::LimitOffset { offset, .. } => {
-                offset.as_ref().and_then(|o| Self::expr_as_usize(&o.value))
-            }
-            _ => None,
-        }
+    /// more than `extract_limit` recognizes its `limit` half; both treat
+    /// it as "no clause" rather than silently misreading one number as
+    /// the other. `GenericDialect` (what this parser uses throughout)
+    /// doesn't parse that MySQL-specific comma form in the first place,
+    /// so this isn't reachable today regardless.
+    fn extract_offset(clause: Option<&ast::LimitClause>) -> Result<usize> {
+        let Some(ast::LimitClause::LimitOffset { offset: Some(offset), .. }) = clause else {
+            return Ok(0);
+        };
+        Self::expr_as_usize(&offset.value).ok_or_else(|| {
+            DatabaseError::ParseError(format!(
+                "OFFSET must be a literal non-negative integer, got: '{}'",
+                offset.value
+            ))
+        })
     }
 
     fn expr_as_usize(expr: &ast::Expr) -> Option<usize> {

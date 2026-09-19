@@ -126,9 +126,28 @@ pub fn extract_calls(expr: &str) -> (String, Vec<(String, AggregateFn, Option<St
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
-            if i < chars.len() && chars[i] == '(' {
+            // Look past optional whitespace for the call's `(` without
+            // committing to it -- `substitute_placeholders` (a prepared
+            // statement's `?`/`$N` substitution) rebuilds a HAVING clause
+            // by rejoining tokens with a single space between every one,
+            // so a placeholder-bound `HAVING COUNT(*) > ?` arrives here
+            // as `"COUNT ( * ) > 1"`, not `"COUNT(*) > 1"` -- without
+            // this, that would silently fail to be recognized as an
+            // aggregate call at all (found and fixed together with
+            // QueryExecutor::execute_prepared's missing HAVING
+            // substitution arm, which had the exact same root symptom:
+            // a prepared HAVING placeholder always hard-erroring).
+            // `parse_aggregate` already tolerates this same whitespace
+            // internally (it trims both the function name and the
+            // argument), so once the call's *span* is found correctly,
+            // recognizing it works unchanged.
+            let mut paren_pos = i;
+            while paren_pos < chars.len() && chars[paren_pos].is_whitespace() {
+                paren_pos += 1;
+            }
+            if paren_pos < chars.len() && chars[paren_pos] == '(' {
                 let mut depth = 1;
-                let mut j = i + 1;
+                let mut j = paren_pos + 1;
                 while j < chars.len() && depth > 0 {
                     match chars[j] {
                         '(' => depth += 1,
@@ -258,6 +277,19 @@ mod tests {
     #[test]
     fn test_extract_calls_rewrites_a_single_aggregate() {
         let (rewritten, calls) = extract_calls("COUNT(*) > 1");
+        assert_eq!(rewritten, "__having_agg_0 > 1");
+        assert_eq!(calls, vec![("__having_agg_0".to_string(), AggregateFn::Count, None)]);
+    }
+
+    #[test]
+    fn test_extract_calls_recognizes_a_call_with_whitespace_around_the_parens() {
+        // A prepared statement's `?`/`$N` substitution
+        // (row_codec::substitute_placeholders) rebuilds an expression by
+        // rejoining tokens with a single space between every one, so a
+        // placeholder-bound HAVING clause arrives here as
+        // "COUNT ( * ) > 1", not "COUNT(*) > 1" -- must still be
+        // recognized as the same call.
+        let (rewritten, calls) = extract_calls("COUNT ( * ) > 1");
         assert_eq!(rewritten, "__having_agg_0 > 1");
         assert_eq!(calls, vec![("__having_agg_0".to_string(), AggregateFn::Count, None)]);
     }
