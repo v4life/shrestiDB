@@ -118,29 +118,39 @@ times each) go through a retry storm of 52,648 real `UPDATE`s:
 
 | | Result |
 |---|---|
-| Ingest | 500,000 events, 19,752 rows/sec (see the caveat below) |
-| **Memory**: live PGM PK index vs. a real B+Tree over the same 500,000 ids | 3.82 MB vs. 16.15 MB — **4.2x smaller** |
-| Retry storm | 5,000 events, 52,648 real `UPDATE`s, 461ms |
+| Ingest | 500,000 events, ~116,000 rows/sec |
+| **Memory**: live PGM PK index vs. a real B+Tree over the same 500,000 ids | 4.11 MB vs. 16.15 MB — **3.9x smaller** |
+| Retry storm | 5,000 events, 52,648 real `UPDATE`s, well under a second |
 | **Retention**: dead MVCC versions left resident after the storm | 7,164 total — 1.43 per retried event, bounded automatically, no manual `VACUUM` |
 
-Two things worth being upfront about, found *while building this*, not
-polished away:
+(The 3.9x here is slightly below `memory_footprint.rs`'s isolated 4.2x —
+this measures the live index mid-run, with a nonzero, not-yet-flushed
+write buffer sitting in it, not a freshly-built structure over a fully
+known key set. Both are real; they're just measuring at different
+moments.)
 
-- **A real bug, fixed**: `UPDATE`/`DELETE` never consulted the primary-key
-  index at all — every `UPDATE ... WHERE id = ?` did a full
-  deserialize-and-scan of the entire table, the exact acceleration
-  `SELECT` already had (`try_pk_index_scan`) just never reused for writes.
-  Before the fix, this example's smaller original retry storm (2,121
-  updates) took **17.19 seconds**; after, **18.43ms** — about 930x. See
-  the `UPDATE`/`DELETE` bullet above and
-  `QueryExecutor::candidate_rows_for_write`.
-- **A real limit, not fixed**: ingest throughput at 500,000 rows (19,752
-  rows/sec) is genuinely lower than at smaller scale, because
-  `DynamicPGMIndex` — the live PK index every `INSERT` goes through —
-  rebuilds its base PGM segments from scratch every 64 buffered inserts
+Three things worth being upfront about, found *while building this*, not
+polished away — two real bugs, both fixed here, not just flagged:
+
+- **`UPDATE`/`DELETE` never consulted the primary-key index at all** —
+  every `UPDATE ... WHERE id = ?` did a full deserialize-and-scan of the
+  entire table, the exact acceleration `SELECT` already had
+  (`try_pk_index_scan`) just never reused for writes. Before the fix,
+  this example's smaller original retry storm (2,121 updates) took
+  **17.19 seconds**; after, **18.43ms** — about 930x. See the
+  `UPDATE`/`DELETE` bullet above and `QueryExecutor::candidate_rows_for_write`.
+- **`DynamicPGMIndex` — the live PK index every `INSERT` goes through —
+  rebuilt its base PGM segments from scratch every 64 buffered inserts**
   (`index::pgm::DynamicPGMIndex::flush_buffer`), real O(n²)-ish bulk-load
-  cost at this scale. Flagged as a follow-up, not silently worked around
-  by shrinking the demo until the number looked better.
+  cost that only showed up at real scale: ingest throughput at 500,000
+  rows was 19,752 rows/sec, sharply down from ~108,000 rows/sec at
+  20,000 rows. Fixed with an unsorted, append-only write buffer (sorted
+  once, at flush time, instead of kept sorted on every single insert)
+  and a flush threshold that grows with the index instead of staying
+  fixed — the same amortized argument behind `Vec`'s own geometric
+  growth. Ingest throughput at 500,000 rows is now ~116,000 rows/sec,
+  matching the small-scale number instead of degrading against it. See
+  `index::pgm::DynamicPGMIndex`'s doc comment for the full mechanism.
 
 ## 🏗️ Architecture
 
@@ -443,6 +453,7 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture, algorithm description
 - [x] Learned index structures (RMI, PGM), real and measured against this codebase's own real (node-splitting) B+Tree — both lookup speed (scale-dependent, RMI winning at every size tested) and memory footprint (PGM ~4.2x smaller, consistent at every scale)
 - [x] Learned MVCC retention scheduling (`RetentionPredictor`), real and wired into every commit — a real training-data bug (the model could never fit under any realistic driven workload) found and fixed this session
 - [x] `UPDATE`/`DELETE` primary-key index acceleration (`candidate_rows_for_write`) — a real, ~930x measured fix, found while building the monotonic-key ingestion proof of concept below
+- [x] `DynamicPGMIndex` bulk-insert scaling (unsorted write buffer + a growing, not fixed, flush threshold) — a real O(n²)-to-O(n) fix, also found while building that proof of concept
 - [x] Basic SQL parsing and type system
 - [x] Real cardinality estimation (`ANALYZE`, PGM-fitted per-column distributions)
 - [x] Cost model consulted for real plan cost estimates

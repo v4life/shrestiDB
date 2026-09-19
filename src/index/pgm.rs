@@ -276,40 +276,90 @@ impl PGMIndex {
 }
 
 /// Dynamic PGM Index supporting high-throughput insertions without immediate full rebuilds
+///
+/// `insert` used to keep `write_buffer` sorted at all times (a
+/// `binary_search` to find the insertion point, then `Vec::insert` to
+/// shift everything after it into place) and `flush_buffer` merged it
+/// into `base` and called `PGMIndex::build` — an O(`base.len()`) full
+/// rebuild — every time the buffer reached a *fixed* `buffer_capacity`
+/// (64, set by every real caller — see `execution::mvcc_store::MVCCTable`,
+/// the live PK index every `INSERT` goes through). With a fixed
+/// threshold, the number of flushes for `n` total inserts is `n / 64`,
+/// each costing `O(current base size)` — total bulk-insert cost
+/// `O(n^2 / 64)`. Real and measured: `examples/monotonic_ingestion_niche.rs`
+/// showed real SQL insert throughput dropping from ~108,000 rows/sec at
+/// 20,000 rows to ~19,700 rows/sec at 500,000 rows on identical per-row
+/// work, purely from this.
+///
+/// Fixed two ways together (fixing only one reintroduces the other's
+/// cost, see each field's docs):
+/// 1. `write_buffer` is now unsorted between flushes — `insert` just
+///    appends (amortized O(1), same as any `Vec::push`) instead of
+///    finding-and-shifting into sorted position. It's sorted once, in
+///    `flush_buffer`, right before the merge that already needed sorted
+///    input.
+/// 2. The flush threshold now grows with `base`'s size instead of
+///    staying fixed at its construction-time value (still the *floor*,
+///    for a small or fresh index) — see `buffer_capacity`'s docs. Fewer,
+///    larger flushes as the index grows is the same amortized argument
+///    behind `Vec`'s own geometric growth: total flush cost across `n`
+///    inserts becomes `O(n)`, not `O(n^2)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicPGMIndex {
     /// Immutable/base PGM index
     pub base: PGMIndex,
-    /// Sorted write buffer (L0) absorbing writes
+    /// Write buffer (L0) absorbing writes — unsorted between flushes (see
+    /// this struct's docs); sorted once, in `flush_buffer`, immediately
+    /// before it's needed sorted for the merge.
     pub write_buffer: Vec<f64>,
-    /// Capacity of write buffer before triggering a linear merge & rebuild
+    /// Current capacity of `write_buffer` before triggering a flush.
+    /// Recomputed after every flush as `max(min_buffer_capacity,
+    /// base.keys.len() / BUFFER_GROWTH_DIVISOR)` — grows with the index
+    /// instead of staying fixed, so flush frequency drops as `base`
+    /// grows (see this struct's docs for why a fixed threshold makes
+    /// bulk insertion quadratic). Bounded well below `base.keys.len()`
+    /// itself (not doubling-style growth, which would let the buffer —
+    /// and therefore the linear-scan cost `contains`/`range_search` pay
+    /// against it — grow to a large fraction of the whole index) so read
+    /// latency doesn't pay for faster bulk writes.
     pub buffer_capacity: usize,
+    /// The smallest `buffer_capacity` is ever allowed to shrink back to —
+    /// fixed at whatever `new` was constructed with, so a small or
+    /// freshly-created index doesn't flush after every single insert
+    /// just because `base` is still tiny.
+    min_buffer_capacity: usize,
     /// Error bound for segments
     pub error_bound: usize,
 }
 
+/// `buffer_capacity` grows to `base.len() / BUFFER_GROWTH_DIVISOR` after
+/// each flush — the buffer never exceeds roughly this fraction of the
+/// index's total size, keeping `contains`/`range_search`'s linear scan
+/// over it cheap relative to the whole index even as bulk inserts get
+/// the full benefit of needing far fewer, larger flushes.
+const BUFFER_GROWTH_DIVISOR: usize = 8;
+
 impl DynamicPGMIndex {
-    /// Create a new dynamic PGM index
+    /// Create a new dynamic PGM index. `buffer_capacity` is the initial —
+    /// and minimum — flush threshold; see `DynamicPGMIndex::buffer_capacity`'s
+    /// docs for how it grows from here.
     pub fn new(keys: Vec<f64>, error_bound: usize, buffer_capacity: usize) -> Self {
         let base = PGMIndex::build(keys, error_bound);
         DynamicPGMIndex {
             base,
             write_buffer: Vec::with_capacity(buffer_capacity),
             buffer_capacity,
+            min_buffer_capacity: buffer_capacity,
             error_bound,
         }
     }
 
-    /// Insert key into the dynamic index
+    /// Insert key into the dynamic index. Appends to `write_buffer`
+    /// unsorted (amortized O(1) — see this struct's docs for why this
+    /// changed from a sorted insert) and flushes once the buffer reaches
+    /// its current (grown, not fixed) capacity.
     pub fn insert(&mut self, key: f64) {
-        let idx = match self
-            .write_buffer
-            .binary_search_by(|k| k.partial_cmp(&key).unwrap())
-        {
-            Ok(i) => i,
-            Err(i) => i,
-        };
-        self.write_buffer.insert(idx, key);
+        self.write_buffer.push(key);
 
         if self.write_buffer.len() >= self.buffer_capacity {
             self.flush_buffer();
@@ -321,6 +371,11 @@ impl DynamicPGMIndex {
         if self.write_buffer.is_empty() {
             return;
         }
+
+        // write_buffer is unsorted between flushes (see this struct's
+        // docs) -- the merge below needs both inputs sorted, and this is
+        // the one place that's actually required, not on every insert.
+        self.write_buffer.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         // Merge two sorted vectors in O(N + M)
         let mut merged = Vec::with_capacity(self.base.keys.len() + self.write_buffer.len());
@@ -349,21 +404,26 @@ impl DynamicPGMIndex {
 
         self.write_buffer.clear();
         self.base = PGMIndex::build(merged, self.error_bound);
+        self.buffer_capacity = (self.base.keys.len() / BUFFER_GROWTH_DIVISOR).max(self.min_buffer_capacity);
     }
 
-    /// Check if key exists in either write buffer or base PGM
+    /// Check if key exists in either write buffer or base PGM. A linear
+    /// scan over `write_buffer` now, not a `binary_search` -- it's
+    /// unsorted between flushes (see this struct's docs), and bounded by
+    /// `buffer_capacity`'s growth policy to stay a small fraction of the
+    /// index's total size, not the whole thing.
     pub fn contains(&self, key: f64) -> bool {
-        if self
-            .write_buffer
-            .binary_search_by(|k| k.partial_cmp(&key).unwrap())
-            .is_ok()
-        {
+        if self.write_buffer.iter().any(|&k| k == key) {
             return true;
         }
         self.base.search(key).is_some()
     }
 
-    /// Range search across write buffer and base PGM
+    /// Range search across write buffer and base PGM. Already did its own
+    /// linear filter over `write_buffer` plus a final sort of the
+    /// combined results even before `write_buffer` became unsorted
+    /// between flushes (see this struct's docs) -- unaffected by that
+    /// change, unlike `contains`, which used to rely on it being sorted.
     pub fn range_search(&self, min_key: f64, max_key: f64) -> Vec<f64> {
         let mut results = Vec::new();
 
@@ -524,6 +584,97 @@ mod tests {
 
         let res = dpgm.range_search(4.0, 16.0);
         assert_eq!(res, vec![5.0, 10.0, 15.0]);
+    }
+
+    #[test]
+    fn test_dynamic_pgm_buffer_capacity_grows_with_base_size_not_fixed() {
+        // The actual fix: a fixed flush threshold makes bulk-insert cost
+        // O(n^2) (see this struct's docs) -- buffer_capacity must actually
+        // grow as base grows, not stay pinned at its construction-time
+        // value forever.
+        let mut dpgm = DynamicPGMIndex::new(Vec::new(), 4, 64);
+        let initial_capacity = dpgm.buffer_capacity;
+        assert_eq!(initial_capacity, 64);
+
+        for i in 0..50_000 {
+            dpgm.insert(i as f64);
+        }
+
+        assert!(
+            dpgm.buffer_capacity > initial_capacity,
+            "buffer_capacity should have grown past its initial 64 after 50,000 inserts, still {}",
+            dpgm.buffer_capacity
+        );
+    }
+
+    #[test]
+    fn test_dynamic_pgm_buffer_capacity_never_shrinks_below_its_floor() {
+        // A tiny index (few flushes, small base) must not flush on every
+        // single insert just because base.len()/BUFFER_GROWTH_DIVISOR
+        // rounds down to something smaller than the original floor.
+        let mut dpgm = DynamicPGMIndex::new(Vec::new(), 4, 64);
+        for i in 0..10 {
+            dpgm.insert(i as f64);
+        }
+        assert_eq!(dpgm.buffer_capacity, 64, "a small index shouldn't shrink its flush threshold below the floor");
+    }
+
+    #[test]
+    fn test_dynamic_pgm_correct_after_many_flush_cycles() {
+        // Exercises the unsorted-write-buffer change (insert no longer
+        // keeps it sorted; flush_buffer sorts it once before merging) and
+        // the growing buffer_capacity together, across many real flush
+        // cycles -- contains() and range_search() must still be correct
+        // for every key, not just the ones in the still-unflushed buffer
+        // at the end.
+        let mut dpgm = DynamicPGMIndex::new(Vec::new(), 4, 64);
+        let n = 20_000;
+        // Inserted out of order on purpose -- insert() no longer requires
+        // (or produces) sorted arrival order now that write_buffer isn't
+        // kept sorted between flushes.
+        let mut keys: Vec<i64> = (0..n).collect();
+        let mut rng_state: u64 = 0xC0FFEE;
+        for i in (1..keys.len()).rev() {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (rng_state >> 33) as usize % (i + 1);
+            keys.swap(i, j);
+        }
+        for &k in &keys {
+            dpgm.insert(k as f64);
+        }
+
+        assert_eq!(dpgm.len(), n as usize);
+        for k in [0i64, 1, n / 2, n - 1] {
+            assert!(dpgm.contains(k as f64), "missing key {k} after {n} out-of-order inserts across many flush cycles");
+        }
+        assert!(!dpgm.contains(-1.0));
+        assert!(!dpgm.contains(n as f64));
+
+        let range = dpgm.range_search(100.0, 105.0);
+        assert_eq!(range, vec![100.0, 101.0, 102.0, 103.0, 104.0, 105.0]);
+    }
+
+    #[test]
+    fn test_dynamic_pgm_bulk_insert_is_not_quadratic() {
+        // Real regression coverage for the O(n^2/64) bug this fix
+        // addresses: 200,000 inserts into a growing index. With the old
+        // fixed-64-threshold behavior (200,000/64 ~= 3,125 full rebuilds,
+        // each averaging ~100,000 keys) this took long enough to be a
+        // real, measured problem (examples/monotonic_ingestion_niche.rs
+        // showed real SQL insert throughput dropping ~5x between 20,000
+        // and 500,000 rows because of it). With a growing threshold, this
+        // must complete in well under a second, not tens of seconds.
+        let mut dpgm = DynamicPGMIndex::new(Vec::new(), 4, 64);
+        let n = 200_000;
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            dpgm.insert(i as f64);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs_f64() < 1.0,
+            "{n} inserts took {elapsed:.2?} -- looks like the old fixed-threshold O(n^2) behavior again"
+        );
     }
 
     #[test]

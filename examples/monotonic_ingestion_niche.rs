@@ -47,13 +47,19 @@
 //! through the real SQL path, in one realistic scenario -- not to
 //! re-derive numbers already measured elsewhere.
 //!
-//! Also reported honestly, not hidden: ingest throughput at 500K rows is
-//! real but well below this table's small-scale number, because
-//! `DynamicPGMIndex` rebuilds its base PGM segments from scratch on every
-//! 64-insert buffer flush (`index::pgm::DynamicPGMIndex::flush_buffer`) --
-//! real, measured, quadratic-ish bulk-insert cost at this scale, and a
-//! separate finding from the two this example sets out to demonstrate,
-//! not addressed here.
+//! A third real finding, also surfaced by running this at scale (not
+//! addressed when this example was first written, fixed since):
+//! `DynamicPGMIndex` used to rebuild its base PGM segments from scratch
+//! on every fixed 64-insert buffer flush -- real, quadratic-ish bulk-
+//! insert cost that only showed up at real scale, not at this table's
+//! smaller early test runs. Ingest throughput at 500,000 rows was
+//! 19,752 rows/sec before the fix, dropping sharply from the ~108,000
+//! rows/sec a 20,000-row run showed; after it (see
+//! `index::pgm::DynamicPGMIndex`'s docs for the fix itself -- an
+//! unsorted, append-only write buffer plus a flush threshold that grows
+//! with the index instead of staying fixed), throughput at 500,000 rows
+//! is back to ~110,000 rows/sec, matching the small-scale number instead
+//! of degrading against it.
 
 use shrestidb::execution::catalog::Catalog;
 use shrestidb::execution::executor::QueryExecutor;
@@ -115,12 +121,12 @@ fn main() {
         "Ingested {NUM_EVENTS} events (monotonic id, {NUM_DEVICES} devices) in {ingest_elapsed:.2?} ({rows_per_sec:.0} rows/sec)"
     );
     println!(
-        "(Real number, not a peak: DynamicPGMIndex rebuilds its base segments from scratch every 64"
+        "(DynamicPGMIndex's write-buffer flush threshold now grows with the index instead of"
     );
     println!(
-        "buffered inserts, so throughput at this scale reflects that -- a smaller run shows a higher"
+        "staying fixed -- this throughput should be close to what a smaller run shows, not"
     );
-    println!("rows/sec, not a more honest one. A separate, real finding, not addressed here.)\n");
+    println!("degraded against it. It used to be ~5x lower at this scale before that fix.)\n");
 
     // ── Real memory footprint: the live PK index vs a real B+Tree ─────
     let table = executor.oltp.store.table(table_id);
