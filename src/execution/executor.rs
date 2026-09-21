@@ -1606,7 +1606,21 @@ impl QueryExecutor {
             // assignment see the first one's already-written result.
             let original = tuple.clone();
             for (idx, compiled) in &assignments {
-                tuple.values[*idx] = compiled.eval(&original);
+                match compiled.eval(&original) {
+                    Ok(v) => tuple.values[*idx] = v,
+                    Err(e) => {
+                        // A genuine type error (e.g. "active + 1" on a
+                        // Boolean column) used to silently write NULL
+                        // here instead -- see CompiledAssignment::eval's
+                        // docs. Abort rather than leave the transaction
+                        // holding this row's lock.
+                        self.oltp.abort(tx);
+                        return Err(DatabaseError::ExecutionError(format!(
+                            "Cannot compute value for column '{}': {e}",
+                            schema.columns[*idx].name
+                        )));
+                    }
+                }
             }
             indexed_rows.push((row_id, tuple.values.clone()));
 
@@ -2288,6 +2302,25 @@ mod tests {
         let executor = QueryExecutor::new(users_catalog());
         seed_users(&executor);
         assert!(executor.execute_sql("UPDATE users SET id = 99 WHERE id = 1").is_err());
+    }
+
+    #[test]
+    fn test_update_set_with_type_mismatched_arithmetic_errors_instead_of_writing_null() {
+        // "age - name": Integer column minus String column. This
+        // compiles fine as an arithmetic shape (two bare column
+        // operands, one operator), but the operand *types* don't
+        // support subtraction -- a genuine type error, not a
+        // legitimate per-row numeric edge case like division by zero.
+        // Verified empirically before the fix: this succeeded and
+        // silently wrote Alice's age to NULL.
+        let executor = QueryExecutor::new(users_catalog());
+        seed_users(&executor); // Alice 30, Bob 15
+        let err = executor.execute_sql("UPDATE users SET age = age - name WHERE name = 'Alice'").unwrap_err();
+        assert!(err.to_string().contains("age"), "error should name the offending column: {err}");
+
+        let rows = executor.execute_sql("SELECT * FROM users").unwrap();
+        let alice = rows.iter().find(|r| r.contains(&"Alice".to_string())).unwrap();
+        assert!(alice.contains(&"30".to_string()), "Alice's age must be untouched, not silently NULLed");
     }
 
     #[test]

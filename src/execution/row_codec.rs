@@ -326,14 +326,25 @@ impl CompiledAssignment {
     /// docs on why the caller must pass the row as it was before any of
     /// this UPDATE's other assignments were applied, not a
     /// partway-mutated working copy.
-    pub fn eval(&self, tuple: &Tuple) -> Value {
+    ///
+    /// Returns `Err` for a genuine type error (e.g. `active + 1` where
+    /// `active` is a `Boolean` column, or `name - name` on two `String`
+    /// columns — `-` isn't defined for strings) — verified empirically to
+    /// otherwise silently write `Value::Null`, the same bug class
+    /// `compile`'s `None` return exists to close, just one evaluation
+    /// step later. This is distinct from `Ok(Value::Null)`, which is the
+    /// *correct* result for a legitimately null operand (SQL NULL
+    /// propagation) or for integer/float division by zero (matches this
+    /// project's SQLite-compatibility target — see
+    /// `test_compiled_assignment_division_by_zero_is_null`).
+    pub fn eval(&self, tuple: &Tuple) -> std::result::Result<Value, String> {
         match &self.kind {
-            AssignmentKind::Literal(v) => v.clone(),
-            AssignmentKind::ColumnRef(idx) => tuple.values.get(*idx).cloned().unwrap_or(Value::Null),
+            AssignmentKind::Literal(v) => Ok(v.clone()),
+            AssignmentKind::ColumnRef(idx) => Ok(tuple.values.get(*idx).cloned().unwrap_or(Value::Null)),
             AssignmentKind::Arithmetic { left, op, right } => {
                 let left = Self::operand_value(left, tuple);
                 let right = Self::operand_value(right, tuple);
-                arith(&left, *op, &right).unwrap_or(Value::Null)
+                arith(&left, *op, &right)
             }
         }
     }
@@ -385,29 +396,41 @@ fn parse_literal_value(token: &str) -> Option<Value> {
     None
 }
 
-fn arith(left: &Value, op: char, right: &Value) -> Option<Value> {
+/// `Ok(Null)` for a legitimately null result (either operand is NULL, or
+/// integer/float division by zero — both real SQL outcomes, not errors).
+/// `Err` for a genuine type/operator mismatch (e.g. `Boolean + Integer`,
+/// or `-`/`*`/`/` on two `String`s — only `+`, as concatenation, is
+/// defined for strings) — these used to be indistinguishable from the
+/// legitimate cases above, silently collapsing to `Value::Null` either
+/// way (see `CompiledAssignment::eval`'s docs).
+fn arith(left: &Value, op: char, right: &Value) -> std::result::Result<Value, String> {
     use Value::*;
+    if matches!(left, Null) || matches!(right, Null) {
+        return Ok(Null);
+    }
     match (left, right) {
         (Integer(a), Integer(b)) => match op {
-            '+' => Some(Integer(a + b)),
-            '-' => Some(Integer(a - b)),
-            '*' => Some(Integer(a * b)),
-            '/' if *b != 0 => Some(Integer(a / b)),
-            _ => None,
+            '+' => Ok(Integer(a + b)),
+            '-' => Ok(Integer(a - b)),
+            '*' => Ok(Integer(a * b)),
+            '/' if *b != 0 => Ok(Integer(a / b)),
+            '/' => Ok(Null),
+            _ => Err(format!("unsupported operator '{op}' between integers")),
         },
-        (String(a), String(b)) if op == '+' => Some(String(format!("{a}{b}"))),
+        (String(a), String(b)) if op == '+' => Ok(String(format!("{a}{b}"))),
         (Integer(_) | Float(_), Integer(_) | Float(_)) => {
-            let a = as_f64(left)?;
-            let b = as_f64(right)?;
+            let a = as_f64(left).expect("checked Integer/Float above");
+            let b = as_f64(right).expect("checked Integer/Float above");
             match op {
-                '+' => Some(Float(a + b)),
-                '-' => Some(Float(a - b)),
-                '*' => Some(Float(a * b)),
-                '/' if b != 0.0 => Some(Float(a / b)),
-                _ => None,
+                '+' => Ok(Float(a + b)),
+                '-' => Ok(Float(a - b)),
+                '*' => Ok(Float(a * b)),
+                '/' if b != 0.0 => Ok(Float(a / b)),
+                '/' => Ok(Null),
+                _ => Err(format!("unsupported operator '{op}' between numbers")),
             }
         }
-        _ => None,
+        _ => Err(format!("cannot apply '{op}' between {left:?} and {right:?}")),
     }
 }
 
@@ -1116,7 +1139,7 @@ mod tests {
         // CompiledAssignment's arithmetic support.
         let schema = schema();
         let compiled = CompiledAssignment::compile("31", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(31));
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)).unwrap(), Value::Integer(31));
     }
 
     #[test]
@@ -1126,21 +1149,21 @@ mod tests {
         // soft to NULL instead of computing anything.
         let schema = schema();
         let compiled = CompiledAssignment::compile("age + 1", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(31));
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)).unwrap(), Value::Integer(31));
     }
 
     #[test]
     fn test_compiled_assignment_column_minus_literal() {
         let schema = schema();
         let compiled = CompiledAssignment::compile("age - 5", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(25));
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)).unwrap(), Value::Integer(25));
     }
 
     #[test]
     fn test_compiled_assignment_column_times_literal() {
         let schema = schema();
         let compiled = CompiledAssignment::compile("age * 2", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(60));
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)).unwrap(), Value::Integer(60));
     }
 
     #[test]
@@ -1148,10 +1171,10 @@ mod tests {
         // "SET age = id" -- both operands are columns.
         let schema = schema();
         let compiled = CompiledAssignment::compile("id", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(7, "Bob", 30, true)), Value::Integer(7));
+        assert_eq!(compiled.eval(&row(7, "Bob", 30, true)).unwrap(), Value::Integer(7));
 
         let compiled = CompiledAssignment::compile("id + age", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(7, "Bob", 30, true)), Value::Integer(37));
+        assert_eq!(compiled.eval(&row(7, "Bob", 30, true)).unwrap(), Value::Integer(37));
     }
 
     #[test]
@@ -1161,7 +1184,36 @@ mod tests {
         // distinct from a compile-time rejection.
         let schema = schema();
         let compiled = CompiledAssignment::compile("age / 0", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Null);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_compiled_assignment_type_mismatched_arithmetic_is_an_eval_error_not_null() {
+        // Verified empirically before this fix: both of these compiled
+        // fine (a valid two-operand arithmetic shape) and then silently
+        // evaluated to Value::Null, indistinguishable from the
+        // legitimate "age / 0" case. "active + 1" -- Boolean plus
+        // Integer -- is a genuine type error, not a per-value edge case.
+        let schema = schema();
+        let compiled = CompiledAssignment::compile("active + 1", &schema, DataType::Boolean).unwrap();
+        assert!(compiled.eval(&row(1, "Bob", 30, true)).is_err());
+
+        // "name - name" -- String minus String; '+' is defined for
+        // strings (concatenation) but '-' is not.
+        let compiled2 = CompiledAssignment::compile("name - name", &schema, DataType::String).unwrap();
+        assert!(compiled2.eval(&row(1, "Bob", 30, true)).is_err());
+    }
+
+    #[test]
+    fn test_compiled_assignment_null_operand_still_propagates_as_null() {
+        // A legitimately-NULL operand (as opposed to a type mismatch)
+        // must still produce Ok(Null), not an error -- standard SQL NULL
+        // propagation through arithmetic.
+        let schema = schema();
+        let mut tuple = row(1, "Bob", 30, true);
+        tuple.values[2] = Value::Null; // age
+        let compiled = CompiledAssignment::compile("age + 1", &schema, DataType::Integer).unwrap();
+        assert_eq!(compiled.eval(&tuple).unwrap(), Value::Null);
     }
 
     #[test]
@@ -1198,7 +1250,7 @@ mod tests {
         // accident, now that everything else unparseable is a hard error.
         let schema = schema();
         let compiled = CompiledAssignment::compile("NULL", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Null);
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)).unwrap(), Value::Null);
     }
 
     #[test]
@@ -1211,7 +1263,7 @@ mod tests {
         string_schema.add_column(Column { id: 1, name: "name".to_string(), data_type: DataType::String, nullable: false, primary_key: false });
         assert!(CompiledAssignment::compile("Bob", &string_schema, DataType::String).is_none());
         let compiled = CompiledAssignment::compile("'Bob'", &string_schema, DataType::String).unwrap();
-        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::String("Bob".to_string()));
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)).unwrap(), Value::String("Bob".to_string()));
     }
 
     #[test]
@@ -1221,7 +1273,7 @@ mod tests {
         // plain-literal path, not be misread as a two-token expression.
         let schema = schema();
         let compiled = CompiledAssignment::compile("-5", &schema, DataType::Integer).unwrap();
-        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)), Value::Integer(-5));
+        assert_eq!(compiled.eval(&row(1, "Bob", 30, true)).unwrap(), Value::Integer(-5));
     }
 
     #[test]
