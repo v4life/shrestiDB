@@ -10,8 +10,12 @@ name = "shrestidb"
 path = "src/lib.rs"
 
 [[bin]]
-name = "db-server"
+name = "shrestidb"
 path = "src/main.rs"
+
+[[bin]]
+name = "db-server"
+path = "src/bin/db_server.rs"
 
 [dependencies]
 # Concurrency & Async I/O
