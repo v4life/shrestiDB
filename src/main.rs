@@ -6,7 +6,6 @@
 //! - Embedded Web Studio GUI via `--studio` / `--web`
 //! - Durable storage backed by Write-Ahead Logging (WAL) and MVCC
 
-use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -366,6 +365,21 @@ fn execute_and_print(sql: &str, executor: &QueryExecutor) -> bool {
     }
 }
 
+fn get_history_file() -> Option<std::path::PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = std::path::PathBuf::from(home).join(".shrestidb_history");
+        if std::fs::OpenOptions::new().create(true).append(true).open(&path).is_ok() {
+            return Some(path);
+        }
+    }
+    // Fallback to local directory if HOME is non-writable
+    let local = std::path::PathBuf::from(".shrestidb_history");
+    if std::fs::OpenOptions::new().create(true).append(true).open(&local).is_ok() {
+        return Some(local);
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opts = match parse_args() {
@@ -423,45 +437,62 @@ async fn main() -> anyhow::Result<()> {
         println!("Type SQL statements, '\\?' for help, or '\\q' / 'exit' to quit.\n");
     }
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let history_file = get_history_file();
+    let mut rl = rustyline::DefaultEditor::new()?;
+    if let Some(ref path) = history_file {
+        let _ = rl.load_history(path);
+    }
 
     loop {
-        print!("shrestidb> ");
-        stdout.flush()?;
+        let readline = rl.readline("shrestidb> ");
+        let line = match readline {
+            Ok(l) => l,
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!("Bye!");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error reading line: {err}");
+                break;
+            }
+        };
 
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            println!();
-            break; // EOF (piped input ended, or Ctrl-D)
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
 
-        if line.eq_ignore_ascii_case("exit")
-            || line.eq_ignore_ascii_case("quit")
-            || line == "\\q"
-            || line == "\\Q"
+        let _ = rl.add_history_entry(trimmed);
+
+        if trimmed.eq_ignore_ascii_case("exit")
+            || trimmed.eq_ignore_ascii_case("quit")
+            || trimmed == "\\q"
+            || trimmed == "\\Q"
         {
             println!("Bye!");
             break;
         }
 
         // Check for shell meta commands
-        if handle_meta_command(line, &executor, &opts.wal_path) {
+        if handle_meta_command(trimmed, &executor, &opts.wal_path) {
             continue;
         }
 
         // Execute SQL statements (supports multi-statement semicolon separated)
-        for stmt in line.split(';') {
+        for stmt in trimmed.split(';') {
             let stmt = stmt.trim();
             if !stmt.is_empty() {
                 execute_and_print(stmt, &executor);
             }
         }
+    }
+
+    if let Some(ref path) = history_file {
+        let _ = rl.save_history(path);
     }
 
     Ok(())
