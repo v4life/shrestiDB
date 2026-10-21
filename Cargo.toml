@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "db-server"
 path = "src/bin/db_server.rs"
 
+[[bin]]
+name = "shrestidb-studio"
+path = "src/bin/studio.rs"
+
 [dependencies]
 # Concurrency & Async I/O
 tokio = { version = "1.35", features = ["full"] }

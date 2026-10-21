@@ -3,12 +3,16 @@
 //! Command Line Interface (CLI) for the ShrestiDB learned database kernel:
 //! - Interactive REPL with formatted tabular output, execution timing, and meta-commands
 //! - Non-interactive SQL execution via `-e` / `--execute`
+//! - Embedded Web Studio GUI via `--studio` / `--web`
 //! - Durable storage backed by Write-Ahead Logging (WAL) and MVCC
 
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 use std::time::Instant;
 
 use shrestidb::execution::QueryExecutor;
+use shrestidb::sql::parser::{SQLParser, SQLStatement};
+use shrestidb::studio::StudioServer;
 use shrestidb::VERSION;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -17,11 +21,12 @@ struct CliOptions {
     wal_path: String,
     execute: Option<String>,
     quiet: bool,
+    studio_port: Option<u16>,
 }
 
 fn print_usage() {
     println!(
-        r#"ShrestiDB {VERSION} — Learned Database Kernel CLI
+        r#"ShrestiDB {VERSION} — Learned Database Kernel CLI & Web Studio
 
 USAGE:
     shrestidb [OPTIONS] [WAL_FILE]
@@ -32,6 +37,7 @@ ARGS:
 OPTIONS:
     -e, --execute <SQL>     Execute SQL statement(s) non-interactively and exit
     -w, --wal <PATH>        Path to WAL file for persistence
+    --studio, --web [PORT]  Launch local Web Studio & Query GUI (default: 8080)
     -q, --quiet             Quiet mode (suppress welcome banner and logs)
     -V, --version           Print version and exit
     -h, --help              Print this help message and exit
@@ -52,6 +58,7 @@ fn parse_args() -> Result<Option<CliOptions>, i32> {
     let mut wal_path = "shrestidb.wal".to_string();
     let mut execute = None;
     let mut quiet = false;
+    let mut studio_port = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -65,6 +72,18 @@ fn parse_args() -> Result<Option<CliOptions>, i32> {
             }
             "-q" | "--quiet" => {
                 quiet = true;
+            }
+            "--studio" | "--web" => {
+                let port = 8080u16;
+                studio_port = Some(port);
+            }
+            s if s.starts_with("--studio=") => {
+                let port = s.trim_start_matches("--studio=").parse().unwrap_or(8080);
+                studio_port = Some(port);
+            }
+            s if s.starts_with("--web=") => {
+                let port = s.trim_start_matches("--web=").parse().unwrap_or(8080);
+                studio_port = Some(port);
             }
             "-w" | "--wal" => {
                 if let Some(path) = args.next() {
@@ -102,22 +121,29 @@ fn parse_args() -> Result<Option<CliOptions>, i32> {
         wal_path,
         execute,
         quiet,
+        studio_port,
     }))
 }
 
-/// Print tabular data in an aligned ASCII box
-fn print_table(rows: &[Vec<String>]) {
-    if rows.is_empty() {
+/// Print tabular data with proper headers and data rows in an aligned ASCII box
+fn print_table_with_headers(headers: &[String], rows: &[Vec<String>]) {
+    let col_count = if !headers.is_empty() {
+        headers.len()
+    } else if let Some(first) = rows.first() {
+        first.len()
+    } else {
         return;
-    }
-    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    if col_count == 0 {
-        return;
-    }
+    };
+
     let mut widths = vec![0; col_count];
+    for (i, h) in headers.iter().enumerate() {
+        if i < col_count && h.len() > widths[i] {
+            widths[i] = h.len();
+        }
+    }
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
-            if cell.len() > widths[i] {
+            if i < col_count && cell.len() > widths[i] {
                 widths[i] = cell.len();
             }
         }
@@ -130,7 +156,18 @@ fn print_table(rows: &[Vec<String>]) {
         .join("+");
 
     println!("+{border}+");
-    for (row_idx, row) in rows.iter().enumerate() {
+    if !headers.is_empty() {
+        let header_line: String = (0..col_count)
+            .map(|i| {
+                let cell = headers.get(i).map(|s| s.as_str()).unwrap_or("");
+                format!(" {:<width$} ", cell, width = widths[i])
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        println!("|{header_line}|");
+        println!("+{border}+");
+    }
+    for row in rows {
         let line: String = (0..col_count)
             .map(|i| {
                 let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
@@ -139,11 +176,6 @@ fn print_table(rows: &[Vec<String>]) {
             .collect::<Vec<_>>()
             .join("|");
         println!("|{line}|");
-
-        // Header separator after first row if there are multiple rows
-        if row_idx == 0 && rows.len() > 1 {
-            println!("+{border}+");
-        }
     }
     println!("+{border}+");
 }
@@ -221,11 +253,12 @@ fn list_tables(executor: &QueryExecutor) {
         println!("No tables found in catalog. Create one with: CREATE TABLE ...");
         return;
     }
-    let mut rows = vec![vec![
+    let headers = vec![
         "Table ID".to_string(),
         "Table Name".to_string(),
         "Columns".to_string(),
-    ]];
+    ];
+    let mut rows = Vec::new();
     let mut tables: Vec<_> = catalog.tables.values().collect();
     tables.sort_by_key(|t| t.table_id);
     for t in tables {
@@ -235,19 +268,20 @@ fn list_tables(executor: &QueryExecutor) {
             t.columns.len().to_string(),
         ]);
     }
-    print_table(&rows);
+    print_table_with_headers(&headers, &rows);
     println!("({} table{})", catalog.tables.len(), if catalog.tables.len() == 1 { "" } else { "s" });
 }
 
 fn describe_table(name: &str, executor: &QueryExecutor) {
     let catalog = executor.catalog.read();
     if let Some(table) = catalog.get_table(name) {
-        let mut rows = vec![vec![
+        let headers = vec![
             "Column".to_string(),
             "Data Type".to_string(),
             "Nullable".to_string(),
             "Primary Key".to_string(),
-        ]];
+        ];
+        let mut rows = Vec::new();
         for col in &table.columns {
             rows.push(vec![
                 col.name.clone(),
@@ -257,7 +291,7 @@ fn describe_table(name: &str, executor: &QueryExecutor) {
             ]);
         }
         println!("Schema for table '{}':", table.name);
-        print_table(&rows);
+        print_table_with_headers(&headers, &rows);
     } else {
         println!("Table '{}' not found.", name);
     }
@@ -269,6 +303,29 @@ fn execute_and_print(sql: &str, executor: &QueryExecutor) -> bool {
         return true;
     }
 
+    let parsed_stmt = SQLParser::parse(trimmed).ok();
+    let mut expected_columns = Vec::new();
+    let mut is_dml = false;
+
+    if let Some(ref stmt) = parsed_stmt {
+        match stmt {
+            SQLStatement::Select(select) => {
+                let catalog = executor.catalog.read();
+                if select.columns.len() == 1 && select.columns[0] == "*" {
+                    if let Some(table) = catalog.get_table(&select.from) {
+                        expected_columns = table.columns.iter().map(|c| c.name.clone()).collect();
+                    }
+                } else {
+                    expected_columns = select.columns.clone();
+                }
+            }
+            SQLStatement::Insert(_) | SQLStatement::Update(_) | SQLStatement::Delete(_) => {
+                is_dml = true;
+            }
+            _ => {}
+        }
+    }
+
     let start = Instant::now();
     match executor.execute_sql(trimmed) {
         Ok(rows) if rows.is_empty() => {
@@ -276,9 +333,25 @@ fn execute_and_print(sql: &str, executor: &QueryExecutor) -> bool {
             println!("OK (took {elapsed:.2?})");
             true
         }
+        Ok(rows) if is_dml => {
+            let elapsed = start.elapsed();
+            let affected = rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            println!(
+                "Query OK, {affected} row{} affected (took {elapsed:.2?})",
+                if affected == 1 { "" } else { "s" }
+            );
+            true
+        }
         Ok(rows) => {
             let elapsed = start.elapsed();
-            print_table(&rows);
+            if expected_columns.is_empty() && !rows.is_empty() {
+                expected_columns = (1..=rows[0].len()).map(|i| format!("col_{i}")).collect();
+            }
+            print_table_with_headers(&expected_columns, &rows);
             println!(
                 "({} row{}, took {elapsed:.2?})",
                 rows.len(),
@@ -293,7 +366,8 @@ fn execute_and_print(sql: &str, executor: &QueryExecutor) -> bool {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let opts = match parse_args() {
         Ok(Some(o)) => o,
         Ok(None) => return Ok(()),
@@ -306,7 +380,14 @@ fn main() -> anyhow::Result<()> {
         info!("Using WAL at {}", opts.wal_path);
     }
 
-    let executor = QueryExecutor::open(&opts.wal_path)?;
+    let executor = Arc::new(QueryExecutor::open(&opts.wal_path)?);
+
+    // Launch Web Studio GUI if requested
+    if let Some(port) = opts.studio_port {
+        let server = Arc::new(StudioServer::new(executor, opts.wal_path));
+        server.run(port).await?;
+        return Ok(());
+    }
 
     // Non-interactive one-shot execution
     if let Some(sql) = opts.execute {

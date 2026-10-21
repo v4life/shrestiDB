@@ -29,6 +29,7 @@ pub mod execution;
 pub mod index;
 pub mod optimizer;
 pub mod sql;
+pub mod studio;
 
 pub use error::{DatabaseError, Result};
 
