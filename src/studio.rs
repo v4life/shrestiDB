@@ -150,9 +150,15 @@ impl StudioServer {
         };
 
         match (method, path) {
-            ("GET", "/") | ("GET", "/index.html") => {
+            ("GET", "/") | ("GET", "/index.html") | ("HEAD", "/") | ("HEAD", "/index.html") => {
                 let html = get_studio_html(&self.wal_path);
                 send_response(&mut stream, "200 OK", "text/html; charset=utf-8", html.as_bytes()).await?;
+            }
+            ("GET", "/favicon.ico") | ("HEAD", "/favicon.ico") => {
+                send_response(&mut stream, "204 No Content", "image/x-icon", b"").await?;
+            }
+            ("OPTIONS", _) => {
+                send_response(&mut stream, "204 No Content", "text/plain", b"").await?;
             }
             ("GET", "/api/status") => {
                 let status = {
