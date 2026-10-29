@@ -22,6 +22,7 @@
 //! since the commit that added it. Both removed rather than left as
 //! unconnected code implying capabilities the engine doesn't have.
 
+pub mod ai;
 pub mod compute;
 pub mod distributed;
 pub mod error;

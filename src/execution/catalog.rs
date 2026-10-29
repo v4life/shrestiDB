@@ -21,6 +21,10 @@ pub enum DataType {
     String,
     Boolean,
     Timestamp,
+    /// Fixed-dimension floating-point vector for embeddings / similarity
+    /// search. `Vector(384)` stores exactly 384 `f64` components —
+    /// analogous to pgvector's `vector(384)`.
+    Vector(usize),
 }
 
 /// Table schema

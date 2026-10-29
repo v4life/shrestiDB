@@ -41,6 +41,29 @@ use crate::error::{DatabaseError, Result};
 use crate::execution::catalog::{DataType, TableSchema};
 use crate::execution::operators::{Tuple, Value};
 
+// ── Vector literal helpers ─────────────────────────────────────────────────
+
+/// Parse a vector literal string like `'[1.0, 2.0, 3.0]'` or `[1.0, 2.0, 3.0]`
+/// into a `Value::Vector`. Accepts both quoted and unquoted forms.
+pub fn parse_vector_literal(raw: &str) -> Option<Value> {
+    let s = raw.trim();
+    // Strip optional surrounding single quotes (INSERT values come quoted)
+    let s = s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(s);
+    let s = s.trim();
+    let inner = s.strip_prefix('[')?.strip_suffix(']')?;
+    let components: std::result::Result<Vec<f64>, _> = inner
+        .split(',')
+        .map(|tok| tok.trim().parse::<f64>())
+        .collect();
+    components.ok().map(Value::Vector)
+}
+
+/// Render a vector to the `[1.0, 2.0, 3.0]` display format.
+pub fn format_vector(v: &[f64]) -> String {
+    let inner: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+    format!("[{}]", inner.join(","))
+}
+
 /// Parse a literal string (as rendered by `sql::parser`, e.g. `"'Alice'"`,
 /// `"30"`, `"true"`) into a typed `Value` per the target column's declared
 /// type. Returns `Value::Null` if the literal doesn't parse as that type.
@@ -53,6 +76,7 @@ pub fn parse_value(raw: &str, data_type: DataType) -> Value {
         DataType::Float => raw.parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
         DataType::Boolean => raw.parse::<bool>().map(Value::Boolean).unwrap_or(Value::Null),
         DataType::String => Value::String(strip_quotes(raw).to_string()),
+        DataType::Vector(_) => parse_vector_literal(raw).unwrap_or(Value::Null),
     }
 }
 
@@ -91,6 +115,7 @@ pub fn parse_literal_checked(token: &str, data_type: DataType) -> Option<Value> 
             .strip_prefix('\'')
             .and_then(|s| s.strip_suffix('\''))
             .map(|s| Value::String(s.to_string())),
+        DataType::Vector(_) => parse_vector_literal(token),
     }
 }
 
@@ -102,6 +127,7 @@ pub fn value_to_string(value: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
         Value::Boolean(b) => b.to_string(),
+        Value::Vector(v) => format_vector(v),
         Value::Null => "NULL".to_string(),
     }
 }
@@ -128,6 +154,7 @@ pub fn literal_repr(value: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::String(s) => format!("'{s}'"),
         Value::Boolean(b) => b.to_string(),
+        Value::Vector(v) => format!("'{}'", format_vector(v)),
         Value::Null => "NULL".to_string(),
     }
 }
@@ -549,12 +576,52 @@ pub fn split_comparison(predicate: &str) -> Option<(String, String, String)> {
 /// claims to support a clause it doesn't parse.
 pub fn parse_order_by(raw: &str) -> Vec<(String, bool)> {
     let raw = raw.strip_prefix("ORDER BY").unwrap_or(raw).trim();
-    raw.split(',')
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut bracket_depth: usize = 0;
+
+    for ch in raw.chars() {
+        match ch {
+            '\'' => {
+                in_quote = !in_quote;
+                cur.push(ch);
+            }
+            '[' if !in_quote => {
+                bracket_depth += 1;
+                cur.push(ch);
+            }
+            ']' if !in_quote => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                cur.push(ch);
+            }
+            ',' if !in_quote && bracket_depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+            }
+            _ => {
+                cur.push(ch);
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        parts.push(cur);
+    }
+
+    parts
+        .into_iter()
         .filter_map(|part| {
-            let tokens: Vec<&str> = part.split_whitespace().collect();
-            let (name, rest) = tokens.split_first()?;
-            let ascending = !rest.iter().any(|t| t.eq_ignore_ascii_case("DESC"));
-            Some(((*name).to_string(), ascending))
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let (expr, ascending) = if part.ends_with(" DESC") || part.ends_with(" desc") {
+                (&part[..part.len() - 5], false)
+            } else if part.ends_with(" ASC") || part.ends_with(" asc") {
+                (&part[..part.len() - 4], true)
+            } else {
+                (part, true)
+            };
+            Some((expr.trim().to_string(), ascending))
         })
         .collect()
 }

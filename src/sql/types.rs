@@ -13,6 +13,9 @@ pub enum DataType {
     Boolean,
     Timestamp,
     Decimal(usize, usize), // (precision, scale)
+    /// Fixed-dimension floating-point vector for embeddings / similarity
+    /// search — `VECTOR(384)` in SQL.
+    Vector(usize),
 }
 
 impl DataType {
@@ -27,6 +30,7 @@ impl DataType {
             DataType::Boolean => Some(1),
             DataType::Timestamp => Some(8),
             DataType::Decimal(_, _) => None, // Variable size
+            DataType::Vector(dims) => Some(*dims * 8), // f64 per dimension
         }
     }
 

@@ -21,6 +21,8 @@ pub enum Value {
     Float(f64),
     String(String),
     Boolean(bool),
+    /// Fixed-dimension floating-point vector for embeddings / similarity search.
+    Vector(Vec<f64>),
     Null,
 }
 

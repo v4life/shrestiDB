@@ -207,6 +207,26 @@ impl StudioServer {
                 let json = serde_json::to_string(&res)?;
                 send_response(&mut stream, "200 OK", "application/json", json.as_bytes()).await?;
             }
+            ("POST", "/api/chat") => {
+                let req: crate::ai::ChatRequest = match serde_json::from_str(body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let err_resp = crate::ai::ChatResponse {
+                            response: format!("Invalid request payload: {e}"),
+                            sql: None,
+                            results: None,
+                            suggestions: Vec::new(),
+                        };
+                        let json = serde_json::to_string(&err_resp)?;
+                        send_response(&mut stream, "200 OK", "application/json", json.as_bytes()).await?;
+                        return Ok(());
+                    }
+                };
+                let agent = crate::ai::AIAgent::new(Arc::clone(&self.executor));
+                let resp = agent.process_message(&req);
+                let json = serde_json::to_string(&resp)?;
+                send_response(&mut stream, "200 OK", "application/json", json.as_bytes()).await?;
+            }
             ("POST", "/api/benchmark") => {
                 let req: BenchmarkRequest = serde_json::from_str(body).unwrap_or(BenchmarkRequest { size: 50000 });
                 let res = run_quick_benchmark(req.size.clamp(1000, 200000));
@@ -482,6 +502,21 @@ fn get_studio_html(wal_path: &str) -> String {
     .metric-sub {{ font-size: 0.85rem; color: var(--text-muted); }}
     .bench-bar {{ height: 12px; border-radius: 6px; background: rgba(255,255,255,0.1); overflow: hidden; margin-top: 6px; }}
     .bench-bar-fill {{ height: 100%; background: var(--accent); }}
+
+    /* AI Studio Chat */
+    .chat-layout {{ display: flex; flex-direction: column; height: 100%; gap: 14px; overflow: hidden; }}
+    .chat-messages {{ flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding: 10px 4px; }}
+    .chat-bubble {{ max-width: 85%; padding: 14px 18px; border-radius: 10px; font-size: 0.92rem; line-height: 1.5; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }}
+    .chat-bubble.user {{ align-self: flex-end; background: rgba(56, 189, 248, 0.18); border: 1px solid var(--accent); color: var(--text-main); }}
+    .chat-bubble.assistant {{ align-self: flex-start; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-main); width: 85%; }}
+    .chat-sql-box {{ background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-top: 10px; font-family: monospace; font-size: 0.88rem; position: relative; color: #38bdf8; }}
+    .chat-sql-btn {{ position: absolute; right: 8px; top: 8px; background: var(--bg-card); border: 1px solid var(--border); color: var(--accent); padding: 4px 10px; border-radius: 4px; font-size: 0.75rem; cursor: pointer; }}
+    .chat-sql-btn:hover {{ background: var(--accent); color: #000; }}
+    .chat-suggestions {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
+    .chat-chip {{ background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.3); color: var(--accent); border-radius: 9999px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer; transition: all 0.15s; }}
+    .chat-chip:hover {{ background: var(--accent); color: #000; }}
+    .chat-input-bar {{ display: flex; gap: 10px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; align-items: center; }}
+    .chat-input {{ flex: 1; background: transparent; border: none; color: var(--text-main); font-size: 0.95rem; outline: none; }}
   </style>
 </head>
 <body>
@@ -493,7 +528,7 @@ fn get_studio_html(wal_path: &str) -> String {
     </div>
     <div class="header-info">
       <span>WAL: <strong>{wal_path}</strong></span>
-      <span>Learned Index Engine: <strong>Active</strong></span>
+      <span>Learned & Vector Engine: <strong>Active</strong></span>
     </div>
   </header>
 
@@ -513,6 +548,7 @@ fn get_studio_html(wal_path: &str) -> String {
     <div class="main">
       <div class="tabs">
         <div class="tab active" onclick="switchTab('queryTab', this)">SQL Studio</div>
+        <div class="tab" onclick="switchTab('aiTab', this)">✨ AI Studio Agent</div>
         <div class="tab" onclick="switchTab('benchTab', this)">Learned Index Benchmark</div>
       </div>
 
@@ -543,7 +579,31 @@ fn get_studio_html(wal_path: &str) -> String {
         </div>
       </div>
 
-      <!-- Tab 2: Learned Index Benchmark -->
+      <!-- Tab 2: AI Studio Agent -->
+      <div class="tab-content" id="aiTab">
+        <div class="chat-layout">
+          <div class="chat-messages" id="chatMessages">
+            <div class="chat-bubble assistant">
+              <strong>✨ ShrestiDB AI Studio Agent</strong><br>
+              Hello! I am your AI Database Assistant, powered directly by ShrestiDB's kernel with native <code>pgvector</code> similarity search and <code>HNSW</code> graph indexing.
+              <br><br>
+              I can write and execute SQL, search vector embeddings, inspect schemas, and explain execution plans. Try asking me something or click a prompt below!
+              <div class="chat-suggestions">
+                <span class="chat-chip" onclick="sendChatMessage('Show all tables in database')">📊 Show catalog schema</span>
+                <span class="chat-chip" onclick="sendChatMessage('Find items similar to [1.0, 0.0, 0.0]')">🎯 Vector similarity search</span>
+                <span class="chat-chip" onclick="sendChatMessage('Count total records')">🔢 Count rows</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="chat-input-bar">
+            <input class="chat-input" id="chatInput" placeholder="Ask AI anything (e.g. 'find items nearest to [0.5, 0.5, 0.0]', 'show schema')..." onkeydown="if(event.key==='Enter') sendChatMessage()">
+            <button class="btn" onclick="sendChatMessage()">Send ⏎</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Learned Index Benchmark -->
       <div class="tab-content" id="benchTab">
         <div class="editor-card">
           <div class="editor-toolbar">
@@ -736,6 +796,76 @@ fn get_studio_html(wal_path: &str) -> String {
         runQuery();
       }}
     }});
+
+    // AI Chat Agent
+    let chatHistory = [];
+    async function sendChatMessage(customText) {{
+      const input = document.getElementById('chatInput');
+      const text = customText || input.value.trim();
+      if (!text) return;
+      if (!customText) input.value = '';
+
+      const container = document.getElementById('chatMessages');
+
+      const userBubble = document.createElement('div');
+      userBubble.className = 'chat-bubble user';
+      userBubble.innerText = text;
+      container.appendChild(userBubble);
+      container.scrollTop = container.scrollHeight;
+
+      const thinkingBubble = document.createElement('div');
+      thinkingBubble.className = 'chat-bubble assistant';
+      thinkingBubble.innerHTML = '<span style="color:var(--text-muted)">Thinking & generating SQL...</span>';
+      container.appendChild(thinkingBubble);
+      container.scrollTop = container.scrollHeight;
+
+      try {{
+        const res = await fetch('/api/chat', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ message: text, history: chatHistory }})
+        }});
+        const data = await res.json();
+
+        chatHistory.push({{ role: 'user', content: text }});
+        chatHistory.push({{ role: 'assistant', content: data.response }});
+
+        let html = `<div>${{data.response.replace(/\n/g, '<br>')}}</div>`;
+        if (data.sql) {{
+          const escSql = data.sql.replace(/'/g, "\\'");
+          html += `
+            <div class="chat-sql-box">
+              <button class="chat-sql-btn" onclick="setQuery('${{escSql}}'); switchTab('queryTab', document.querySelectorAll('.tab')[0]);">Open in SQL Editor</button>
+              <code>${{data.sql}}</code>
+            </div>
+          `;
+        }}
+        if (data.results && data.results.success && data.results.rows.length > 0) {{
+          html += '<div style="margin-top:10px; max-height:180px; overflow:auto;"><table class="data-table"><thead><tr>';
+          data.results.columns.forEach(c => {{ html += `<th>${{c}}</th>`; }});
+          html += '</tr></thead><tbody>';
+          data.results.rows.slice(0, 5).forEach(r => {{
+            html += '<tr>' + r.map(cell => `<td>${{cell}}</td>`).join('') + '</tr>';
+          }});
+          html += '</tbody></table></div>';
+          html += `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:6px;">⚡ Query returned ${{data.results.rows.length}} row(s) in ${{data.results.duration_us}}µs</div>`;
+        }}
+        if (data.suggestions && data.suggestions.length > 0) {{
+          html += '<div class="chat-suggestions">';
+          data.suggestions.forEach(s => {{
+            const escS = s.replace(/'/g, "\\'");
+            html += `<span class="chat-chip" onclick="sendChatMessage('${{escS}}')">${{s}}</span>`;
+          }});
+          html += '</div>';
+        }}
+
+        thinkingBubble.innerHTML = html;
+        container.scrollTop = container.scrollHeight;
+        loadTables();
+      }} catch (err) {{
+        thinkingBubble.innerHTML = `<span style="color:var(--danger)">AI Chat Error: ${{err.message}}</span>`;
+      }}
+    }}
 
     // Initial load
     loadTables();

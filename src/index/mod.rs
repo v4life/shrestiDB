@@ -10,9 +10,11 @@
 //! actually wired in.
 
 pub mod btree;
+pub mod hnsw;
 pub mod models;
 pub mod pgm;
 pub mod rmi;
 
+pub use hnsw::{DistanceMetric, HNSWConfig, HNSWIndex};
 pub use pgm::{DynamicPGMIndex, PGMIndex, PGMSegment};
 pub use rmi::RMIIndex;

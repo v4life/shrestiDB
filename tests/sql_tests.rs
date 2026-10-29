@@ -80,4 +80,41 @@ mod sql_tests {
         println!("Plan 2 estimated cost: {}", plan2.estimated_cost);
         println!("Plan 3 estimated cost: {}", plan3.estimated_cost);
     }
+
+    #[test]
+    fn test_vector_ddl_insert_and_similarity_search() {
+        use shrestidb::execution::QueryExecutor;
+
+        let executor = QueryExecutor::new(Catalog::new());
+
+        // 1. CREATE TABLE with VECTOR(3)
+        executor.execute_sql("CREATE TABLE items (id INT PRIMARY KEY, name TEXT, embedding VECTOR(3))").unwrap();
+
+        // 2. INSERT items with 3D vector embeddings
+        executor.execute_sql("INSERT INTO items VALUES (1, 'item_x', '[1.0, 0.0, 0.0]')").unwrap();
+        executor.execute_sql("INSERT INTO items VALUES (2, 'item_y', '[0.0, 1.0, 0.0]')").unwrap();
+        executor.execute_sql("INSERT INTO items VALUES (3, 'item_xy', '[0.707, 0.707, 0.0]')").unwrap();
+
+        // 3. Simple SELECT to verify storage & formatting
+        let rows = executor.execute_sql("SELECT id, name, embedding FROM items").unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // 4. pgvector-style Top-K nearest neighbor search by Cosine Distance (<=>)
+        // Query near X-axis: [0.9, 0.1, 0.0] -> item_x (1) must be first, then item_xy (3), then item_y (2)
+        let knn_cosine = executor.execute_sql("SELECT id, name FROM items ORDER BY embedding <=> '[0.9, 0.1, 0.0]' LIMIT 2").unwrap();
+        assert_eq!(knn_cosine.len(), 2);
+        assert_eq!(knn_cosine[0][0], "1"); // item_x closest
+        assert_eq!(knn_cosine[1][0], "3"); // item_xy second closest
+
+        // 5. Nearest neighbor search by L2 Distance (<->)
+        // Query near origin: [0.05, 0.05, 0.0] -> item_xy (norm 1.0) is further than nothing, but let's test specific origin point
+        let knn_l2 = executor.execute_sql("SELECT id, name FROM items ORDER BY embedding <-> '[0.0, 0.9, 0.0]' LIMIT 1").unwrap();
+        assert_eq!(knn_l2.len(), 1);
+        assert_eq!(knn_l2[0][0], "2"); // item_y is at [0.0, 1.0, 0.0], distance is 0.1
+
+        // 6. Nearest neighbor search by Inner Product (<#>)
+        let knn_ip = executor.execute_sql("SELECT id, name FROM items ORDER BY embedding <#> '[1.0, 0.0, 0.0]' LIMIT 1").unwrap();
+        assert_eq!(knn_ip.len(), 1);
+        assert_eq!(knn_ip[0][0], "1"); // item_x has highest dot product (1.0), lowest negated IP (-1.0)
+    }
 }

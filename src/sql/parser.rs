@@ -14,7 +14,7 @@
 use crate::error::{DatabaseError, Result};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{self, Statement as AstStatement};
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser as SqlDialectParser;
 
 /// SQL statement types
@@ -204,7 +204,8 @@ pub struct SQLParser;
 impl SQLParser {
     /// Parse a single SQL statement.
     pub fn parse(sql: &str) -> Result<SQLStatement> {
-        let statements = SqlDialectParser::parse_sql(&GenericDialect {}, sql)
+        let statements = SqlDialectParser::parse_sql(&PostgreSqlDialect {}, sql)
+            .or_else(|_| SqlDialectParser::parse_sql(&GenericDialect {}, sql))
             .map_err(|e| DatabaseError::ParseError(e.to_string()))?;
 
         let stmt = statements

@@ -168,6 +168,61 @@ impl VectorOps {
             dot / (norm_a * norm_b)
         }
     }
+
+    /// Cosine distance: 1 - cosine_similarity. Range [0, 2], lower = more similar.
+    /// This is the metric used by the `<=>` operator (pgvector-compatible).
+    pub fn cosine_distance(a: &[f64], b: &[f64]) -> f64 {
+        1.0 - Self::cosine_similarity(a, b)
+    }
+
+    /// Euclidean (L2) distance between two vectors.
+    /// This is the metric used by the `<->` operator (pgvector-compatible).
+    pub fn l2_distance(a: &[f64], b: &[f64]) -> f64 {
+        let min_len = a.len().min(b.len());
+        let chunks_a = a[..min_len].chunks_exact(4);
+        let chunks_b = b[..min_len].chunks_exact(4);
+
+        let mut acc0 = 0.0;
+        let mut acc1 = 0.0;
+        let mut acc2 = 0.0;
+        let mut acc3 = 0.0;
+
+        for (ca, cb) in chunks_a.zip(chunks_b) {
+            let d0 = ca[0] - cb[0];
+            let d1 = ca[1] - cb[1];
+            let d2 = ca[2] - cb[2];
+            let d3 = ca[3] - cb[3];
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+        }
+        let mut sum = (acc0 + acc1) + (acc2 + acc3);
+
+        let tail_start = min_len / 4 * 4;
+        for i in tail_start..min_len {
+            let d = a[i] - b[i];
+            sum += d * d;
+        }
+
+        sum.sqrt()
+    }
+
+    /// Negative inner product distance: -dot(a, b).
+    /// This is the metric used by the `<#>` operator (pgvector-compatible).
+    /// More negative = more similar, so negating makes lower = more similar.
+    pub fn inner_product_distance(a: &[f64], b: &[f64]) -> f64 {
+        -Self::dot(a, b)
+    }
+
+    /// L2-normalize a vector in place, returning a new normalized vector.
+    pub fn normalize(v: &[f64]) -> Vec<f64> {
+        let n = Self::norm(v);
+        if n == 0.0 {
+            return vec![0.0; v.len()];
+        }
+        v.iter().map(|x| x / n).collect()
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +262,42 @@ mod tests {
         let b = vec![6.0, 8.0];
         let sim = VectorOps::cosine_similarity(&a, &b);
         assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_distance() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((VectorOps::cosine_distance(&a, &b) - 0.0).abs() < 1e-6);
+
+        let c = vec![0.0, 1.0, 0.0];
+        assert!((VectorOps::cosine_distance(&a, &c) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_l2_distance() {
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![3.0, 4.0, 0.0];
+        assert!((VectorOps::l2_distance(&a, &b) - 5.0).abs() < 1e-6);
+
+        // Distance to self is 0
+        assert!((VectorOps::l2_distance(&a, &a) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_inner_product_distance() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        // dot = 4 + 10 + 18 = 32, negative = -32
+        assert!((VectorOps::inner_product_distance(&a, &b) - (-32.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_normalize() {
+        let v = vec![3.0, 4.0];
+        let n = VectorOps::normalize(&v);
+        assert!((n[0] - 0.6).abs() < 1e-6);
+        assert!((n[1] - 0.8).abs() < 1e-6);
+        assert!((VectorOps::norm(&n) - 1.0).abs() < 1e-6);
     }
 }

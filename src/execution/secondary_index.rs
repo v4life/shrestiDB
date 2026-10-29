@@ -50,6 +50,7 @@ impl Ord for IndexKey {
             (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
             (Value::String(a), Value::String(b)) => a.cmp(b),
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+            (Value::Vector(a), Value::Vector(b)) => a.len().cmp(&b.len()),
             (Value::Null, Value::Null) => Ordering::Equal,
             (a, b) => variant_rank(a).cmp(&variant_rank(b)),
         }
@@ -63,6 +64,7 @@ fn variant_rank(v: &Value) -> u8 {
         Value::Integer(_) => 2,
         Value::Float(_) => 3,
         Value::String(_) => 4,
+        Value::Vector(_) => 5,
     }
 }
 

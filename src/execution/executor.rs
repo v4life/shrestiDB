@@ -67,6 +67,8 @@ pub struct QueryExecutor {
     /// the indexed column) that those lower, byte-oriented layers
     /// deliberately don't have.
     secondary_indexes: RwLock<HashMap<(u64, String), SecondaryIndex>>,
+    /// In-memory HNSW indexes for approximate nearest neighbor vector similarity search.
+    pub hnsw_indexes: RwLock<HashMap<(u64, String), std::sync::Arc<crate::index::hnsw::HNSWIndex>>>,
     /// Real per-column value distributions built by `ANALYZE <table>`
     /// (`execute_analyze`), keyed by `(table_name, column_name)` — see
     /// `optimizer::cardinality::ColumnDistribution`'s docs. Unlike
@@ -107,6 +109,9 @@ enum JoinHashKey {
     Float(u64),
     String(String),
     Boolean(bool),
+    /// Vectors hashed by their bit patterns — same approach as Float.
+    /// Joining on a vector column is unusual but must not panic.
+    Vector(Vec<u64>),
     Null,
 }
 
@@ -117,6 +122,7 @@ impl JoinHashKey {
             Value::Float(f) => JoinHashKey::Float(f.to_bits()),
             Value::String(s) => JoinHashKey::String(s.clone()),
             Value::Boolean(b) => JoinHashKey::Boolean(*b),
+            Value::Vector(v) => JoinHashKey::Vector(v.iter().map(|f| f.to_bits()).collect()),
             Value::Null => JoinHashKey::Null,
         }
     }
@@ -131,6 +137,7 @@ impl QueryExecutor {
             oltp: OLTPEngine::new(),
             planner: QueryPlanner::new(),
             secondary_indexes: RwLock::new(HashMap::new()),
+            hnsw_indexes: RwLock::new(HashMap::new()),
             stats: RwLock::new(HashMap::new()),
         }
     }
@@ -154,11 +161,19 @@ impl QueryExecutor {
             oltp,
             planner: QueryPlanner::new(),
             secondary_indexes: RwLock::new(HashMap::new()),
+            hnsw_indexes: RwLock::new(HashMap::new()),
             stats: RwLock::new(HashMap::new()),
         };
 
         for (table_id, column) in index_specs {
-            executor.rebuild_secondary_index(table_id, &column)?;
+            let dims = executor.catalog.read().get_table_by_id(table_id as u32)
+                .and_then(|s| s.get_column(&column))
+                .and_then(|c| match c.data_type { DataType::Vector(d) => Some(d), _ => None });
+            if let Some(d) = dims {
+                executor.rebuild_hnsw_index(table_id, &column, d)?;
+            } else {
+                executor.rebuild_secondary_index(table_id, &column)?;
+            }
         }
 
         Ok(executor)
@@ -806,22 +821,81 @@ impl QueryExecutor {
                     // GROUP BY key's name survives unchanged from the
                     // pre-aggregation schema -- a known, documented scope
                     // limit, not a silent wrong order.
-                    let resolved: Vec<(usize, bool)> = keys
+                    //
+                    // Also supports pgvector-style similarity ordering:
+                    // `ORDER BY embedding <=> '[1.0, 2.0, 3.0]'` (cosine distance),
+                    // `ORDER BY embedding <-> '[1.0, 2.0, 3.0]'` (L2 distance),
+                    // `ORDER BY embedding <#> '[1.0, 2.0, 3.0]'` (inner product).
+                    enum SortKey {
+                        Column { idx: usize, ascending: bool },
+                        VectorDistance {
+                            idx: usize,
+                            target: Vec<f64>,
+                            metric: crate::index::hnsw::DistanceMetric,
+                            ascending: bool,
+                        },
+                    }
+
+                    let resolved: Vec<SortKey> = keys
                         .iter()
-                        .map(|(col, ascending)| {
+                        .map(|(col_expr, ascending)| {
+                            let (metric_op, metric) = if col_expr.contains("<=>") {
+                                ("<=>", Some(crate::index::hnsw::DistanceMetric::Cosine))
+                            } else if col_expr.contains("<->") {
+                                ("<->", Some(crate::index::hnsw::DistanceMetric::L2))
+                            } else if col_expr.contains("<#>") {
+                                ("<#>", Some(crate::index::hnsw::DistanceMetric::InnerProduct))
+                            } else {
+                                ("", None)
+                            };
+
+                            if let Some(metric) = metric {
+                                let parts: Vec<&str> = col_expr.splitn(2, metric_op).collect();
+                                if parts.len() == 2 {
+                                    let col_name = parts[0].trim();
+                                    let target_str = parts[1].trim();
+                                    if let Some(idx) = schema.columns.iter().position(|c| c.name == col_name) {
+                                        if let Some(Value::Vector(target)) = row_codec::parse_vector_literal(target_str) {
+                                            return Ok(SortKey::VectorDistance {
+                                                idx,
+                                                target,
+                                                metric,
+                                                ascending: *ascending,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+
                             schema
                                 .columns
                                 .iter()
-                                .position(|c| &c.name == col)
-                                .map(|idx| (idx, *ascending))
-                                .ok_or_else(|| DatabaseError::ExecutionError(format!("Unknown column '{col}' in ORDER BY")))
+                                .position(|c| &c.name == col_expr)
+                                .map(|idx| SortKey::Column { idx, ascending: *ascending })
+                                .ok_or_else(|| DatabaseError::ExecutionError(format!("Unknown column '{col_expr}' in ORDER BY")))
                         })
                         .collect::<Result<Vec<_>>>()?;
 
                     tuples.sort_by(|a, b| {
-                        for &(idx, ascending) in &resolved {
-                            let ord = row_codec::compare_for_sort(&a.values[idx], &b.values[idx]);
-                            let ord = if ascending { ord } else { ord.reverse() };
+                        for key in &resolved {
+                            let ord = match key {
+                                SortKey::Column { idx, ascending } => {
+                                    let o = row_codec::compare_for_sort(&a.values[*idx], &b.values[*idx]);
+                                    if *ascending { o } else { o.reverse() }
+                                }
+                                SortKey::VectorDistance { idx, target, metric, ascending } => {
+                                    let dist_a = match &a.values[*idx] {
+                                        Value::Vector(v) => metric.compute(v, target),
+                                        _ => f64::INFINITY,
+                                    };
+                                    let dist_b = match &b.values[*idx] {
+                                        Value::Vector(v) => metric.compute(v, target),
+                                        _ => f64::INFINITY,
+                                    };
+                                    let o = dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal);
+                                    if *ascending { o } else { o.reverse() }
+                                }
+                            };
                             if ord != std::cmp::Ordering::Equal {
                                 return ord;
                             }
@@ -1389,6 +1463,7 @@ impl QueryExecutor {
 
         for (row_id, values) in indexed_rows {
             self.index_row_in_secondary_indexes(table_id, row_id, &schema, &values);
+            self.index_row_in_hnsw_indexes(table_id, row_id, &schema, &values);
         }
 
         Ok(affected)
@@ -1643,6 +1718,7 @@ impl QueryExecutor {
 
         for (row_id, values) in indexed_rows {
             self.index_row_in_secondary_indexes(table_id, row_id, &schema, &values);
+            self.index_row_in_hnsw_indexes(table_id, row_id, &schema, &values);
         }
 
         Ok(affected)
@@ -1735,22 +1811,30 @@ impl QueryExecutor {
     /// restart knows to rebuild it — see `open`), then builds it now by
     /// backfill-scanning the table's current rows.
     fn execute_create_index(&self, create: CreateIndexStatement) -> Result<()> {
-        let table_id = {
+        let (table_id, is_vector, dims) = {
             let catalog = self.catalog.read();
             let schema = catalog.get_table(&create.table).ok_or_else(|| {
                 DatabaseError::ExecutionError(format!("Unknown table '{}'", create.table))
             })?;
-            if !schema.columns.iter().any(|c| c.name == create.column) {
-                return Err(DatabaseError::ExecutionError(format!(
+            let col = schema.columns.iter().find(|c| c.name == create.column).ok_or_else(|| {
+                DatabaseError::ExecutionError(format!(
                     "Unknown column '{}' on table '{}'",
                     create.column, create.table
-                )));
-            }
-            schema.table_id as u64
+                ))
+            })?;
+            let dims = match col.data_type {
+                DataType::Vector(d) => Some(d),
+                _ => None,
+            };
+            (schema.table_id as u64, dims.is_some(), dims.unwrap_or(0))
         };
 
         self.oltp.log_index_change(table_id, &create.column)?;
-        self.rebuild_secondary_index(table_id, &create.column)
+        if is_vector {
+            self.rebuild_hnsw_index(table_id, &create.column, dims)
+        } else {
+            self.rebuild_secondary_index(table_id, &create.column)
+        }
     }
 
     /// The PGM segment-fitting tolerance `execute_analyze` builds each
@@ -1813,6 +1897,9 @@ impl QueryExecutor {
                         );
                     }
                 }
+                DataType::Vector(_) => {
+                    // Vector columns are indexed with HNSW, not scalar 1D PGM distributions.
+                }
             }
         }
 
@@ -1867,13 +1954,61 @@ impl QueryExecutor {
         }
     }
 
+    /// (Re)build an HNSW index for `table_id`'s vector `column`.
+    fn rebuild_hnsw_index(&self, table_id: u64, column: &str, dims: usize) -> Result<()> {
+        let schema = self
+            .catalog
+            .read()
+            .get_table_by_id(table_id as u32)
+            .cloned()
+            .ok_or_else(|| DatabaseError::ExecutionError(format!("Unknown table id {table_id}")))?;
+        let col_idx = schema.columns.iter().position(|c| c.name == column).ok_or_else(|| {
+            DatabaseError::ExecutionError(format!("Unknown column '{column}'"))
+        })?;
+
+        let rows = self.oltp.with_read_snapshot(|tx| self.oltp.scan_table(tx, table_id));
+        let index = std::sync::Arc::new(crate::index::hnsw::HNSWIndex::new(dims, crate::index::hnsw::HNSWConfig::default()));
+        for (row_id, bytes) in rows {
+            if let Ok(tuple) = bincode::deserialize::<Tuple>(&bytes) {
+                if let Some(Value::Vector(v)) = tuple.values.get(col_idx) {
+                    let _ = index.insert(row_id, v.clone());
+                }
+            }
+        }
+
+        self.hnsw_indexes.write().insert((table_id, column.to_string()), index);
+        Ok(())
+    }
+
+    /// Add `row`'s vector values to registered HNSW indexes.
+    fn index_row_in_hnsw_indexes(&self, table_id: u64, row_id: u64, schema: &TableSchema, row: &[Value]) {
+        let indexes = self.hnsw_indexes.read();
+        if indexes.is_empty() {
+            return;
+        }
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if let Some(hnsw) = indexes.get(&(table_id, col.name.clone())) {
+                if let Some(Value::Vector(v)) = row.get(idx) {
+                    let _ = hnsw.insert(row_id, v.clone());
+                }
+            }
+        }
+    }
+
     /// Map a rendered DDL type string (e.g. `"VARCHAR(50)"`, `"BIGINT"`) onto
     /// the catalog's coarser `DataType`. A heuristic substring match, since
     /// `DataType` doesn't track length/precision at all — good enough given
     /// the executor only branches on which of the 5 variants a column is.
     fn map_ddl_type(raw: &str) -> DataType {
         let upper = raw.to_uppercase();
-        if upper.contains("BOOL") {
+        if upper.contains("VECTOR") {
+            let dims = upper
+                .find('(')
+                .and_then(|open| upper[open + 1..].find(')').map(|close| &upper[open + 1..open + 1 + close]))
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(3);
+            DataType::Vector(dims)
+        } else if upper.contains("BOOL") {
             DataType::Boolean
         } else if upper.contains("TIMESTAMP") || upper.contains("DATE") {
             DataType::Timestamp
