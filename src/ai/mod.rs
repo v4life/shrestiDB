@@ -198,47 +198,64 @@ impl AIAgent {
 
     /// Intelligent Semantic Rule-based NL->SQL translator
     fn translate_to_sql(&self, prompt: &str, schema: &SchemaSummary) -> (String, Option<String>) {
-        let p_lower = prompt.to_lowercase();
+        let trimmed = prompt.trim();
+        let p_lower = trimmed.to_lowercase();
 
-        // If the user directly typed a SQL statement
-        if p_lower.starts_with("select ")
-            || p_lower.starts_with("create ")
-            || p_lower.starts_with("insert ")
-            || p_lower.starts_with("update ")
-            || p_lower.starts_with("delete ")
+        // 1. Natural language table creation / modification intents:
+        // Handles "create another table", "create another table ?", "create table foo", "make a table", "add a table"
+        if p_lower.contains("create another table")
+            || p_lower.contains("make a table")
+            || p_lower.contains("make another table")
+            || p_lower.contains("add a table")
+            || (p_lower.starts_with("create table ") && !p_lower.contains('('))
+            || p_lower == "create a table"
+            || p_lower == "create table"
+            || p_lower.starts_with("create table ?")
         {
-            let sql = prompt.to_string();
-            return (
-                "Executing SQL statement directly:".to_string(),
-                Some(if sql.ends_with(';') { sql } else { format!("{sql};") }),
-            );
-        }
-
-        // Pattern: Natural language requests to create a table (e.g. "create table zip_codes", "create another table zip_codes")
-        if (p_lower.contains("create table") || p_lower.contains("create another table") || p_lower.contains("make a table") || p_lower.contains("add a table"))
-            && !p_lower.starts_with("create table")
-        {
-            // Extract table name if possible
+            // Extract table name if specified
             let words: Vec<&str> = p_lower.split_whitespace().collect();
             let table_name = words
                 .iter()
                 .position(|&w| w == "table")
                 .and_then(|idx| words.get(idx + 1))
                 .map(|name| name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
-                .filter(|name| !name.is_empty())
-                .unwrap_or("new_table");
+                .filter(|name| !name.is_empty() && *name != "?" && *name != "another")
+                .unwrap_or("documents");
 
             let sql = if table_name.contains("zip") {
                 format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, zip TEXT, city TEXT, state TEXT, coordinates VECTOR(2));")
-            } else if table_name.contains("vector") || table_name.contains("embed") {
-                format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, name TEXT, embedding VECTOR(3));")
+            } else if table_name.contains("doc") || table_name.contains("vector") || table_name.contains("embed") {
+                format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, title TEXT, content TEXT, embedding VECTOR(3));")
+            } else if table_name.contains("user") || table_name.contains("account") {
+                format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, username TEXT, email TEXT, balance FLOAT);")
             } else {
-                format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, name TEXT, description TEXT);")
+                format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, name TEXT, description TEXT, embedding VECTOR(3));")
             };
 
             return (
-                format!("Generated DDL statement to create the `{table_name}` table:"),
+                format!("Here is a DDL template to create table `{table_name}`:"),
                 Some(sql),
+            );
+        }
+
+        // 2. Direct raw SQL execution: only when the prompt actually parses or clearly has full SQL syntax
+        let is_valid_raw_sql = if p_lower.starts_with("select ")
+            || p_lower.starts_with("insert ")
+            || p_lower.starts_with("update ")
+            || p_lower.starts_with("delete ")
+            || (p_lower.starts_with("create ") && p_lower.contains('('))
+            || p_lower.starts_with("analyze ")
+        {
+            crate::sql::parser::SQLParser::parse(trimmed.trim_end_matches(';')).is_ok()
+        } else {
+            false
+        };
+
+        if is_valid_raw_sql {
+            let sql = trimmed.to_string();
+            return (
+                "Executing SQL statement directly:".to_string(),
+                Some(if sql.ends_with(';') { sql } else { format!("{sql};") }),
             );
         }
 
@@ -413,5 +430,31 @@ mod tests {
         let resp = agent.process_message(&req);
         assert!(resp.sql.unwrap().contains("count(*)"));
         assert_eq!(resp.results.unwrap().rows[0][0], "1");
+    }
+
+    #[test]
+    fn test_ai_agent_natural_language_create_table() {
+        let executor = Arc::new(QueryExecutor::new(Catalog::new()));
+        let agent = AIAgent::new(executor);
+
+        // Test "create another table ?"
+        let req1 = ChatRequest {
+            message: "create another table ?".to_string(),
+            history: vec![],
+        };
+        let resp1 = agent.process_message(&req1);
+        assert!(resp1.sql.is_some());
+        assert!(resp1.sql.unwrap().starts_with("CREATE TABLE"));
+
+        // Test "create another table zip_codes"
+        let req2 = ChatRequest {
+            message: "create another table zip_codes".to_string(),
+            history: vec![],
+        };
+        let resp2 = agent.process_message(&req2);
+        assert!(resp2.sql.is_some());
+        let sql2 = resp2.sql.unwrap();
+        assert!(sql2.contains("CREATE TABLE zip_codes"));
+        assert!(sql2.contains("VECTOR(2)"));
     }
 }
