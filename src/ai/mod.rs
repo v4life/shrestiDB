@@ -3,6 +3,9 @@
 //! Provides schema-aware natural language to SQL translation, query explanation,
 //! and interactive chat capabilities directly within the database engine and Studio.
 
+pub mod llm_client;
+pub use llm_client::{LLMClient, LLMConfig};
+
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
@@ -104,18 +107,137 @@ impl SchemaSummary {
 /// The Studio AI Agent
 pub struct AIAgent {
     executor: Arc<QueryExecutor>,
+    llm: LLMClient,
 }
 
 impl AIAgent {
     pub fn new(executor: Arc<QueryExecutor>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            llm: LLMClient::new(LLMConfig::default()),
+        }
+    }
+
+    pub fn with_llm_config(executor: Arc<QueryExecutor>, config: LLMConfig) -> Self {
+        Self {
+            executor,
+            llm: LLMClient::new(config),
+        }
     }
 
     /// Process an incoming natural language prompt
-    pub fn process_message(&self, req: &ChatRequest) -> ChatResponse {
+    pub async fn process_message(&self, req: &ChatRequest) -> ChatResponse {
         let schema = SchemaSummary::from_executor(&self.executor);
         let user_prompt = req.message.trim();
 
+        // If an LLM provider is configured (API key or local Ollama), call it!
+        if self.llm.is_configured() {
+            let system_prompt = format!(
+                "You are an AI SQL agent for ShrestiDB, a learned and vector database.\n\
+                 {}\n\
+                 Supported SQL syntax:\n\
+                 - SELECT with WHERE, ORDER BY, GROUP BY, LIMIT, JOIN\n\
+                 - Vector operators: <=> (cosine distance), <-> (L2 distance), <#> (inner product)\n\
+                 - CREATE TABLE ... (id INT PRIMARY KEY, ..., embedding VECTOR(N))\n\
+                 - INSERT INTO ... VALUES (...)\n\n\
+                 Always include any SQL query you generate inside standard markdown ```sql ... ``` code blocks.\n\
+                 Keep explanations concise and helpful.",
+                schema.describe()
+            );
+
+            if let Ok(llm_response) = self.llm.chat_completion(&system_prompt, user_prompt, &req.history).await {
+                // Extract SQL from response if present
+                let extracted_sql = Self::extract_sql_from_markdown(&llm_response);
+                let results = extracted_sql.as_deref().and_then(|sql| self.try_execute_sql(sql));
+                let suggestions = self.generate_suggestions(&schema, extracted_sql.as_deref());
+
+                return ChatResponse {
+                    response: llm_response,
+                    sql: extracted_sql,
+                    results,
+                    suggestions,
+                };
+            }
+        }
+
+        // Fallback: embedded semantic rule engine
+        self.process_message_local(req, &schema)
+    }
+
+    /// Helper to extract SQL from markdown code fences ```sql ... ```
+    fn extract_sql_from_markdown(text: &str) -> Option<String> {
+        if let Some(start) = text.find("```sql") {
+            let rest = &text[start + 6..];
+            if let Some(end) = rest.find("```") {
+                let sql = rest[..end].trim();
+                if !sql.is_empty() {
+                    return Some(sql.to_string());
+                }
+            }
+        } else if let Some(start) = text.find("```") {
+            let rest = &text[start + 3..];
+            if let Some(end) = rest.find("```") {
+                let sql = rest[..end].trim();
+                if sql.to_lowercase().starts_with("select")
+                    || sql.to_lowercase().starts_with("create")
+                    || sql.to_lowercase().starts_with("insert")
+                {
+                    return Some(sql.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Try executing a SQL statement and formatting the output
+    fn try_execute_sql(&self, sql: &str) -> Option<QueryResultView> {
+        let start = std::time::Instant::now();
+        match self.executor.execute_sql(sql) {
+            Ok(raw_rows) => {
+                let duration_us = start.elapsed().as_micros();
+                let mut columns = Vec::new();
+                if let Ok(stmt) = crate::sql::parser::SQLParser::parse(sql) {
+                    if let crate::sql::parser::SQLStatement::Select(select) = stmt {
+                        let catalog = self.executor.catalog.read();
+                        if select.columns.len() == 1 && select.columns[0] == "*" {
+                            if let Some(table) = catalog.get_table(&select.from) {
+                                columns = table.columns.iter().map(|c| c.name.clone()).collect();
+                            }
+                        } else {
+                            columns = select.columns.clone();
+                        }
+                    }
+                }
+                if columns.is_empty() && !raw_rows.is_empty() {
+                    columns = (1..=raw_rows[0].len()).map(|i| format!("col_{i}")).collect();
+                }
+
+                Some(QueryResultView {
+                    success: true,
+                    columns,
+                    rows: raw_rows,
+                    affected_rows: None,
+                    duration_us,
+                    error: None,
+                })
+            }
+            Err(e) => {
+                let duration_us = start.elapsed().as_micros();
+                Some(QueryResultView {
+                    success: false,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    affected_rows: None,
+                    duration_us,
+                    error: Some(e.to_string()),
+                })
+            }
+        }
+    }
+
+    /// Process via local rule engine (fallback / offline mode)
+    pub fn process_message_local(&self, req: &ChatRequest, schema: &SchemaSummary) -> ChatResponse {
+        let user_prompt = req.message.trim();
         let p_lower = user_prompt.to_lowercase();
 
         // 1. Check for schema inquiry
@@ -135,58 +257,13 @@ impl AIAgent {
         }
 
         // 2. Generate SQL from natural language
-        let (explanation, generated_sql) = self.translate_to_sql(user_prompt, &schema);
+        let (explanation, generated_sql) = self.translate_to_sql(user_prompt, schema);
 
         // 3. If SQL was generated, attempt execution
-        let mut results = None;
-        if let Some(ref sql) = generated_sql {
-            let start = std::time::Instant::now();
-            match self.executor.execute_sql(sql) {
-                Ok(raw_rows) => {
-                    let duration_us = start.elapsed().as_micros();
-                    // Attempt to infer column names from catalog
-                    let mut columns = Vec::new();
-                    if let Ok(stmt) = crate::sql::parser::SQLParser::parse(sql) {
-                        if let crate::sql::parser::SQLStatement::Select(select) = stmt {
-                            let catalog = self.executor.catalog.read();
-                            if select.columns.len() == 1 && select.columns[0] == "*" {
-                                if let Some(table) = catalog.get_table(&select.from) {
-                                    columns = table.columns.iter().map(|c| c.name.clone()).collect();
-                                }
-                            } else {
-                                columns = select.columns.clone();
-                            }
-                        }
-                    }
-                    if columns.is_empty() && !raw_rows.is_empty() {
-                        columns = (1..=raw_rows[0].len()).map(|i| format!("col_{i}")).collect();
-                    }
-
-                    results = Some(QueryResultView {
-                        success: true,
-                        columns,
-                        rows: raw_rows,
-                        affected_rows: None,
-                        duration_us,
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    let duration_us = start.elapsed().as_micros();
-                    results = Some(QueryResultView {
-                        success: false,
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                        affected_rows: None,
-                        duration_us,
-                        error: Some(e.to_string()),
-                    });
-                }
-            }
-        }
+        let results = generated_sql.as_deref().and_then(|sql| self.try_execute_sql(sql));
 
         // 4. Generate intelligent follow-up suggestions
-        let suggestions = self.generate_suggestions(&schema, generated_sql.as_deref());
+        let suggestions = self.generate_suggestions(schema, generated_sql.as_deref());
 
         ChatResponse {
             response: explanation,
@@ -373,8 +450,8 @@ mod tests {
     use super::*;
     use crate::execution::catalog::Catalog;
 
-    #[test]
-    fn test_ai_agent_empty_catalog() {
+    #[tokio::test]
+    async fn test_ai_agent_empty_catalog() {
         let executor = Arc::new(QueryExecutor::new(Catalog::new()));
         let agent = AIAgent::new(executor);
 
@@ -382,12 +459,12 @@ mod tests {
             message: "Show me all tables".to_string(),
             history: vec![],
         };
-        let resp = agent.process_message(&req);
+        let resp = agent.process_message(&req).await;
         assert!(resp.response.contains("No tables currently registered"));
     }
 
-    #[test]
-    fn test_ai_agent_vector_similarity_search() {
+    #[tokio::test]
+    async fn test_ai_agent_vector_similarity_search() {
         let executor = Arc::new(QueryExecutor::new(Catalog::new()));
 
         // Setup items table with VECTOR column
@@ -401,7 +478,7 @@ mod tests {
             message: "Find items similar to [0.9, 0.1, 0.0]".to_string(),
             history: vec![],
         };
-        let resp = agent.process_message(&req);
+        let resp = agent.process_message(&req).await;
 
         assert!(resp.sql.is_some());
         let sql = resp.sql.unwrap();
@@ -416,8 +493,8 @@ mod tests {
         assert_eq!(res.rows[0][0], "1"); // 'apple' is nearest to [0.9, 0.1, 0.0]
     }
 
-    #[test]
-    fn test_ai_agent_count_query() {
+    #[tokio::test]
+    async fn test_ai_agent_count_query() {
         let executor = Arc::new(QueryExecutor::new(Catalog::new()));
         executor.execute_sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
         executor.execute_sql("INSERT INTO users VALUES (1, 'Alice')").unwrap();
@@ -427,13 +504,13 @@ mod tests {
             message: "Count all rows in users".to_string(),
             history: vec![],
         };
-        let resp = agent.process_message(&req);
+        let resp = agent.process_message(&req).await;
         assert!(resp.sql.unwrap().contains("count(*)"));
         assert_eq!(resp.results.unwrap().rows[0][0], "1");
     }
 
-    #[test]
-    fn test_ai_agent_natural_language_create_table() {
+    #[tokio::test]
+    async fn test_ai_agent_natural_language_create_table() {
         let executor = Arc::new(QueryExecutor::new(Catalog::new()));
         let agent = AIAgent::new(executor);
 
@@ -442,7 +519,7 @@ mod tests {
             message: "create another table ?".to_string(),
             history: vec![],
         };
-        let resp1 = agent.process_message(&req1);
+        let resp1 = agent.process_message(&req1).await;
         assert!(resp1.sql.is_some());
         assert!(resp1.sql.unwrap().starts_with("CREATE TABLE"));
 
@@ -451,7 +528,7 @@ mod tests {
             message: "create another table zip_codes".to_string(),
             history: vec![],
         };
-        let resp2 = agent.process_message(&req2);
+        let resp2 = agent.process_message(&req2).await;
         assert!(resp2.sql.is_some());
         let sql2 = resp2.sql.unwrap();
         assert!(sql2.contains("CREATE TABLE zip_codes"));

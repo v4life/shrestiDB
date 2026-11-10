@@ -223,7 +223,7 @@ impl StudioServer {
                     }
                 };
                 let agent = crate::ai::AIAgent::new(Arc::clone(&self.executor));
-                let resp = agent.process_message(&req);
+                let resp = agent.process_message(&req).await;
                 let json = serde_json::to_string(&resp)?;
                 send_response(&mut stream, "200 OK", "application/json", json.as_bytes()).await?;
             }
