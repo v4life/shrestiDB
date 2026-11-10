@@ -214,6 +214,34 @@ impl AIAgent {
             );
         }
 
+        // Pattern: Natural language requests to create a table (e.g. "create table zip_codes", "create another table zip_codes")
+        if (p_lower.contains("create table") || p_lower.contains("create another table") || p_lower.contains("make a table") || p_lower.contains("add a table"))
+            && !p_lower.starts_with("create table")
+        {
+            // Extract table name if possible
+            let words: Vec<&str> = p_lower.split_whitespace().collect();
+            let table_name = words
+                .iter()
+                .position(|&w| w == "table")
+                .and_then(|idx| words.get(idx + 1))
+                .map(|name| name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+                .filter(|name| !name.is_empty())
+                .unwrap_or("new_table");
+
+            let sql = if table_name.contains("zip") {
+                format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, zip TEXT, city TEXT, state TEXT, coordinates VECTOR(2));")
+            } else if table_name.contains("vector") || table_name.contains("embed") {
+                format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, name TEXT, embedding VECTOR(3));")
+            } else {
+                format!("CREATE TABLE {table_name} (id INT PRIMARY KEY, name TEXT, description TEXT);")
+            };
+
+            return (
+                format!("Generated DDL statement to create the `{table_name}` table:"),
+                Some(sql),
+            );
+        }
+
         // Check if there are no tables
         if schema.tables.is_empty() {
             return (
