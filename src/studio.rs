@@ -856,10 +856,10 @@ fn get_studio_html(wal_path: &str) -> String {
 
         let html = `${{providerHtml}}<div>${{data.response.replace(/\n/g, '<br>')}}</div>`;
         if (data.sql) {{
-          const escSql = data.sql.replace(/'/g, "\\'");
+          // Use a data attribute to safely carry the SQL — avoids escaping bugs in onclick strings
           html += `
             <div class="chat-sql-box">
-              <button class="chat-sql-btn" onclick="setQuery('${{escSql}}'); switchTab('queryTab', document.querySelectorAll('.tab')[0]);">Open in SQL Editor</button>
+              <button class="chat-sql-btn js-open-in-editor">Open in SQL Editor</button>
               <code>${{data.sql}}</code>
             </div>
           `;
@@ -877,13 +877,28 @@ fn get_studio_html(wal_path: &str) -> String {
         if (data.suggestions && data.suggestions.length > 0) {{
           html += '<div class="chat-suggestions">';
           data.suggestions.forEach(s => {{
-            const escS = s.replace(/'/g, "\\'");
-            html += `<span class="chat-chip" onclick="sendChatMessage('${{escS}}')">${{s}}</span>`;
+            html += `<button class="chat-chip js-suggestion" data-msg="${{s.replace(/"/g, '&quot;')}}">${{s}}</button>`;
           }});
           html += '</div>';
         }}
 
         thinkingBubble.innerHTML = html;
+
+        // Wire up "Open in SQL Editor" safely with a real event listener (not an inline onclick string)
+        const openBtn = thinkingBubble.querySelector('.js-open-in-editor');
+        if (openBtn && data.sql) {{
+          openBtn.addEventListener('click', function() {{
+            setQuery(data.sql);
+            switchTab('queryTab', document.querySelectorAll('.tab')[0]);
+          }});
+        }}
+        // Wire up suggestion chips the same safe way
+        thinkingBubble.querySelectorAll('.js-suggestion').forEach(function(chip) {{
+          chip.addEventListener('click', function() {{
+            sendChatMessage(chip.dataset.msg);
+          }});
+        }});
+
         container.scrollTop = container.scrollHeight;
         loadTables();
       }} catch (err) {{
