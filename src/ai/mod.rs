@@ -44,6 +44,8 @@ pub struct ChatResponse {
     pub sql: Option<String>,
     pub results: Option<QueryResultView>,
     pub suggestions: Vec<String>,
+    #[serde(default)]
+    pub provider: String,
 }
 
 /// Schema summary representing the live database state
@@ -129,6 +131,7 @@ impl AIAgent {
     pub async fn process_message(&self, req: &ChatRequest) -> ChatResponse {
         let schema = SchemaSummary::from_executor(&self.executor);
         let user_prompt = req.message.trim();
+        let mut fallback_reason: Option<String> = None;
 
         // If an LLM provider is configured (API key or local Ollama), call it!
         if self.llm.is_configured() {
@@ -145,23 +148,33 @@ impl AIAgent {
                 schema.describe()
             );
 
-            if let Ok(llm_response) = self.llm.chat_completion(&system_prompt, user_prompt, &req.history).await {
-                // Extract SQL from response if present
-                let extracted_sql = Self::extract_sql_from_markdown(&llm_response);
-                let results = extracted_sql.as_deref().and_then(|sql| self.try_execute_sql(sql));
-                let suggestions = self.generate_suggestions(&schema, extracted_sql.as_deref());
+            match self.llm.chat_completion(&system_prompt, user_prompt, &req.history).await {
+                Ok(llm_response) => {
+                    // Extract SQL from response if present
+                    let extracted_sql = Self::extract_sql_from_markdown(&llm_response);
+                    let results = extracted_sql.as_deref().and_then(|sql| self.try_execute_sql(sql));
+                    let suggestions = self.generate_suggestions(&schema, extracted_sql.as_deref());
 
-                return ChatResponse {
-                    response: llm_response,
-                    sql: extracted_sql,
-                    results,
-                    suggestions,
-                };
+                    return ChatResponse {
+                        response: llm_response,
+                        sql: extracted_sql,
+                        results,
+                        suggestions,
+                        provider: format!("{} ({})", self.llm.provider_name(), self.llm.model_name()),
+                    };
+                }
+                Err(e) => {
+                    fallback_reason = Some(e);
+                }
             }
         }
 
         // Fallback: embedded semantic rule engine
-        self.process_message_local(req, &schema)
+        let mut resp = self.process_message_local(req, &schema);
+        if let Some(err) = fallback_reason {
+            resp.provider = format!("Embedded Rule Engine (Fallback: {})", err);
+        }
+        resp
     }
 
     /// Helper to extract SQL from markdown code fences ```sql ... ```
@@ -253,6 +266,7 @@ impl AIAgent {
                 sql: None,
                 results: None,
                 suggestions: schema.tables.iter().map(|t| format!("SELECT * FROM {} LIMIT 5;", t.name)).collect(),
+                provider: "Embedded Rule Engine".to_string(),
             };
         }
 
@@ -270,6 +284,7 @@ impl AIAgent {
             sql: generated_sql,
             results,
             suggestions,
+            provider: "Embedded Rule Engine".to_string(),
         }
     }
 

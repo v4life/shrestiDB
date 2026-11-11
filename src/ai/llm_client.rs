@@ -23,12 +23,23 @@ pub struct LLMConfig {
 impl Default for LLMConfig {
     fn default() -> Self {
         // Read configuration from environment variables if present
-        let endpoint = std::env::var("SHRESTIDB_AI_ENDPOINT")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let api_key = std::env::var("SHRESTIDB_AI_API_KEY")
-            .unwrap_or_default();
-        let model = std::env::var("SHRESTIDB_AI_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let api_key = std::env::var("SHRESTIDB_AI_API_KEY").unwrap_or_default();
+
+        let endpoint = std::env::var("SHRESTIDB_AI_ENDPOINT").unwrap_or_else(|_| {
+            if !api_key.trim().is_empty() {
+                "https://api.openai.com/v1".to_string()
+            } else {
+                "http://localhost:11434/v1".to_string()
+            }
+        });
+
+        let model = std::env::var("SHRESTIDB_AI_MODEL").unwrap_or_else(|_| {
+            if endpoint.contains("11434") || endpoint.contains("localhost") || endpoint.contains("127.0.0.1") {
+                "llama3.2".to_string()
+            } else {
+                "gpt-4o-mini".to_string()
+            }
+        });
 
         Self {
             endpoint,
@@ -69,15 +80,48 @@ pub struct LLMClient {
 
 impl LLMClient {
     pub fn new(config: LLMConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(6))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
             config,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 
     /// Check if this client is configured with active credentials or a local endpoint
     pub fn is_configured(&self) -> bool {
-        !self.config.api_key.trim().is_empty() || self.config.endpoint.contains("localhost") || self.config.endpoint.contains("127.0.0.1")
+        !self.config.api_key.trim().is_empty()
+            || self.config.endpoint.contains("localhost")
+            || self.config.endpoint.contains("127.0.0.1")
+    }
+
+    /// Human-readable provider name inferred from endpoint
+    pub fn provider_name(&self) -> String {
+        let ep = self.config.endpoint.to_lowercase();
+        if ep.contains("11434") || ep.contains("ollama") {
+            "Ollama".to_string()
+        } else if ep.contains("openai.com") {
+            "OpenAI".to_string()
+        } else if ep.contains("generativelanguage.googleapis.com") {
+            "Gemini".to_string()
+        } else if ep.contains("groq.com") {
+            "Groq".to_string()
+        } else if ep.contains("localhost") || ep.contains("127.0.0.1") {
+            "Local LLM".to_string()
+        } else {
+            "Cloud LLM".to_string()
+        }
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.config.model
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.config.endpoint
     }
 
     /// Send a chat completion request to the provider
@@ -137,3 +181,4 @@ impl LLMClient {
             .ok_or_else(|| "No choices returned by model provider".to_string())
     }
 }
+

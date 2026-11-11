@@ -173,6 +173,18 @@ impl StudioServer {
                 let json = serde_json::to_string(&status)?;
                 send_response(&mut stream, "200 OK", "application/json", json.as_bytes()).await?;
             }
+            ("GET", "/api/ai/info") => {
+                let config = crate::ai::LLMConfig::default();
+                let client = crate::ai::LLMClient::new(config.clone());
+                let info = serde_json::json!({
+                    "endpoint": config.endpoint,
+                    "model": config.model,
+                    "provider": client.provider_name(),
+                    "is_configured": client.is_configured(),
+                });
+                let json = serde_json::to_string(&info)?;
+                send_response(&mut stream, "200 OK", "application/json", json.as_bytes()).await?;
+            }
             ("GET", "/api/tables") => {
                 let tables: Vec<TableInfo> = {
                     let catalog = self.executor.catalog.read();
@@ -216,6 +228,7 @@ impl StudioServer {
                             sql: None,
                             results: None,
                             suggestions: Vec::new(),
+                            provider: "None".to_string(),
                         };
                         let json = serde_json::to_string(&err_resp)?;
                         send_response(&mut stream, "200 OK", "application/json", json.as_bytes()).await?;
@@ -515,6 +528,8 @@ fn get_studio_html(wal_path: &str) -> String {
     .chat-suggestions {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
     .chat-chip {{ background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.3); color: var(--accent); border-radius: 9999px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer; transition: all 0.15s; }}
     .chat-chip:hover {{ background: var(--accent); color: #000; }}
+    .chat-provider-badge {{ display: inline-flex; align-items: center; gap: 5px; font-size: 0.72rem; font-weight: 600; color: #38bdf8; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 4px; padding: 2px 7px; margin-bottom: 8px; }}
+    .chat-provider-badge.fallback {{ color: #fbbf24; background: rgba(251, 191, 36, 0.1); border-color: rgba(251, 191, 36, 0.25); }}
     .chat-input-bar {{ display: flex; gap: 10px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; align-items: center; }}
     .chat-input {{ flex: 1; background: transparent; border: none; color: var(--text-main); font-size: 0.95rem; outline: none; }}
   </style>
@@ -582,6 +597,10 @@ fn get_studio_html(wal_path: &str) -> String {
       <!-- Tab 2: AI Studio Agent -->
       <div class="tab-content" id="aiTab">
         <div class="chat-layout">
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 14px; background:var(--bg-panel); border:1px solid var(--border); border-radius:8px; font-size:0.82rem;">
+            <span>🤖 Active Provider: <strong id="aiActiveBackend" style="color:var(--accent);">Detecting...</strong></span>
+            <span id="aiBackendInfo" style="color:var(--text-muted); font-size:0.75rem;">Loading model details...</span>
+          </div>
           <div class="chat-messages" id="chatMessages">
             <div class="chat-bubble assistant">
               <strong>✨ ShrestiDB AI Studio Agent</strong><br>
@@ -830,7 +849,12 @@ fn get_studio_html(wal_path: &str) -> String {
         chatHistory.push({{ role: 'user', content: text }});
         chatHistory.push({{ role: 'assistant', content: data.response }});
 
-        let html = `<div>${{data.response.replace(/\n/g, '<br>')}}</div>`;
+        let isFallback = data.provider && (data.provider.includes('Fallback') || data.provider.includes('Embedded'));
+        let badgeClass = isFallback ? 'chat-provider-badge fallback' : 'chat-provider-badge';
+        let badgeIcon = isFallback ? '⚙️' : '⚡';
+        let providerHtml = data.provider ? `<div class="${{badgeClass}}">${{badgeIcon}} ${{data.provider}}</div>` : '';
+
+        let html = `${{providerHtml}}<div>${{data.response.replace(/\n/g, '<br>')}}</div>`;
         if (data.sql) {{
           const escSql = data.sql.replace(/'/g, "\\'");
           html += `
@@ -867,8 +891,23 @@ fn get_studio_html(wal_path: &str) -> String {
       }}
     }}
 
+    // AI Provider info loader
+    async function loadAiInfo() {{
+      try {{
+        const res = await fetch('/api/ai/info');
+        const d = await res.json();
+        const activeEl = document.getElementById('aiActiveBackend');
+        const infoEl = document.getElementById('aiBackendInfo');
+        if (activeEl && infoEl) {{
+          activeEl.innerText = `${{d.provider}} (${{d.model}})`;
+          infoEl.innerText = `Endpoint: ${{d.endpoint}}`;
+        }}
+      }} catch (e) {{}}
+    }}
+
     // Initial load
     loadTables();
+    loadAiInfo();
   </script>
 </body>
 </html>
