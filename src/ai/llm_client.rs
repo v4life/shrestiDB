@@ -80,8 +80,15 @@ pub struct LLMClient {
 
 impl LLMClient {
     pub fn new(config: LLMConfig) -> Self {
+        // Use a generous timeout for local LLM inference (e.g. Ollama on Intel CPU may take
+        // 30-120s to load a model and generate the first token on cold start).
+        let timeout_secs = if config.endpoint.contains("localhost") || config.endpoint.contains("127.0.0.1") {
+            120u64 // Local providers: give them plenty of time
+        } else {
+            30u64  // Cloud providers: they should respond quickly
+        };
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(6))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
