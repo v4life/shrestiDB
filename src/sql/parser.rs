@@ -265,7 +265,9 @@ impl SQLParser {
             .map(|t| Self::table_factor_name(&t.relation))
             .unwrap_or_default();
         let from_alias = select.from.first().and_then(|t| Self::table_factor_alias(&t.relation));
-        let joins = select
+
+        // Collect explicit JOINs from the first FROM entry.
+        let mut joins: Vec<JoinClause> = select
             .from
             .first()
             .map(|t| {
@@ -285,7 +287,117 @@ impl SQLParser {
             })
             .unwrap_or_default();
 
-        let where_clause = select.selection.as_ref().map(|e| e.to_string());
+        // Handle implicit comma-join syntax: `FROM a, b, c WHERE ...`
+        // sqlparser puts the extra tables as additional `from` entries (each
+        // with an empty `joins` list). Convert them into inner JoinClauses
+        // with no condition here; the WHERE predicate is then split below.
+        let implicit_join_tables: Vec<(String, Option<String>)> = select
+            .from
+            .iter()
+            .skip(1) // first entry is `from` / explicit-JOIN base
+            .map(|t| (Self::table_factor_name(&t.relation), Self::table_factor_alias(&t.relation)))
+            .collect();
+
+        // Collect the all-table names for predicate classification.
+        // A predicate term is a "join condition" for table T if it references
+        // T's name (or alias) *and* at least one other table already in scope.
+        // Everything else stays in the WHERE filter.
+        //
+        // We work at the flattened-string level (after `e.to_string()`) to
+        // stay consistent with the rest of this parser's "no expression tree
+        // downstream" design. This is intentionally simple: we split on the
+        // top-level AND chain and check each term for table name mentions.
+        let (where_clause, implicit_joins) = if implicit_join_tables.is_empty() {
+            (select.selection.as_ref().map(|e| e.to_string()), Vec::new())
+        } else {
+            // All table identifiers in scope (base + implicit extras).
+            // Also include their aliases so e.g. `a.id = zc.id` is recognised
+            // when the query says `FROM accounts a, zip_codes zc`.
+            let all_tables: Vec<String> = {
+                let mut v = vec![from_alias.clone().unwrap_or_else(|| from.clone())];
+                for (tname, talias) in &implicit_join_tables {
+                    v.push(talias.clone().unwrap_or_else(|| tname.clone()));
+                }
+                // Also add unaliased table names so `accounts.id` is found
+                // even when `FROM accounts a` gave it an alias.
+                v.push(from.clone());
+                for (tname, _) in &implicit_join_tables {
+                    v.push(tname.clone());
+                }
+                v
+            };
+
+            // Split the WHERE AST into individual AND-connected conjuncts.
+            let conjuncts = select
+                .selection
+                .as_ref()
+                .map(Self::collect_and_conjuncts)
+                .unwrap_or_default();
+
+            // For each implicit join table, pick the conjuncts that mention
+            // that table AND at least one other table in scope. The first
+            // qualifying conjunct becomes the join condition; remaining ones
+            // that only mention this table also get pulled into join conds.
+            let mut used = vec![false; conjuncts.len()];
+            let mut implicit_conds: Vec<Option<String>> = vec![None; implicit_join_tables.len()];
+
+            for (idx, (tname, talias)) in implicit_join_tables.iter().enumerate() {
+                let this_id = talias.as_deref().unwrap_or(tname.as_str());
+                let mut join_parts: Vec<String> = Vec::new();
+
+                for (ci, expr_str) in conjuncts.iter().enumerate() {
+                    if used[ci] { continue; }
+                    let lower = expr_str.to_lowercase();
+                    // Check if this conjunct references this table.
+                    let refs_this = lower.contains(&format!("{}.", this_id.to_lowercase()))
+                        || lower.contains(&format!("{}.", tname.to_lowercase()));
+                    if !refs_this { continue; }
+                    // Check if it also references any other table in scope —
+                    // that makes it a cross-table join predicate; a conjunct
+                    // that only mentions one table is a plain row filter and
+                    // stays in WHERE.
+                    let refs_other = all_tables.iter().any(|t| {
+                        let tl = t.to_lowercase();
+                        tl != this_id.to_lowercase()
+                            && tl != tname.to_lowercase()
+                            && lower.contains(&format!("{}.", tl))
+                    });
+                    if refs_this && refs_other {
+                        join_parts.push(expr_str.clone());
+                        used[ci] = true;
+                    }
+                }
+
+                implicit_conds[idx] = if join_parts.is_empty() {
+                    None
+                } else {
+                    Some(join_parts.join(" AND "))
+                };
+            }
+
+            // Remaining (unused) conjuncts become the WHERE filter.
+            let remaining: Vec<String> = conjuncts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !used[*i])
+                .map(|(_, s)| s.clone())
+                .collect();
+            let where_clause = if remaining.is_empty() { None } else { Some(remaining.join(" AND ")) };
+
+            (where_clause, implicit_conds)
+        };
+
+        // Append the implicit join tables with their extracted conditions.
+        for ((tname, talias), cond) in implicit_join_tables.into_iter().zip(implicit_joins) {
+            joins.push(JoinClause {
+                table: tname,
+                alias: talias,
+                condition: cond,
+                equi_match: None,
+                kind: JoinKind::Inner,
+            });
+        }
+
         let group_by = match &select.group_by {
             ast::GroupByExpr::Expressions(exprs, _) => exprs.iter().map(|e| e.to_string()).collect(),
             ast::GroupByExpr::All(_) => Vec::new(), // not recognized; see field docs
@@ -308,6 +420,20 @@ impl SQLParser {
             limit,
             offset,
         }))
+    }
+
+    /// Flatten a WHERE expression's top-level `AND` chain into individual
+    /// conjunct strings, preserving parenthesised sub-expressions intact.
+    /// `a AND b AND c` → `["a", "b", "c"]`; `a AND (b OR c)` → `["a", "(b OR c)"]`.
+    fn collect_and_conjuncts(expr: &ast::Expr) -> Vec<String> {
+        match expr {
+            ast::Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+                let mut parts = Self::collect_and_conjuncts(left);
+                parts.extend(Self::collect_and_conjuncts(right));
+                parts
+            }
+            other => vec![other.to_string()],
+        }
     }
 
     /// Extract the join constraint from a join operator, regardless of
@@ -749,5 +875,109 @@ mod tests {
     fn test_parse_invalid_sql_errors() {
         assert!(SQLParser::parse("SELECT * FRM users").is_err());
         assert!(SQLParser::parse("").is_err());
+    }
+
+    // ── Implicit comma-join (FROM a, b, c WHERE ...) ─────────────────────────
+
+    #[test]
+    fn test_implicit_two_table_join_becomes_join_clause() {
+        // `FROM accounts, address WHERE accounts.id = address.id` must be
+        // rewritten into an explicit inner-join with the predicate as the
+        // join condition, not left as a WHERE on a cross product.
+        let sql = "SELECT * FROM accounts, address WHERE accounts.id = address.id";
+        let stmt = SQLParser::parse(sql).unwrap();
+        match stmt {
+            SQLStatement::Select(s) => {
+                assert_eq!(s.from, "accounts");
+                assert_eq!(s.joins.len(), 1);
+                let j = &s.joins[0];
+                assert_eq!(j.table, "address");
+                // The join condition must reference both tables.
+                let cond = j.condition.as_deref().expect("expected a join condition");
+                assert!(cond.contains("accounts.id"), "condition: {cond}");
+                assert!(cond.contains("address.id"), "condition: {cond}");
+                // The cross-table predicate must NOT also appear in WHERE.
+                assert!(s.where_clause.is_none(), "where_clause should be empty after extraction, got: {:?}", s.where_clause);
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_implicit_three_table_join_partitions_predicates() {
+        // The exact query the user reported failing.
+        let sql = "SELECT * FROM accounts, address, zip_codes WHERE accounts.id = address.id AND accounts.id = zip_codes.id";
+        let stmt = SQLParser::parse(sql).unwrap();
+        match stmt {
+            SQLStatement::Select(s) => {
+                assert_eq!(s.from, "accounts");
+                assert_eq!(s.joins.len(), 2, "expected two implicit join clauses");
+
+                let j_addr = s.joins.iter().find(|j| j.table == "address").expect("address join missing");
+                let cond_addr = j_addr.condition.as_deref().expect("address join condition missing");
+                assert!(cond_addr.contains("accounts.id") && cond_addr.contains("address.id"),
+                    "address condition: {cond_addr}");
+
+                let j_zip = s.joins.iter().find(|j| j.table == "zip_codes").expect("zip_codes join missing");
+                let cond_zip = j_zip.condition.as_deref().expect("zip_codes join condition missing");
+                assert!(cond_zip.contains("accounts.id") && cond_zip.contains("zip_codes.id"),
+                    "zip_codes condition: {cond_zip}");
+
+                // No leftover WHERE — both predicates were cross-table.
+                assert!(s.where_clause.is_none(), "where_clause should be empty, got: {:?}", s.where_clause);
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_implicit_join_mixed_predicates_splits_correctly() {
+        // Cross-table predicates → join conditions; single-table predicate → WHERE.
+        let sql = "SELECT * FROM accounts, address WHERE accounts.id = address.id AND accounts.balance > 100";
+        let stmt = SQLParser::parse(sql).unwrap();
+        match stmt {
+            SQLStatement::Select(s) => {
+                let j = &s.joins[0];
+                let cond = j.condition.as_deref().expect("join condition missing");
+                assert!(cond.contains("accounts.id") && cond.contains("address.id"));
+                // The single-table filter must remain in WHERE.
+                let wc = s.where_clause.as_deref().expect("where_clause should contain single-table filter");
+                assert!(wc.contains("accounts.balance") && wc.contains("100"), "where: {wc}");
+                // And must NOT contain the join predicate.
+                assert!(!wc.contains("address.id"), "join predicate leaked into WHERE: {wc}");
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_implicit_join_end_to_end_executes() {
+        // Integration smoke test: the query must actually execute and return data.
+        use std::sync::Arc;
+        use crate::execution::{QueryExecutor, catalog::Catalog};
+
+        let executor = Arc::new(QueryExecutor::new(Catalog::new()));
+        executor.execute_sql("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").unwrap();
+        executor.execute_sql("CREATE TABLE address (id INT PRIMARY KEY, city TEXT)").unwrap();
+        executor.execute_sql("CREATE TABLE zip_codes (id INT PRIMARY KEY, zip TEXT)").unwrap();
+
+        executor.execute_sql("INSERT INTO accounts VALUES (1, 'Alice')").unwrap();
+        executor.execute_sql("INSERT INTO accounts VALUES (2, 'Bob')").unwrap();
+        executor.execute_sql("INSERT INTO address VALUES (1, 'San Francisco')").unwrap();
+        executor.execute_sql("INSERT INTO address VALUES (2, 'Oakland')").unwrap();
+        executor.execute_sql("INSERT INTO zip_codes VALUES (1, '94102')").unwrap();
+        // Intentionally no zip_codes row for Bob — only Alice should appear.
+
+        let rows = executor.execute_sql(
+            "SELECT * FROM accounts, address, zip_codes WHERE accounts.id = address.id AND accounts.id = zip_codes.id"
+        ).unwrap();
+
+        // Only Alice has matching rows in all three tables.
+        assert_eq!(rows.len(), 1, "expected 1 row, got {}: {:?}", rows.len(), rows);
+        // The row should contain Alice's data from all three tables.
+        let row = &rows[0];
+        assert!(row.iter().any(|v| v == "Alice"), "row: {row:?}");
+        assert!(row.iter().any(|v| v == "San Francisco"), "row: {row:?}");
+        assert!(row.iter().any(|v| v == "94102"), "row: {row:?}");
     }
 }
