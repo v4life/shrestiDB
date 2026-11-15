@@ -310,23 +310,6 @@ impl SQLParser {
         let (where_clause, implicit_joins) = if implicit_join_tables.is_empty() {
             (select.selection.as_ref().map(|e| e.to_string()), Vec::new())
         } else {
-            // All table identifiers in scope (base + implicit extras).
-            // Also include their aliases so e.g. `a.id = zc.id` is recognised
-            // when the query says `FROM accounts a, zip_codes zc`.
-            let all_tables: Vec<String> = {
-                let mut v = vec![from_alias.clone().unwrap_or_else(|| from.clone())];
-                for (tname, talias) in &implicit_join_tables {
-                    v.push(talias.clone().unwrap_or_else(|| tname.clone()));
-                }
-                // Also add unaliased table names so `accounts.id` is found
-                // even when `FROM accounts a` gave it an alias.
-                v.push(from.clone());
-                for (tname, _) in &implicit_join_tables {
-                    v.push(tname.clone());
-                }
-                v
-            };
-
             // Split the WHERE AST into individual AND-connected conjuncts.
             let conjuncts = select
                 .selection
@@ -345,6 +328,28 @@ impl SQLParser {
                 let this_id = talias.as_deref().unwrap_or(tname.as_str());
                 let mut join_parts: Vec<String> = Vec::new();
 
+                // Tables already in scope on the left side: from + implicit_join_tables[0..idx]
+                let mut tables_before = Vec::new();
+                tables_before.push(from.to_lowercase());
+                if let Some(ref a) = from_alias {
+                    tables_before.push(a.to_lowercase());
+                }
+                for (prev_name, prev_alias) in &implicit_join_tables[..idx] {
+                    tables_before.push(prev_name.to_lowercase());
+                    if let Some(ref a) = prev_alias {
+                        tables_before.push(a.to_lowercase());
+                    }
+                }
+
+                // Tables to be joined in future iterations: implicit_join_tables[idx + 1..]
+                let mut tables_after = Vec::new();
+                for (future_name, future_alias) in &implicit_join_tables[idx + 1..] {
+                    tables_after.push(future_name.to_lowercase());
+                    if let Some(ref a) = future_alias {
+                        tables_after.push(a.to_lowercase());
+                    }
+                }
+
                 for (ci, expr_str) in conjuncts.iter().enumerate() {
                     if used[ci] { continue; }
                     let lower = expr_str.to_lowercase();
@@ -352,17 +357,14 @@ impl SQLParser {
                     let refs_this = lower.contains(&format!("{}.", this_id.to_lowercase()))
                         || lower.contains(&format!("{}.", tname.to_lowercase()));
                     if !refs_this { continue; }
-                    // Check if it also references any other table in scope —
-                    // that makes it a cross-table join predicate; a conjunct
-                    // that only mentions one table is a plain row filter and
-                    // stays in WHERE.
-                    let refs_other = all_tables.iter().any(|t| {
-                        let tl = t.to_lowercase();
-                        tl != this_id.to_lowercase()
-                            && tl != tname.to_lowercase()
-                            && lower.contains(&format!("{}.", tl))
-                    });
-                    if refs_this && refs_other {
+
+                    // It must NOT reference any future tables that haven't been joined yet.
+                    let refs_future = tables_after.iter().any(|t| lower.contains(&format!("{}.", t)));
+                    if refs_future { continue; }
+
+                    // It must reference at least one table that has already been joined (on the left side).
+                    let refs_before = tables_before.iter().any(|t| lower.contains(&format!("{}.", t)));
+                    if refs_this && refs_before {
                         join_parts.push(expr_str.clone());
                         used[ci] = true;
                     }
@@ -979,5 +981,40 @@ mod tests {
         assert!(row.iter().any(|v| v == "Alice"), "row: {row:?}");
         assert!(row.iter().any(|v| v == "San Francisco"), "row: {row:?}");
         assert!(row.iter().any(|v| v == "94102"), "row: {row:?}");
+    }
+
+    #[test]
+    fn test_implicit_chained_joins_between_non_base_tables() {
+        use std::sync::Arc;
+        use crate::execution::{QueryExecutor, catalog::Catalog};
+
+        let executor = Arc::new(QueryExecutor::new(Catalog::new()));
+        executor.execute_sql("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").unwrap();
+        executor.execute_sql("CREATE TABLE address (id INT PRIMARY KEY, zip_code TEXT)").unwrap();
+        executor.execute_sql("CREATE TABLE zip_codes (id INT PRIMARY KEY, zip TEXT, city TEXT)").unwrap();
+
+        executor.execute_sql("INSERT INTO accounts VALUES (1, 'Alice')").unwrap();
+        executor.execute_sql("INSERT INTO address VALUES (1, '94102')").unwrap();
+        executor.execute_sql("INSERT INTO zip_codes VALUES (1, '94102', 'San Francisco')").unwrap();
+
+        // Test the exact query reported:
+        let sql = "SELECT * FROM accounts, address, zip_codes WHERE accounts.id = address.id AND address.zip_code = zip_codes.zip";
+        let stmt = SQLParser::parse(sql).unwrap();
+        if let SQLStatement::Select(s) = &stmt {
+            assert_eq!(s.joins.len(), 2);
+            assert_eq!(s.joins[0].table, "address");
+            assert_eq!(s.joins[0].condition.as_deref(), Some("accounts.id = address.id"));
+            assert_eq!(s.joins[1].table, "zip_codes");
+            assert_eq!(s.joins[1].condition.as_deref(), Some("address.zip_code = zip_codes.zip"));
+            assert!(s.where_clause.is_none());
+        } else {
+            panic!("expected select");
+        }
+
+        let rows = executor.execute_sql(sql).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].iter().any(|v| v == "Alice"));
+        assert!(rows[0].iter().any(|v| v == "94102"));
+        assert!(rows[0].iter().any(|v| v == "San Francisco"));
     }
 }

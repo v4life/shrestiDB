@@ -572,24 +572,17 @@ impl QueryExecutor {
                     // regardless of shape.
                     let mut hash_key_indices: Option<(usize, usize)> = None; // (idx into left_tuples, idx into right_tuples)
                     if let Some(cond) = condition {
-                        let (left_tok, op, right_tok) = row_codec::split_comparison(cond).ok_or_else(|| {
-                            DatabaseError::ExecutionError(format!("Unsupported JOIN condition: '{cond}'"))
-                        })?;
-                        let col_idx = |tok: &str| merged_schema.columns.iter().position(|c| c.name == tok);
-                        let (a, b) = match (col_idx(&left_tok), col_idx(&right_tok)) {
-                            (Some(a), Some(b)) => (a, b),
-                            _ => {
-                                return Err(DatabaseError::ExecutionError(format!(
-                                    "JOIN condition must compare two columns (e.g. 'a.id = b.a_id'), got: '{cond}'"
-                                )));
+                        if let Some((left_tok, op, right_tok)) = row_codec::split_comparison(cond) {
+                            let col_idx = |tok: &str| merged_schema.columns.iter().position(|c| c.name == tok);
+                            if let (Some(a), Some(b)) = (col_idx(&left_tok), col_idx(&right_tok)) {
+                                if op == "=" {
+                                    hash_key_indices = match (a < left_len, b < left_len) {
+                                        (true, false) => Some((a, b - left_len)),
+                                        (false, true) => Some((b, a - left_len)),
+                                        _ => None, // both operands on the same side: not hash-joinable
+                                    };
+                                }
                             }
-                        };
-                        if op == "=" {
-                            hash_key_indices = match (a < left_len, b < left_len) {
-                                (true, false) => Some((a, b - left_len)),
-                                (false, true) => Some((b, a - left_len)),
-                                _ => None, // both operands on the same side: not hash-joinable
-                            };
                         }
                     }
 
