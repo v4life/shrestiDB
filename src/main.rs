@@ -126,18 +126,20 @@ fn parse_args() -> Result<Option<CliOptions>, i32> {
 
 /// Print tabular data with proper headers and data rows in an aligned ASCII box
 fn print_table_with_headers(headers: &[String], rows: &[Vec<String>]) {
-    let col_count = if !headers.is_empty() {
+    let col_count = if let Some(first) = rows.first() {
+        first.len().max(headers.len())
+    } else if !headers.is_empty() {
         headers.len()
-    } else if let Some(first) = rows.first() {
-        first.len()
     } else {
         return;
     };
 
     let mut widths = vec![0; col_count];
-    for (i, h) in headers.iter().enumerate() {
-        if i < col_count && h.len() > widths[i] {
-            widths[i] = h.len();
+    for (i, w) in widths.iter_mut().enumerate() {
+        if let Some(h) = headers.get(i) {
+            if h.len() > *w {
+                *w = h.len();
+            }
         }
     }
     for row in rows {
@@ -155,10 +157,11 @@ fn print_table_with_headers(headers: &[String], rows: &[Vec<String>]) {
         .join("+");
 
     println!("+{border}+");
-    if !headers.is_empty() {
+    if !headers.is_empty() || rows.first().is_some() {
         let header_line: String = (0..col_count)
             .map(|i| {
-                let cell = headers.get(i).map(|s| s.as_str()).unwrap_or("");
+                let default_name = format!("col_{}", i + 1);
+                let cell = headers.get(i).map(|s| s.as_str()).unwrap_or(&default_name);
                 format!(" {:<width$} ", cell, width = widths[i])
             })
             .collect::<Vec<_>>()
@@ -309,14 +312,7 @@ fn execute_and_print(sql: &str, executor: &QueryExecutor) -> bool {
     if let Some(ref stmt) = parsed_stmt {
         match stmt {
             SQLStatement::Select(select) => {
-                let catalog = executor.catalog.read();
-                if select.columns.len() == 1 && select.columns[0] == "*" {
-                    if let Some(table) = catalog.get_table(&select.from) {
-                        expected_columns = table.columns.iter().map(|c| c.name.clone()).collect();
-                    }
-                } else {
-                    expected_columns = select.columns.clone();
-                }
+                expected_columns = executor.resolve_select_columns(select);
             }
             SQLStatement::Insert(_) | SQLStatement::Update(_) | SQLStatement::Delete(_) => {
                 is_dml = true;

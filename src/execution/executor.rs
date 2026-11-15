@@ -230,6 +230,38 @@ impl QueryExecutor {
         }
     }
 
+    /// Resolve expected column names for a SELECT statement, taking into account
+    /// joins and wildcard expansions.
+    pub fn resolve_select_columns(&self, select: &crate::sql::parser::SelectStatement) -> Vec<String> {
+        let catalog = self.catalog.read();
+        if select.columns.len() == 1 && select.columns[0] == "*" {
+            let mut cols = Vec::new();
+            if select.joins.is_empty() {
+                if let Some(table) = catalog.get_table(&select.from) {
+                    cols.extend(table.columns.iter().map(|c| c.name.clone()));
+                }
+            } else {
+                let from_prefix = select.from_alias.as_deref().unwrap_or(&select.from);
+                if let Some(table) = catalog.get_table(&select.from) {
+                    for c in &table.columns {
+                        cols.push(format!("{from_prefix}.{}", c.name));
+                    }
+                }
+                for join in &select.joins {
+                    let join_prefix = join.alias.as_deref().unwrap_or(&join.table);
+                    if let Some(table) = catalog.get_table(&join.table) {
+                        for c in &table.columns {
+                            cols.push(format!("{join_prefix}.{}", c.name));
+                        }
+                    }
+                }
+            }
+            cols
+        } else {
+            select.columns.clone()
+        }
+    }
+
     /// Parse, bind, and plan/validate `sql` once, returning a
     /// `PreparedStatement` that `execute_prepared` can run repeatedly with
     /// different bound `params` — each execution substitutes parameters

@@ -211,14 +211,7 @@ impl AIAgent {
                 let mut columns = Vec::new();
                 if let Ok(stmt) = crate::sql::parser::SQLParser::parse(sql) {
                     if let crate::sql::parser::SQLStatement::Select(select) = stmt {
-                        let catalog = self.executor.catalog.read();
-                        if select.columns.len() == 1 && select.columns[0] == "*" {
-                            if let Some(table) = catalog.get_table(&select.from) {
-                                columns = table.columns.iter().map(|c| c.name.clone()).collect();
-                            }
-                        } else {
-                            columns = select.columns.clone();
-                        }
+                        columns = self.executor.resolve_select_columns(&select);
                     }
                 }
                 if columns.is_empty() && !raw_rows.is_empty() {

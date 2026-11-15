@@ -289,14 +289,7 @@ impl StudioServer {
         if let Some(ref stmt) = parsed_stmt {
             match stmt {
                 SQLStatement::Select(select) => {
-                    let catalog = self.executor.catalog.read();
-                    if select.columns.len() == 1 && select.columns[0] == "*" {
-                        if let Some(table) = catalog.get_table(&select.from) {
-                            expected_columns = table.columns.iter().map(|c| c.name.clone()).collect();
-                        }
-                    } else {
-                        expected_columns = select.columns.clone();
-                    }
+                    expected_columns = self.executor.resolve_select_columns(select);
                 }
                 SQLStatement::Insert(_) | SQLStatement::Update(_) | SQLStatement::Delete(_) => {
                     is_dml = true;
