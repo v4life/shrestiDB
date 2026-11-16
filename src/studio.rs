@@ -842,9 +842,9 @@ fn get_studio_html(wal_path: &str) -> String {
         chatHistory.push({{ role: 'user', content: text }});
         chatHistory.push({{ role: 'assistant', content: data.response }});
 
-        let isFallback = data.provider && (data.provider.includes('Fallback') || data.provider.includes('Embedded'));
-        let badgeClass = isFallback ? 'chat-provider-badge fallback' : 'chat-provider-badge';
-        let badgeIcon = isFallback ? '⚙️' : '⚡';
+        let isOffline = data.provider && (data.provider.includes('Offline') || data.provider.includes('Unconfigured') || data.provider.includes('Fallback'));
+        let badgeClass = isOffline ? 'chat-provider-badge fallback' : 'chat-provider-badge';
+        let badgeIcon = isOffline ? '⚠️' : '⚡';
         let providerHtml = data.provider ? `<div class="${{badgeClass}}">${{badgeIcon}} ${{data.provider}}</div>` : '';
 
         let html = `${{providerHtml}}<div>${{data.response.replace(/\n/g, '<br>')}}</div>`;
