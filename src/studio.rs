@@ -84,6 +84,8 @@ pub struct StudioServer {
     start_time: Instant,
 }
 
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#0ea5e9"/></linearGradient></defs><rect width="32" height="32" rx="7" fill="#0f172a"/><ellipse cx="16" cy="8" rx="10" ry="3" fill="none" stroke="#334155" stroke-width="1.5"/><path d="M6 8v5c0 1.7 4.5 3 10 3s10-1.3 10-3V8" fill="none" stroke="#334155" stroke-width="1.5"/><path d="M6 13v5c0 1.7 4.5 3 10 3s10-1.3 10-3v-5" fill="none" stroke="#334155" stroke-width="1.5"/><path d="M17.5 4L9.5 16.5h5.5l-2 11.5 9.5-13.5h-5.5l3-10.5z" fill="url(#g)"/></svg>"##;
+
 impl StudioServer {
     pub fn new(executor: Arc<QueryExecutor>, wal_path: String) -> Self {
         StudioServer {
@@ -154,8 +156,8 @@ impl StudioServer {
                 let html = get_studio_html(&self.wal_path);
                 send_response(&mut stream, "200 OK", "text/html; charset=utf-8", html.as_bytes()).await?;
             }
-            ("GET", "/favicon.ico") | ("HEAD", "/favicon.ico") => {
-                send_response(&mut stream, "204 No Content", "image/x-icon", b"").await?;
+            ("GET", "/favicon.ico") | ("HEAD", "/favicon.ico") | ("GET", "/favicon.svg") | ("HEAD", "/favicon.svg") => {
+                send_response(&mut stream, "200 OK", "image/svg+xml", FAVICON_SVG.as_bytes()).await?;
             }
             ("OPTIONS", _) => {
                 send_response(&mut stream, "204 No Content", "text/plain", b"").await?;
@@ -434,6 +436,8 @@ fn get_studio_html(wal_path: &str) -> String {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ShrestiDB Studio</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="alternate icon" href="/favicon.ico">
   <style>
     :root {{
       --bg-dark: #0f172a;
