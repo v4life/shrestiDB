@@ -516,10 +516,10 @@ fn get_studio_html(wal_path: &str) -> String {
     /* AI Studio Chat */
     .chat-layout {{ display: flex; flex-direction: column; height: 100%; gap: 14px; overflow: hidden; }}
     .chat-messages {{ flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding: 10px 4px; }}
-    .chat-bubble {{ max-width: 85%; padding: 14px 18px; border-radius: 10px; font-size: 0.92rem; line-height: 1.5; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }}
+    .chat-bubble {{ max-width: 85%; padding: 14px 18px; border-radius: 10px; font-size: 0.92rem; line-height: 1.5; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); white-space: pre-wrap; }}
     .chat-bubble.user {{ align-self: flex-end; background: rgba(56, 189, 248, 0.18); border: 1px solid var(--accent); color: var(--text-main); }}
     .chat-bubble.assistant {{ align-self: flex-start; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-main); width: 85%; }}
-    .chat-sql-box {{ background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-top: 10px; font-family: monospace; font-size: 0.88rem; position: relative; color: #38bdf8; }}
+    .chat-sql-box {{ background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-top: 10px; font-family: monospace; font-size: 0.88rem; position: relative; color: #38bdf8; white-space: pre; overflow-x: auto; }}
     .chat-sql-btn {{ position: absolute; right: 8px; top: 8px; background: var(--bg-card); border: 1px solid var(--border); color: var(--accent); padding: 4px 10px; border-radius: 4px; font-size: 0.75rem; cursor: pointer; }}
     .chat-sql-btn:hover {{ background: var(--accent); color: #000; }}
     .chat-suggestions {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
@@ -527,8 +527,8 @@ fn get_studio_html(wal_path: &str) -> String {
     .chat-chip:hover {{ background: var(--accent); color: #000; }}
     .chat-provider-badge {{ display: inline-flex; align-items: center; gap: 5px; font-size: 0.72rem; font-weight: 600; color: #38bdf8; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 4px; padding: 2px 7px; margin-bottom: 8px; }}
     .chat-provider-badge.fallback {{ color: #fbbf24; background: rgba(251, 191, 36, 0.1); border-color: rgba(251, 191, 36, 0.25); }}
-    .chat-input-bar {{ display: flex; gap: 10px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; align-items: center; }}
-    .chat-input {{ flex: 1; background: transparent; border: none; color: var(--text-main); font-size: 0.95rem; outline: none; }}
+    .chat-input-bar {{ display: flex; gap: 10px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; align-items: flex-end; }}
+    .chat-input {{ flex: 1; background: transparent; border: none; color: var(--text-main); font-size: 0.95rem; outline: none; resize: none; min-height: 24px; max-height: 160px; line-height: 1.45; font-family: inherit; }}
   </style>
 </head>
 <body>
@@ -613,8 +613,8 @@ fn get_studio_html(wal_path: &str) -> String {
           </div>
 
           <div class="chat-input-bar">
-            <input class="chat-input" id="chatInput" placeholder="Ask AI anything (e.g. 'find items nearest to [0.5, 0.5, 0.0]', 'show schema')..." onkeydown="if(event.key==='Enter') sendChatMessage()">
-            <button class="btn" onclick="sendChatMessage()">Send ⏎</button>
+            <textarea class="chat-input" id="chatInput" rows="1" placeholder="Ask AI anything or enter multi-line SQL... (⏎ to send, Shift+⏎ for newline)"></textarea>
+            <button class="btn" style="padding: 8px 16px; align-self: flex-end;" onclick="sendChatMessage()">Send ⏎</button>
           </div>
         </div>
       </div>
@@ -815,11 +815,28 @@ fn get_studio_html(wal_path: &str) -> String {
 
     // AI Chat Agent
     let chatHistory = [];
+
+    // Multiline Chat Input Auto-resize and Enter / Shift+Enter handling
+    const chatInputEl = document.getElementById('chatInput');
+    chatInputEl.addEventListener('keydown', function(e) {{
+      if (e.key === 'Enter' && !e.shiftKey) {{
+        e.preventDefault();
+        sendChatMessage();
+      }}
+    }});
+    chatInputEl.addEventListener('input', function() {{
+      this.style.height = 'auto';
+      this.style.height = Math.min(this.scrollHeight, 160) + 'px';
+    }});
+
     async function sendChatMessage(customText) {{
       const input = document.getElementById('chatInput');
       const text = customText || input.value.trim();
       if (!text) return;
-      if (!customText) input.value = '';
+      if (!customText) {{
+        input.value = '';
+        input.style.height = 'auto';
+      }}
 
       const container = document.getElementById('chatMessages');
 
