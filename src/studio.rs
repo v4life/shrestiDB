@@ -6,7 +6,6 @@
 //! - Real-time Learned Index vs B-Tree Benchmark & Visualizer
 //! - Zero external runtime dependencies: runs directly on Tokio HTTP server
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -96,10 +95,23 @@ impl StudioServer {
     }
 
     pub async fn run(self: Arc<Self>, port: u16) -> anyhow::Result<()> {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = TcpListener::bind(addr).await?;
+        let host = std::env::var("HOST")
+            .or_else(|_| std::env::var("SHRESTIDB_HOST"))
+            .unwrap_or_else(|_| "0.0.0.0".to_string());
+        self.run_on(&host, port).await
+    }
+
+    pub async fn run_on(self: Arc<Self>, host: &str, port: u16) -> anyhow::Result<()> {
+        let bind_target = format!("{host}:{port}");
+        let listener = TcpListener::bind(&bind_target).await?;
         println!();
-        println!("🚀 ShrestiDB Web Studio is running at: http://localhost:{port}/");
+        if host == "0.0.0.0" {
+            println!("🚀 ShrestiDB Web Studio listening on all interfaces (0.0.0.0:{port}):");
+            println!("   Local:   http://localhost:{port}/  or  http://127.0.0.1:{port}/");
+            println!("   Network: http://0.0.0.0:{port}/");
+        } else {
+            println!("🚀 ShrestiDB Web Studio is running at: http://{host}:{port}/");
+        }
         println!("Press Ctrl+C to stop the web server.\n");
 
         loop {
@@ -155,6 +167,9 @@ impl StudioServer {
             ("GET", "/") | ("GET", "/index.html") | ("HEAD", "/") | ("HEAD", "/index.html") => {
                 let html = get_studio_html(&self.wal_path);
                 send_response(&mut stream, "200 OK", "text/html; charset=utf-8", html.as_bytes()).await?;
+            }
+            ("GET", "/health") | ("GET", "/healthz") | ("HEAD", "/health") | ("HEAD", "/healthz") => {
+                send_response(&mut stream, "200 OK", "text/plain", b"OK").await?;
             }
             ("GET", "/favicon.ico") | ("HEAD", "/favicon.ico") | ("GET", "/favicon.svg") | ("HEAD", "/favicon.svg") => {
                 send_response(&mut stream, "200 OK", "image/svg+xml", FAVICON_SVG.as_bytes()).await?;
