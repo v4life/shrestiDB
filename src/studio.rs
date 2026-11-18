@@ -830,16 +830,56 @@ fn get_studio_html(wal_path: &str) -> String {
 
     // AI Chat Agent
     let chatHistory = [];
+    let promptHistory = JSON.parse(localStorage.getItem('shrestidb_ai_history') || '[]');
+    let historyIdx = -1;
+    let savedCurrentInput = '';
 
-    // Multiline Chat Input Auto-resize and Enter / Shift+Enter handling
+    // Multiline Chat Input Auto-resize, Enter / Shift+Enter, and Up/Down History navigation
     const chatInputEl = document.getElementById('chatInput');
     chatInputEl.addEventListener('keydown', function(e) {{
       if (e.key === 'Enter' && !e.shiftKey) {{
         e.preventDefault();
         sendChatMessage();
+        return;
+      }}
+
+      // Navigate prompt history with ArrowUp / ArrowDown
+      if (e.key === 'ArrowUp') {{
+        const isCaretAtTop = this.selectionStart === 0 && this.selectionEnd === 0;
+        if (isCaretAtTop && promptHistory.length > 0) {{
+          if (historyIdx === -1) {{
+            savedCurrentInput = this.value;
+            historyIdx = promptHistory.length - 1;
+          }} else if (historyIdx > 0) {{
+            historyIdx--;
+          }}
+          this.value = promptHistory[historyIdx] || '';
+          this.style.height = 'auto';
+          this.style.height = Math.min(this.scrollHeight, 160) + 'px';
+          e.preventDefault();
+          this.setSelectionRange(this.value.length, this.value.length);
+        }}
+      }} else if (e.key === 'ArrowDown') {{
+        const isCaretAtEnd = this.selectionStart === this.value.length && this.selectionEnd === this.value.length;
+        if (isCaretAtEnd && historyIdx !== -1) {{
+          if (historyIdx < promptHistory.length - 1) {{
+            historyIdx++;
+            this.value = promptHistory[historyIdx];
+          }} else {{
+            historyIdx = -1;
+            this.value = savedCurrentInput;
+          }}
+          this.style.height = 'auto';
+          this.style.height = Math.min(this.scrollHeight, 160) + 'px';
+          e.preventDefault();
+          this.setSelectionRange(this.value.length, this.value.length);
+        }}
       }}
     }});
     chatInputEl.addEventListener('input', function() {{
+      if (historyIdx === -1) {{
+        savedCurrentInput = this.value;
+      }}
       this.style.height = 'auto';
       this.style.height = Math.min(this.scrollHeight, 160) + 'px';
     }});
@@ -848,6 +888,16 @@ fn get_studio_html(wal_path: &str) -> String {
       const input = document.getElementById('chatInput');
       const text = customText || input.value.trim();
       if (!text) return;
+
+      // Save to prompt history (avoid consecutive duplicates)
+      if (promptHistory.length === 0 || promptHistory[promptHistory.length - 1] !== text) {{
+        promptHistory.push(text);
+        if (promptHistory.length > 100) promptHistory.shift();
+        try {{ localStorage.setItem('shrestidb_ai_history', JSON.stringify(promptHistory)); }} catch(e) {{}}
+      }}
+      historyIdx = -1;
+      savedCurrentInput = '';
+
       if (!customText) {{
         input.value = '';
         input.style.height = 'auto';
