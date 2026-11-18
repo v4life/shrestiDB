@@ -1,17 +1,21 @@
 # ShrestiDB ⚡
 
-[![Build & Test](https://img.shields.io/badge/tests-346%20passed-brightgreen.svg)]()
+[![Build & Test](https://img.shields.io/badge/tests-376%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-Proprietary-blue.svg)]()
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)]()
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)]()
 
-**ShrestiDB** is an ACID-compliant, relational database kernel written in Rust that integrates machine learning models directly into indexing, query optimization, and storage management:
+**ShrestiDB** is an ACID-compliant, hybrid relational and vector database kernel written in Rust that integrates learned machine learning models directly into indexing, query optimization, storage, and natural language assistance:
 
 - **Learned Indexing (PGM & RMI)**: Up to **~8.2x – 9.8x faster** key lookups than a node-splitting B+Tree at scale, while using **~4x less memory**.
-- **Real-Time Web Studio**: Built-in browser GUI for interactive query execution, catalog exploration, and live index benchmarking.
+- **Vector Database Engine & HNSW**: Native `VECTOR(N)` type, SIMD distance operators (`<=>` Cosine, `<->` L2, `<#>` Dot Product), and Hierarchical Navigable Small World (HNSW) graph indexing for fast approximate nearest-neighbor search.
+- **✨ AI Studio Agent**: Natural language to SQL engine with zero-config local **Ollama** auto-detection (`localhost:11434`, `llama3.2`), universal OpenAI/Gemini compatibility, provider transparency badges, and multiline prompt support (`Shift + Enter`).
+- **Real-Time Web Studio**: Built-in browser GUI for interactive query execution, catalog exploration, and live index benchmarking with custom electric lightning branding.
 - **Interactive CLI & REPL**: Terminal shell with arrow-key history, persistent command storage (`~/.shrestidb_history`), and formatted ASCII data grids.
+- **Multi-Table Joins & SQL**: ANSI `JOIN ... ON ...` and implicit comma joins (`FROM a, b, c WHERE ...`) with hash joins, compiled nested-loop fallback, and qualified multi-table `SELECT *` projections.
 - **MVCC & Write-Ahead Logging (WAL)**: Snapshot isolation with row-level 2PL lock management, deadlock timeouts, and file-backed crash recovery.
 - **Learned MVCC Retention GC**: Online linear models predict per-row version bloat to adaptively sweep dead tuple versions without manual `VACUUM`.
-- **Data-Driven Query Optimizer**: Empirical CDF cardinality estimation via PGM models and dynamic cost-based join reordering.
+- **Cloud & Container Ready**: `0.0.0.0` dual-interface binding, `$HOST` and `$PORT` auto-detection, `/health` probes, and multi-stage Docker build for AWS ECS, GCP Cloud Run, and Kubernetes.
 
 ---
 
@@ -69,29 +73,105 @@ Bye!
 
 ---
 
-### 2. Browser Web Studio (GUI)
+### 2. Browser Web Studio & AI Agent
 
-ShrestiDB includes an embedded Web Studio with a SQL editor, table explorer, and visual benchmark runner:
+ShrestiDB includes an embedded Web Studio with a SQL editor, table explorer, visual benchmark runner, and AI chat agent:
 
 ```bash
-cargo run --bin shrestidb -- --studio
+cargo run --bin shrestidb-studio
 ```
-*(Or launch directly on a custom port: `cargo run --bin shrestidb-studio -- --port 8080`)*
+*(By default binds to `0.0.0.0:8080`, accessible from localhost, 127.0.0.1, or remote cloud ingress)*
 
-Then open your browser to **[http://localhost:8080/](http://localhost:8080/)**:
+Then open **[http://localhost:8080/](http://localhost:8080/)**:
 
-- **SQL Editor**: Write SQL with quick query templates and press **`⌘ + Enter`** to run.
-- **Live Catalog**: Browse tables and view row counts in real-time.
-- **Learned Index Benchmark Tab**: Benchmark our Piecewise Geometric Model (PGM) against a standard B-Tree on 10K, 50K, or 100K keys with animated performance graphs.
+- **SQL Studio**: Write SQL with quick query templates and press **`⌘ + Enter`** to run.
+- **✨ AI Studio Agent**: Chat with your database in natural language (e.g. *"Find items nearest to [0.5, 0.5, 0.0]"*, *"Show all accounts with balance over 1000"*).
+  - Uses auto-detected local **Ollama** (`llama3.2`) or cloud LLMs.
+  - Multiline prompt box: **`Enter`** to send, **`Shift + Enter`** for new line.
+  - Real-time provider badges (`⚡ Ollama (llama3.2)`, `⚡ Direct SQL`, `⚠️ Ollama (Offline)`).
+- **Learned Index Benchmark Tab**: Benchmark our Piecewise Geometric Model (PGM) against a standard B-Tree on 10K, 50K, or 100K keys with live performance graphs.
 
 ---
 
-### 3. Non-Interactive / Scripting Execution (`-e`)
+### 3. Vector Engine & Similarity Search
 
-Run one-shot queries directly from terminal scripts, Makefiles, or CI pipelines:
+ShrestiDB provides native vector column support and SIMD-accelerated distance metrics:
 
+```sql
+-- 1. Create table with VECTOR embedding column
+CREATE TABLE documents (
+    id INT PRIMARY KEY,
+    title TEXT,
+    embedding VECTOR(3)
+);
+
+-- 2. Insert vector embeddings
+INSERT INTO documents VALUES (1, 'Deep Learning Paper', '[0.95, 0.10, 0.05]');
+INSERT INTO documents VALUES (2, 'Database Kernels', '[0.10, 0.90, 0.20]');
+INSERT INTO documents VALUES (3, 'AI Optimization', '[0.85, 0.20, 0.15]');
+
+-- 3. Nearest-neighbor vector similarity search using Cosine distance (<=>)
+SELECT title, embedding <=> '[0.90, 0.15, 0.05]' AS distance
+FROM documents
+ORDER BY distance
+LIMIT 2;
+```
+
+#### Supported Vector Operators:
+| Operator | Distance Metric | Use Case |
+|:---:|---|---|
+| `<=>` | **Cosine Distance** ($1 - \cos \theta$) | Semantic search, text embeddings, LLM retrieval |
+| `<->` | **L2 Euclidean Distance** ($\|\vec{u} - \vec{v}\|_2$) | Spatial coordinates, geometric search |
+| `<#>` | **Negative Dot Product** ($-\vec{u} \cdot \vec{v}$) | Pre-normalized unit vectors, maximum inner product |
+
+---
+
+### 4. Multi-Table Joins
+
+ShrestiDB supports both explicit ANSI joins and implicit comma joins with chained predicates:
+
+```sql
+-- Chained implicit join across 3 tables:
+SELECT *
+FROM accounts, address, zip_codes
+WHERE accounts.id = address.id
+  AND accounts.id = zip_codes.id;
+
+-- Explicit ANSI INNER JOIN:
+SELECT a.name, addr.city, z.zip
+FROM accounts a
+JOIN address addr ON a.id = addr.id
+JOIN zip_codes z ON addr.zip_code = z.zip;
+```
+
+---
+
+### 5. Cloud & Docker Deployment
+
+ShrestiDB is cloud-native and ready for AWS ECS, GCP Cloud Run, Kubernetes, or Docker:
+
+#### Docker
 ```bash
-cargo run --bin shrestidb -- -q -w data.wal -e "SELECT name, balance FROM accounts WHERE id = 1;"
+# Build the production image
+docker build -t shrestidb .
+
+# Run with persistent WAL volume on port 8080
+docker run -p 8080:8080 -v shrestidb_data:/data shrestidb
+```
+
+#### GCP Cloud Run
+```bash
+gcloud run deploy shrestidb \
+  --source . \
+  --port 8080 \
+  --allow-unauthenticated
+```
+
+#### Health Checks
+Cloud orchestrators can query `/health` or `/healthz` for liveness and readiness:
+```bash
+curl -i http://localhost:8080/health
+# HTTP/1.1 200 OK
 ```
 
 ---
@@ -100,9 +180,10 @@ cargo run --bin shrestidb -- -q -w data.wal -e "SELECT name, balance FROM accoun
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│               Interface Layer                          │
+│                   Interface Layer                      │
 │   • CLI REPL (Rustyline, history, formatted tables)    │
 │   • Web Studio (Tokio HTTP, embedded SPA, REST API)   │
+│   • ✨ AI Studio Agent (Ollama / OpenAI / Gemini client)│
 └───────────────────────────┬────────────────────────────┘
                             │
 ┌───────────────────────────▼────────────────────────────┐
@@ -116,7 +197,8 @@ cargo run --bin shrestidb -- -q -w data.wal -e "SELECT name, balance FROM accoun
 ┌───────────────────────────▼────────────────────────────┐
 │              Query Execution Engine                    │
 │   • Vectorized SIMD Operators (filter, project, limit) │
-│   • Hash Join & Nested Loop Joins                      │
+│   • Hash Join & Compiled Nested-Loop Joins             │
+│   • Vector Distance Operators (<=>, <->, <#>)          │
 │   • Aggregations (COUNT, SUM, AVG, MIN, MAX)           │
 │   • Prepared Statements ($N / ? parameters)            │
 └───────────────────────────┬────────────────────────────┘
@@ -125,6 +207,7 @@ cargo run --bin shrestidb -- -q -w data.wal -e "SELECT name, balance FROM accoun
 │                  Index Layer                           │
 │   • Piecewise Geometric Model (DynamicPGMIndex)        │
 │   • Recursive Model Index (RMIIndex)                   │
+│   • HNSW Graph Index (Hierarchical Vector ANN)         │
 │   • Secondary B+Tree Indexes (CREATE INDEX)            │
 │   • SIMD-accelerated Bounded Binary Search             │
 └───────────────────────────┬────────────────────────────┘
@@ -143,22 +226,27 @@ cargo run --bin shrestidb -- -q -w data.wal -e "SELECT name, balance FROM accoun
 ## ⚡ Core Innovations & Features
 
 ### 1. Learned Index Structures (PGM & RMI)
-Traditional B-Trees incur $O(\log N)$ pointer-chasing latency across tree levels. ShrestiDB models data positions as a continuous function $f(key) \to position$:
+Traditional B-Trees incur $O(\log N)$ pointer-chasing latency across tree levels. ShrestiDB models data positions as a continuous function $f(\text{key}) \to \text{position}$:
 - **Piecewise Geometric Model (PGM)**: Splits sorted data into piecewise linear segments with bounded error $\epsilon$. Point searches locate the target segment and run SIMD-accelerated bounded search in $O(\log \epsilon)$.
 - **Dynamic PGM**: Combines a static PGM base with an append-only write buffer, amortizing bulk-load costs through geometric capacity expansion.
 - **Memory Footprint**: Segments store only model slope and intercept, reducing index memory by **~4x** compared to node-splitting B+Trees.
 
-### 2. Learned MVCC Retention GC
+### 2. Hierarchical Navigable Small World (HNSW) Vector Index
+- Multi-layer proximity graph with probabilistic layer distribution.
+- Greedily traverses sparse top layers for high-speed navigation, transitioning to dense ground layers for high recall.
+- AVX2/portable SIMD-accelerated distance evaluation for high throughput.
+
+### 3. Learned MVCC Retention GC
 MVCC creates version chains that bloat memory if dead versions are not pruned. Instead of relying on periodic coarse-grained manual `VACUUM` commands:
 - ShrestiDB fits an online regression model tracking write counts versus dead tuples collected.
 - It adaptively triggers per-row version chain pruning only when predicted reclaimable memory justifies the sweep cost.
 
-### 3. PGM-Driven Cardinality Estimation
+### 4. PGM-Driven Cardinality Estimation
 Replaces arbitrary static 50% selectivity constants with an empirical Cumulative Distribution Function (CDF) built by fitting a PGM model over sorted column values during `ANALYZE <table>`:
 - Yields true data-distribution-aware selectivity estimates for range and equality predicates.
 - Directly powers the dynamic programming join reordering engine (`JoinOrderer`).
 
-### 4. Durability & Transaction Isolation
+### 5. Durability & Transaction Isolation
 - **Snapshot Isolation**: Transactions read consistent MVCC snapshots at `BEGIN` timestamp without acquiring read locks on clean reads.
 - **Row-Level 2PL**: Exclusive locks on write operations with a 100ms cycle-detection timeout to prevent deadlocks.
 - **Write-Ahead Logging**: Every `CREATE TABLE`, `INSERT`, `UPDATE`, and `DELETE` is logged to an append-only WAL before committing, guaranteeing durability across restarts.
@@ -207,6 +295,7 @@ All benchmarks are reproducible via `cargo run --release --example <name>`:
 ```
 shrestidb/
 ├── Cargo.toml                          # Crate configuration & binaries
+├── Dockerfile                          # Multi-stage container build for AWS/GCP
 ├── README.md                           # Documentation & quick start
 ├── DESIGN.md                           # Architectural design specification
 │
@@ -221,12 +310,17 @@ shrestidb/
 │   │
 │   ├── studio.rs                       # Embedded Tokio HTTP server & SPA UI
 │   │
-│   ├── index/                          # [LAYER 1] Learned Indexing
+│   ├── ai/                             # [LAYER 0] AI Agent & Natural Language SQL
+│   │   ├── mod.rs                      # Schema-aware agent coordinator
+│   │   └── llm_client.rs               # Universal OpenAI/Ollama/Gemini client
+│   │
+│   ├── index/                          # [LAYER 1] Learned & Vector Indexing
 │   │   ├── mod.rs
 │   │   ├── models.rs                   # Linear regression segment models
 │   │   ├── pgm.rs                      # Static & Dynamic PGM Index
 │   │   ├── rmi.rs                      # Multi-stage Recursive Model Index
-│   │   └── btree.rs                    # Node-splitting B+Tree comparison baseline
+│   │   ├── hnsw.rs                     # Hierarchical Navigable Small World Graph
+│   │   └── btree.rs                    # Node-splitting B+Tree baseline
 │   │
 │   ├── optimizer/                      # [LAYER 2] Query Optimization
 │   │   ├── mod.rs
@@ -256,10 +350,10 @@ shrestidb/
 │   │   ├── binder.rs                   # Catalog validation and binding
 │   │   └── types.rs                    # AST representations
 │   │
-│   └── compute/                        # [UTILITY] SIMD Acceleration
+│   └── compute/                        # [UTILITY] SIMD & Vector Math
 │       ├── mod.rs
 │       ├── simd_ops.rs                 # AVX2/portable SIMD bounded search
-│       └── vector_math.rs              # Vectorized array math
+│       └── vector_math.rs              # Vector distance metrics (<=>, <->, <#>)
 │
 ├── examples/                           # End-to-end demonstrations
 │   ├── learned_index_demo.rs           # PGM vs B-Tree microbenchmark
@@ -269,7 +363,7 @@ shrestidb/
 │   ├── vs_sqlite.rs                    # SQLite comparative benchmark
 │   └── cardinality_demo.rs             # Learned cardinality estimation demo
 │
-└── tests/                              # Comprehensive test suite (346 tests)
+└── tests/                              # Comprehensive test suite (376 tests)
     ├── dynamic_pgm_tests.rs
     ├── integration_tests.rs
     ├── perf_tests.rs
@@ -286,8 +380,10 @@ Run the complete test suite:
 cargo test --lib
 ```
 
-All **346 unit and integration tests** validate:
+All **376 unit and integration tests** validate:
 - Learned index bounded prediction accuracy and segment splits
+- Vector similarity calculations (`<=>`, `<->`, `<#>`) and HNSW recall
+- Multi-table chained join predicate partitioning and schema projection
 - Strict predicate type safety (unsupported expressions error cleanly rather than causing silent corruption)
 - Concurrent transaction correctness and 2PL lock release verification
 - File-backed WAL crash recovery across restarts
