@@ -258,7 +258,14 @@ impl QueryExecutor {
             }
             cols
         } else {
-            select.columns.clone()
+            select
+                .columns
+                .iter()
+                .map(|col| {
+                    let (_, alias) = Self::parse_column_alias(col);
+                    alias.unwrap_or(col.as_str()).to_string()
+                })
+                .collect()
         }
     }
 
@@ -808,24 +815,23 @@ impl QueryExecutor {
                         .take()
                         .ok_or_else(|| DatabaseError::ExecutionError("Project with no input".to_string()))?;
 
-                    // Resolved once, before touching any row -- the same
-                    // name must resolve for every row anyway, so there's
-                    // nothing to gain from re-resolving it per tuple (and
-                    // an unknown column should fail the whole statement,
-                    // not just skip silently for some rows).
-                    let indices: Vec<usize> = columns
-                        .iter()
-                        .map(|col| {
-                            schema.columns.iter().position(|c| &c.name == col).ok_or_else(|| {
-                                DatabaseError::ExecutionError(format!("Unknown column '{col}' in SELECT list"))
-                            })
-                        })
-                        .collect::<Result<Vec<usize>>>()?;
-
+                    // Resolve projection expressions: parse optional aliases (e.g., `col AS alias`)
+                    // and resolve source column against the current schema (supports `col` and `table.col`).
+                    let mut indices = Vec::with_capacity(columns.len());
                     let mut projected_schema = TableSchema::new(schema.table_id, schema.name.clone());
-                    for &idx in &indices {
-                        projected_schema.add_column(schema.columns[idx].clone());
+
+                    for col in columns {
+                        let (source, alias) = Self::parse_column_alias(col);
+                        let idx = Self::resolve_column_in_schema(&schema, source)?;
+                        indices.push(idx);
+
+                        let mut out_col = schema.columns[idx].clone();
+                        if let Some(alias_name) = alias {
+                            out_col.name = alias_name.to_string();
+                        }
+                        projected_schema.add_column(out_col);
                     }
+
                     let projected_tuples = tuples
                         .into_iter()
                         .map(|t| Tuple { values: indices.iter().map(|&i| t.values[i].clone()).collect() })
@@ -1154,6 +1160,78 @@ impl QueryExecutor {
         });
 
         Ok(Some(tuples))
+    }
+
+    /// Parse an optional column alias (`<expr> AS <alias>` or `<expr> <alias>`).
+    /// Returns `(source_expr, Option<alias>)`.
+    pub(crate) fn parse_column_alias(raw: &str) -> (&str, Option<&str>) {
+        let trimmed = raw.trim();
+        // Check for explicit " AS " or " as "
+        if let Some(idx) = trimmed.to_lowercase().rfind(" as ") {
+            let (source, rest) = trimmed.split_at(idx);
+            let alias = rest[4..].trim().trim_matches(|c| c == '"' || c == '`' || c == '\'');
+            if !source.trim().is_empty() && !alias.is_empty() {
+                return (source.trim(), Some(alias));
+            }
+        }
+        // Check for implicit alias separated by whitespace (e.g. "col alias")
+        // but avoid expressions with operators, parentheses, commas, or function calls
+        if !trimmed.contains('(') && !trimmed.contains(')') && !trimmed.contains(',') && !trimmed.contains('+') && !trimmed.contains('-') {
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            if tokens.len() == 2 {
+                let alias = tokens[1].trim_matches(|c| c == '"' || c == '`' || c == '\'');
+                return (tokens[0], Some(alias));
+            }
+        }
+        (trimmed, None)
+    }
+
+    /// Resolve a column reference against a schema.
+    /// Supports exact matches (`id`, `u.id`), table-qualified matches (`u.id` in merged schema),
+    /// and unambiguous unqualified lookups (`id` matching a single qualified column `u.id`).
+    pub(crate) fn resolve_column_in_schema(schema: &TableSchema, source: &str) -> Result<usize> {
+        // 1. Exact match
+        if let Some(idx) = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(source)) {
+            return Ok(idx);
+        }
+
+        // 2. Table-qualified match: e.g. source is `u.id` or `users.id`
+        if let Some((src_qualifier, src_col)) = source.split_once('.') {
+            let mut matches = Vec::new();
+            for (i, c) in schema.columns.iter().enumerate() {
+                if let Some((schema_qualifier, schema_col)) = c.name.split_once('.') {
+                    if schema_col.eq_ignore_ascii_case(src_col) && schema_qualifier.eq_ignore_ascii_case(src_qualifier) {
+                        matches.push(i);
+                    }
+                }
+            }
+            if matches.len() == 1 {
+                return Ok(matches[0]);
+            } else if matches.len() > 1 {
+                return Err(DatabaseError::ExecutionError(format!(
+                    "Column reference '{source}' is ambiguous in SELECT list"
+                )));
+            }
+        }
+
+        // 3. Unqualified match: e.g. source is `id`, schema contains `users.id`
+        let mut matches = Vec::new();
+        for (i, c) in schema.columns.iter().enumerate() {
+            let base_name = Self::base_column_name(&c.name);
+            if base_name.eq_ignore_ascii_case(source) {
+                matches.push(i);
+            }
+        }
+
+        match matches.len() {
+            1 => Ok(matches[0]),
+            0 => Err(DatabaseError::ExecutionError(format!(
+                "Unknown column '{source}' in SELECT list"
+            ))),
+            _ => Err(DatabaseError::ExecutionError(format!(
+                "Column reference '{source}' is ambiguous in SELECT list"
+            ))),
+        }
     }
 
     /// A column's own name, stripping any `"qualifier."` prefix a prior
@@ -4458,5 +4536,47 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let rows = reopened.execute_sql("SELECT * FROM users WHERE name = 'Bob'").unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_select_projection_with_column_aliases_and_table_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test_alias.wal");
+        let executor = QueryExecutor::open(&wal_path).unwrap();
+
+        executor
+            .execute_sql("CREATE TABLE accounts (id INT PRIMARY KEY, username VARCHAR(50), balance INT)")
+            .unwrap();
+        executor
+            .execute_sql("CREATE TABLE address (id INT PRIMARY KEY, address VARCHAR(100), zip_code VARCHAR(10))")
+            .unwrap();
+
+        executor
+            .execute_sql("INSERT INTO accounts (id, username, balance) VALUES (1, 'Veer', 5000)")
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO address (id, address, zip_code) VALUES (1, '41514 Carmen St', '94539')")
+            .unwrap();
+
+        // 1. Explicit join with table alias and column alias
+        let query = "SELECT a.id, a.username, a.balance, z.zip_code as address_zip_code FROM accounts a JOIN address z ON a.id = z.id";
+        let rows = executor.execute_sql(query).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec!["1", "Veer", "5000", "94539"]);
+
+        // 2. Verify schema and resolve_select_columns reflects the alias
+        let parsed = crate::sql::parser::SQLParser::parse(query).unwrap();
+        if let crate::sql::parser::SQLStatement::Select(select) = parsed {
+            let cols = executor.resolve_select_columns(&select);
+            assert_eq!(cols, vec!["a.id", "a.username", "a.balance", "address_zip_code"]);
+        } else {
+            panic!("expected select");
+        }
+
+        // 3. Unqualified column aliases in single table query
+        let query_single = "SELECT username AS user_name, balance FROM accounts";
+        let rows_single = executor.execute_sql(query_single).unwrap();
+        assert_eq!(rows_single.len(), 1);
+        assert_eq!(rows_single[0], vec!["Veer", "5000"]);
     }
 }
