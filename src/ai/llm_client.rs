@@ -29,7 +29,7 @@ impl Default for LLMConfig {
             if !api_key.trim().is_empty() {
                 "https://api.openai.com/v1".to_string()
             } else {
-                "http://localhost:11434/v1".to_string()
+                "http://127.0.0.1:11434/v1".to_string()
             }
         });
 
