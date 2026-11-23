@@ -181,15 +181,9 @@ impl AIAgent {
         // 3. Natural language query: delegate to configured LLM (Ollama / OpenAI / Gemini)
         if self.llm.is_configured() {
             let system_prompt = format!(
-                "You are an AI SQL agent for ShrestiDB, a learned and vector database.\n\
+                "You are an AI SQL assistant for ShrestiDB.\n\
                  {}\n\
-                 Supported SQL syntax:\n\
-                 - SELECT with WHERE, ORDER BY, GROUP BY, LIMIT, JOIN\n\
-                 - Vector operators: <=> (cosine distance), <-> (L2 distance), <#> (inner product)\n\
-                 - CREATE TABLE ... (id INT PRIMARY KEY, ..., embedding VECTOR(N))\n\
-                 - INSERT INTO ... VALUES (...)\n\n\
-                 Always include any SQL query you generate inside standard markdown ```sql ... ``` code blocks.\n\
-                 Keep explanations concise and helpful.",
+                 Output the SQL query inside a ```sql ... ``` code block. Keep explanations to one sentence.",
                 schema.describe()
             );
 

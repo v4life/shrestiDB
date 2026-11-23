@@ -56,6 +56,8 @@ struct OpenAIRequest {
     model: String,
     messages: Vec<OpenAIMessage>,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,6 +163,7 @@ impl LLMClient {
             model: self.config.model.clone(),
             messages,
             temperature: self.config.temperature,
+            max_tokens: Some(150),
         };
 
         let url = format!("{}/chat/completions", self.config.endpoint.trim_end_matches('/'));
