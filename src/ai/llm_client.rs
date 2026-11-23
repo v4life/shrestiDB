@@ -35,7 +35,8 @@ impl Default for LLMConfig {
 
         let model = std::env::var("SHRESTIDB_AI_MODEL").unwrap_or_else(|_| {
             if endpoint.contains("11434") || endpoint.contains("localhost") || endpoint.contains("127.0.0.1") {
-                "llama3.2".to_string()
+                // Default to llama3.2:1b for fast interactive CPU inference (~8s vs ~5min for 3b).
+                "llama3.2:1b".to_string()
             } else {
                 "gpt-4o-mini".to_string()
             }
