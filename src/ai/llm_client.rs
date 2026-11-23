@@ -83,12 +83,12 @@ pub struct LLMClient {
 
 impl LLMClient {
     pub fn new(config: LLMConfig) -> Self {
-        // Use a generous timeout for local LLM inference (e.g. Ollama on Intel CPU may take
-        // 2-3 minutes to load a cold 3B model into RAM and generate the first token).
+        // Use a generous timeout for local LLM inference on CPU (e.g. big analysis or multi-turn reasoning
+        // on CPU can take 10-20 minutes). Allow up to 30 minutes (1800s) for local providers.
         let timeout_secs = if config.endpoint.contains("localhost") || config.endpoint.contains("127.0.0.1") {
-            300u64 // Local providers: allow up to 5 minutes for cold start / CPU inference
+            1800u64 // Local providers: 30 minutes to allow thorough big analysis on CPU
         } else {
-            30u64  // Cloud providers: they should respond quickly
+            120u64  // Cloud providers: up to 2 minutes
         };
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
@@ -163,7 +163,7 @@ impl LLMClient {
             model: self.config.model.clone(),
             messages,
             temperature: self.config.temperature,
-            max_tokens: Some(150),
+            max_tokens: Some(1024),
         };
 
         let url = format!("{}/chat/completions", self.config.endpoint.trim_end_matches('/'));
