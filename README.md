@@ -1,6 +1,6 @@
 # ShrestiDB ⚡
 
-[![Build & Test](https://img.shields.io/badge/tests-376%20passed-brightgreen.svg)]()
+[![Build & Test](https://img.shields.io/badge/tests-377%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-Proprietary-blue.svg)]()
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)]()
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)]()
@@ -9,10 +9,10 @@
 
 - **Learned Indexing (PGM & RMI)**: Up to **~8.2x – 9.8x faster** key lookups than a node-splitting B+Tree at scale, while using **~4x less memory**.
 - **Vector Database Engine & HNSW**: Native `VECTOR(N)` type, SIMD distance operators (`<=>` Cosine, `<->` L2, `<#>` Dot Product), and Hierarchical Navigable Small World (HNSW) graph indexing for fast approximate nearest-neighbor search.
-- **✨ AI Studio Agent**: Natural language to SQL engine with zero-config local **Ollama** auto-detection (`localhost:11434`, `llama3.2`), universal OpenAI/Gemini compatibility, provider transparency badges, and multiline prompt support (`Shift + Enter`).
+- **✨ AI Studio Agent**: Natural language to SQL engine with zero-config local **Ollama** auto-detection (`127.0.0.1:11434`, `llama3.2:1b`), universal OpenAI/Gemini/Groq compatibility, provider transparency badges, multiline prompts (`Shift + Enter`), and terminal-like **Up/Down history navigation**.
 - **Real-Time Web Studio**: Built-in browser GUI for interactive query execution, catalog exploration, and live index benchmarking with custom electric lightning branding.
 - **Interactive CLI & REPL**: Terminal shell with arrow-key history, persistent command storage (`~/.shrestidb_history`), and formatted ASCII data grids.
-- **Multi-Table Joins & SQL**: ANSI `JOIN ... ON ...` and implicit comma joins (`FROM a, b, c WHERE ...`) with hash joins, compiled nested-loop fallback, and qualified multi-table `SELECT *` projections.
+- **Multi-Table Joins & SQL**: ANSI `JOIN ... ON ...` and implicit comma joins (`FROM a, b, c WHERE ...`) with hash joins, compiled nested-loop fallback, qualified projections, and full column alias support (`<col> AS <alias>`).
 - **MVCC & Write-Ahead Logging (WAL)**: Snapshot isolation with row-level 2PL lock management, deadlock timeouts, and file-backed crash recovery.
 - **Learned MVCC Retention GC**: Online linear models predict per-row version bloat to adaptively sweep dead tuple versions without manual `VACUUM`.
 - **Cloud & Container Ready**: `0.0.0.0` dual-interface binding, `$HOST` and `$PORT` auto-detection, `/health` probes, and multi-stage Docker build for AWS ECS, GCP Cloud Run, and Kubernetes.
@@ -86,9 +86,11 @@ Then open **[http://localhost:8080/](http://localhost:8080/)**:
 
 - **SQL Studio**: Write SQL with quick query templates and press **`⌘ + Enter`** to run.
 - **✨ AI Studio Agent**: Chat with your database in natural language (e.g. *"Find items nearest to [0.5, 0.5, 0.0]"*, *"Show all accounts with balance over 1000"*).
-  - Uses auto-detected local **Ollama** (`llama3.2`) or cloud LLMs.
+  - Uses auto-detected local **Ollama** (`llama3.2:1b` by default for fast CPU inference) or cloud LLMs.
   - Multiline prompt box: **`Enter`** to send, **`Shift + Enter`** for new line.
-  - Real-time provider badges (`⚡ Ollama (llama3.2)`, `⚡ Direct SQL`, `⚠️ Ollama (Offline)`).
+  - Command History: Use **`↑` / `↓`** arrow keys to cycle through past AI prompts with persistent draft saving.
+  - Deep Analysis Mode: Configured with a 30-minute timeout and 1024-token budget to allow CPU models to finish thorough reasoning.
+  - Real-time provider badges (`⚡ Ollama (llama3.2:1b)`, `⚡ Direct SQL`, `⚠️ Ollama (Offline)`).
 - **Learned Index Benchmark Tab**: Benchmark our Piecewise Geometric Model (PGM) against a standard B-Tree on 10K, 50K, or 100K keys with live performance graphs.
 
 ---
@@ -137,8 +139,11 @@ FROM accounts, address, zip_codes
 WHERE accounts.id = address.id
   AND accounts.id = zip_codes.id;
 
--- Explicit ANSI INNER JOIN:
-SELECT a.name, addr.city, z.zip
+-- Explicit ANSI INNER JOIN with column aliases:
+SELECT
+    a.name,
+    addr.city,
+    z.zip AS primary_zip
 FROM accounts a
 JOIN address addr ON a.id = addr.id
 JOIN zip_codes z ON addr.zip_code = z.zip;
@@ -363,7 +368,7 @@ shrestidb/
 │   ├── vs_sqlite.rs                    # SQLite comparative benchmark
 │   └── cardinality_demo.rs             # Learned cardinality estimation demo
 │
-└── tests/                              # Comprehensive test suite (376 tests)
+└── tests/                              # Comprehensive test suite (377 tests)
     ├── dynamic_pgm_tests.rs
     ├── integration_tests.rs
     ├── perf_tests.rs
@@ -380,7 +385,7 @@ Run the complete test suite:
 cargo test --lib
 ```
 
-All **376 unit and integration tests** validate:
+All **377 unit and integration tests** validate:
 - Learned index bounded prediction accuracy and segment splits
 - Vector similarity calculations (`<=>`, `<->`, `<#>`) and HNSW recall
 - Multi-table chained join predicate partitioning and schema projection
