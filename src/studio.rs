@@ -6,9 +6,12 @@
 //! - Real-time Learned Index vs B-Tree Benchmark & Visualizer
 //! - Zero external runtime dependencies: runs directly on Tokio HTTP server
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -75,22 +78,80 @@ struct BenchmarkResponse {
     pgm_segments: usize,
 }
 
+// ── Rate Limiter ──────────────────────────────────────────────────────────────
+
+/// In-memory sliding-window rate limiter per client IP address.
+pub struct RateLimiter {
+    /// Maps client IP -> list of request timestamps within the window
+    records: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    /// Max requests allowed per window
+    limit: usize,
+    /// Time window in seconds
+    window_secs: u64,
+}
+
+impl RateLimiter {
+    pub fn new(limit: usize, window_secs: u64) -> Self {
+        Self {
+            records: Mutex::new(HashMap::new()),
+            limit,
+            window_secs,
+        }
+    }
+
+    /// Check if a request from `ip` is allowed. Returns `true` if allowed, `false` if rate-limited.
+    pub fn check(&self, ip: IpAddr) -> bool {
+        if self.limit == 0 {
+            return true; // Rate limiting disabled
+        }
+
+        let now = Instant::now();
+        let window_duration = std::time::Duration::from_secs(self.window_secs);
+        let mut map = self.records.lock();
+
+        let timestamps = map.entry(ip).or_default();
+        // Prune timestamps older than window
+        timestamps.retain(|&t| now.duration_since(t) <= window_duration);
+
+        if timestamps.len() < self.limit {
+            timestamps.push(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // ── Studio Server ─────────────────────────────────────────────────────────────
 
 pub struct StudioServer {
     executor: Arc<QueryExecutor>,
     wal_path: String,
     start_time: Instant,
+    limiter: Arc<RateLimiter>,
+    demo_mode: bool,
 }
 
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#0ea5e9"/></linearGradient></defs><rect width="32" height="32" rx="7" fill="#0f172a"/><ellipse cx="16" cy="8" rx="10" ry="3" fill="none" stroke="#334155" stroke-width="1.5"/><path d="M6 8v5c0 1.7 4.5 3 10 3s10-1.3 10-3V8" fill="none" stroke="#334155" stroke-width="1.5"/><path d="M6 13v5c0 1.7 4.5 3 10 3s10-1.3 10-3v-5" fill="none" stroke="#334155" stroke-width="1.5"/><path d="M17.5 4L9.5 16.5h5.5l-2 11.5 9.5-13.5h-5.5l3-10.5z" fill="url(#g)"/></svg>"##;
 
 impl StudioServer {
     pub fn new(executor: Arc<QueryExecutor>, wal_path: String) -> Self {
+        // Rate limit: default to 60 requests/minute per IP (set SHRESTIDB_RATE_LIMIT=0 to disable)
+        let rate_limit = std::env::var("SHRESTIDB_RATE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(60);
+
+        let demo_mode = std::env::var("SHRESTIDB_DEMO_MODE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         StudioServer {
             executor,
             wal_path,
             start_time: Instant::now(),
+            limiter: Arc::new(RateLimiter::new(rate_limit, 60)),
+            demo_mode,
         }
     }
 
@@ -115,7 +176,7 @@ impl StudioServer {
         println!("Press Ctrl+C to stop the web server.\n");
 
         loop {
-            let (stream, _) = match listener.accept().await {
+            let (stream, remote_addr) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
                     error!("Connection accept error: {e}");
@@ -125,14 +186,14 @@ impl StudioServer {
 
             let server = Arc::clone(&self);
             tokio::spawn(async move {
-                if let Err(e) = server.handle_connection(stream).await {
+                if let Err(e) = server.handle_connection(stream, remote_addr.ip()).await {
                     error!("HTTP handle error: {e}");
                 }
             });
         }
     }
 
-    async fn handle_connection(&self, mut stream: TcpStream) -> anyhow::Result<()> {
+    async fn handle_connection(&self, mut stream: TcpStream, client_ip: IpAddr) -> anyhow::Result<()> {
         let mut buffer = [0u8; 8192];
         let bytes_read = stream.read(&mut buffer).await?;
         if bytes_read == 0 {
@@ -154,6 +215,24 @@ impl StudioServer {
         let method = parts[0];
         let path = parts[1];
 
+        // Apply IP Rate Limiting to write and compute APIs (/api/query, /api/chat, /api/benchmark)
+        if path.starts_with("/api/query") || path.starts_with("/api/chat") || path.starts_with("/api/benchmark") {
+            if !self.limiter.check(client_ip) {
+                let err_msg = serde_json::json!({
+                    "success": false,
+                    "error": "Rate limit exceeded (429 Too Many Requests). Please wait a moment before sending more queries.",
+                    "response": "⚠️ **Rate limit exceeded**: Please wait a minute before sending more queries."
+                });
+                send_response(
+                    &mut stream,
+                    "429 Too Many Requests",
+                    "application/json",
+                    err_msg.to_string().as_bytes(),
+                ).await?;
+                return Ok(());
+            }
+        }
+
         // Find body if present (split on \r\n\r\n or \n\n)
         let body = if let Some(idx) = request_str.find("\r\n\r\n") {
             &request_str[idx + 4..]
@@ -165,7 +244,7 @@ impl StudioServer {
 
         match (method, path) {
             ("GET", "/") | ("GET", "/index.html") | ("HEAD", "/") | ("HEAD", "/index.html") => {
-                let html = get_studio_html(&self.wal_path);
+                let html = get_studio_html(&self.wal_path, self.demo_mode);
                 send_response(&mut stream, "200 OK", "text/html; charset=utf-8", html.as_bytes()).await?;
             }
             ("GET", "/health") | ("GET", "/healthz") | ("HEAD", "/health") | ("HEAD", "/healthz") => {
@@ -296,6 +375,21 @@ impl StudioServer {
                 duration_us: 0,
                 error: None,
             };
+        }
+
+        // Demo Mode Protection: Prevent dropping or truncating tables in public sandbox
+        if self.demo_mode {
+            let upper = trimmed.to_uppercase();
+            if upper.starts_with("DROP ") || upper.starts_with("TRUNCATE ") {
+                return QueryResponse {
+                    success: false,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    affected_rows: None,
+                    duration_us: 0,
+                    error: Some("DDL mutations (DROP / TRUNCATE) are disabled in Demo Mode.".to_string()),
+                };
+            }
         }
 
         // Determine columns if SELECT
@@ -444,8 +538,8 @@ fn run_quick_benchmark(size: usize) -> BenchmarkResponse {
 
 // ── Embedded Web Studio UI ────────────────────────────────────────────────────
 
-fn get_studio_html(wal_path: &str) -> String {
-    format!(r##"<!DOCTYPE html>
+fn get_studio_html(wal_path: &str, demo_mode: bool) -> String {
+    let mut html = format!(r##"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -1005,5 +1099,13 @@ fn get_studio_html(wal_path: &str) -> String {
   </script>
 </body>
 </html>
-"##, wal_path = wal_path, VERSION = VERSION)
+"##, wal_path = wal_path, VERSION = VERSION);
+
+    if demo_mode {
+        html = html.replace(
+            r#"<span class="badge">v"#,
+            r#"<span class="badge" style="background:rgba(245,158,11,0.2);border-color:#f59e0b;color:#f59e0b;">PUBLIC DEMO</span> <span class="badge">v"#
+        );
+    }
+    html
 }
