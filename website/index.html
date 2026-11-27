@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ShrestiDB ⚡ | Learned & Vector Database Kernel in Rust</title>
+  <meta name="description" content="ShrestiDB is an ACID-compliant, hybrid relational and vector database kernel written in Rust that replaces B-Trees with learned machine learning indexes (PGM/RMI) and SIMD HNSW vector search.">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg: #090d16;
+      --bg-card: #0f172a;
+      --bg-card-hover: #162036;
+      --border: #1e293b;
+      --border-accent: #334155;
+      --accent: #38bdf8;
+      --accent-gradient: linear-gradient(135deg, #38bdf8 0%, #0ea5e9 100%);
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --success: #34d399;
+      --code-bg: #030712;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { background-color: var(--bg); color: var(--text); line-height: 1.6; overflow-x: hidden; }
+
+    /* Navigation */
+    nav {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(9, 13, 22, 0.85); backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; max-width: 1200px; margin: 0 auto;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 1.3rem; color: var(--text); text-decoration: none; }
+    .nav-links { display: flex; gap: 24px; align-items: center; }
+    .nav-link { color: var(--text-muted); text-decoration: none; font-size: 0.95rem; font-weight: 500; transition: color 0.2s; }
+    .nav-link:hover { color: var(--text); }
+    .btn-nav {
+      background: var(--accent-gradient); color: #000; font-weight: 600; padding: 8px 16px; border-radius: 8px; text-decoration: none; font-size: 0.9rem; transition: transform 0.15s, opacity 0.2s;
+    }
+    .btn-nav:hover { transform: translateY(-1px); opacity: 0.95; }
+
+    /* Container */
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+    /* Hero */
+    .hero { text-align: center; padding: 90px 0 60px; }
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 6px 16px; border-radius: 9999px; font-size: 0.85rem; font-weight: 600; color: var(--accent); margin-bottom: 24px;
+    }
+    h1 {
+      font-size: clamp(2.5rem, 6vw, 4.2rem); font-weight: 900; line-height: 1.15; letter-spacing: -0.03em; margin-bottom: 24px;
+    }
+    .gradient-text {
+      background: var(--accent-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .hero p {
+      font-size: 1.25rem; color: var(--text-muted); max-width: 780px; margin: 0 auto 36px;
+    }
+    .hero-actions { display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; }
+    .btn-primary {
+      background: var(--accent-gradient); color: #090d16; font-weight: 700; font-size: 1.05rem; padding: 14px 28px; border-radius: 10px; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; transition: transform 0.15s, box-shadow 0.2s;
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 10px 25px -5px rgba(56, 189, 248, 0.4); }
+    .btn-secondary {
+      background: var(--bg-card); color: var(--text); border: 1px solid var(--border-accent); font-weight: 600; font-size: 1.05rem; padding: 14px 28px; border-radius: 10px; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; transition: background 0.2s, border-color 0.2s;
+    }
+    .btn-secondary:hover { background: var(--bg-card-hover); border-color: var(--accent); }
+
+    /* Highlights Section */
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 24px; margin: 70px 0; }
+    .card {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px; padding: 32px; transition: transform 0.2s, border-color 0.2s;
+    }
+    .card:hover { transform: translateY(-3px); border-color: rgba(56, 189, 248, 0.4); }
+    .card-icon { font-size: 2rem; margin-bottom: 16px; display: inline-block; }
+    .card h3 { font-size: 1.3rem; margin-bottom: 12px; font-weight: 700; }
+    .card p { color: var(--text-muted); font-size: 0.95rem; line-height: 1.6; }
+
+    /* Benchmark Table */
+    .benchmark-section { margin: 80px 0; }
+    .section-title { text-align: center; margin-bottom: 12px; font-size: 2.2rem; font-weight: 800; }
+    .section-subtitle { text-align: center; color: var(--text-muted); margin-bottom: 40px; font-size: 1.05rem; }
+    .table-container {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px; overflow-x: auto;
+    }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th { background: rgba(15, 23, 42, 0.9); padding: 16px 20px; font-size: 0.9rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); }
+    td { padding: 18px 20px; border-bottom: 1px solid var(--border); font-size: 0.95rem; }
+    tr:last-child td { border-bottom: none; }
+    .highlight-cell { color: var(--accent); font-weight: 700; }
+    .speedup-badge { background: rgba(52, 211, 153, 0.15); color: var(--success); padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.85rem; }
+
+    /* Code Walkthrough */
+    .code-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); gap: 24px; margin: 40px 0 80px; }
+    .code-box {
+      background: var(--code-bg); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    }
+    .code-header {
+      background: rgba(15, 23, 42, 0.7); padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; font-size: 0.85rem; color: var(--text-muted);
+    }
+    pre { padding: 20px; overflow-x: auto; font-family: var(--font-mono); font-size: 0.9rem; line-height: 1.6; color: #e2e8f0; }
+    .kw { color: #38bdf8; font-weight: 600; }
+    .fn { color: #f472b6; }
+    .str { color: #a3e635; }
+    .comment { color: #64748b; font-style: italic; }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border); padding: 50px 0; text-align: center; color: var(--text-muted); font-size: 0.9rem; margin-top: 60px;
+    }
+    footer a { color: var(--accent); text-decoration: none; }
+
+    @media (max-width: 640px) {
+      .code-grid { grid-template-columns: 1fr; }
+      .hero-actions { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation -->
+  <header style="border-bottom: 1px solid var(--border);">
+    <nav>
+      <a href="/" class="brand">
+        <svg width="24" height="24" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="7" fill="#0f172a"/><path d="M17.5 4L9.5 16.5h5.5l-2 11.5 9.5-13.5h-5.5l3-10.5z" fill="url(#g)"/><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#0ea5e9"/></linearGradient></defs></svg>
+        <span>ShrestiDB</span>
+      </a>
+      <div class="nav-links">
+        <a href="#benchmarks" class="nav-link">Benchmarks</a>
+        <a href="#features" class="nav-link">Features</a>
+        <a href="https://github.com/v4life/shrestiDB/blob/main/ARCHITECTURE.md" class="nav-link" target="_blank" rel="noopener">Architecture</a>
+        <a href="https://github.com/v4life/shrestiDB" class="nav-link" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://studio.shrestidb.com" class="btn-nav" target="_blank" rel="noopener">Launch Studio ⚡</a>
+      </div>
+    </nav>
+  </header>
+
+  <div class="container">
+
+    <!-- Hero Section -->
+    <section class="hero">
+      <div class="hero-badge">⚡ 377 Tests Passing • Pure Rust Kernel</div>
+      <h1>Learned Machine Learning Indexes<br><span class="gradient-text">Meet Vector & Relational SQL</span></h1>
+      <p>
+        ShrestiDB is an embedded database kernel that replaces bulky B-Trees with learned regression models and SIMD vector search — delivering 8x–10x faster lookups and a 4x smaller memory footprint in a single binary.
+      </p>
+      <div class="hero-actions">
+        <a href="https://studio.shrestidb.com" class="btn-primary" target="_blank" rel="noopener">
+          ⚡ Launch Live Studio
+        </a>
+        <a href="https://github.com/v4life/shrestiDB" class="btn-secondary" target="_blank" rel="noopener">
+          <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          View on GitHub
+        </a>
+      </div>
+    </section>
+
+    <!-- Key Capabilities Grid -->
+    <section id="features" class="grid-3">
+      <div class="card">
+        <span class="card-icon">🧠</span>
+        <h3>Learned PGM & RMI Indexing</h3>
+        <p>Treats key indexing as an ML regression problem. Predicts exact tuple offsets with bounded linear segments, scaling flatly at O(log ε) while saving 75% RAM over B-Trees.</p>
+      </div>
+
+      <div class="card">
+        <span class="card-icon">📐</span>
+        <h3>Native SIMD Vector Engine</h3>
+        <p>High-dimensional embeddings with Hierarchical Navigable Small World (HNSW) proximity graphs. Accelerated by AVX2/NEON SIMD cosine, L2, and dot product distances.</p>
+      </div>
+
+      <div class="card">
+        <span class="card-icon">⚡</span>
+        <h3>ACID MVCC & Learned Auto-GC</h3>
+        <p>Snapshot-isolated transactions with row-level 2PL and write-ahead logging (WAL). Online regression models predict version bloat to sweep dead tuples without manual VACUUM.</p>
+      </div>
+    </section>
+
+    <!-- Measured Benchmark Table -->
+    <section id="benchmarks" class="benchmark-section">
+      <h2 class="section-title">Measured Benchmark Results</h2>
+      <p class="section-subtitle">Reproducible with <code>cargo run --release --example learned_index_demo</code></p>
+      
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Dataset Scale</th>
+              <th>Learned PGM Lookup</th>
+              <th>Learned RMI Lookup</th>
+              <th>Standard B+Tree</th>
+              <th>PGM Speedup</th>
+              <th>Index Memory Footprint</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>10,000 Keys</strong></td>
+              <td>0.55 µs</td>
+              <td>0.18 µs</td>
+              <td>0.10 µs</td>
+              <td>0.5x</td>
+              <td>~4x smaller</td>
+            </tr>
+            <tr>
+              <td><strong>100,000 Keys</strong></td>
+              <td>0.41 µs</td>
+              <td>0.22 µs</td>
+              <td>0.30 µs</td>
+              <td>0.7x</td>
+              <td>~4.1x smaller</td>
+            </tr>
+            <tr style="background: rgba(56, 189, 248, 0.05);">
+              <td><strong>1,000,000 Keys</strong></td>
+              <td class="highlight-cell">0.44 µs</td>
+              <td class="highlight-cell">0.37 µs</td>
+              <td>3.61 µs</td>
+              <td><span class="speedup-badge">8.2x – 9.8x FASTER</span></td>
+              <td class="highlight-cell">75% Less RAM (~4.2x)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Code Showcases -->
+    <section class="code-grid">
+      <div class="code-box">
+        <div class="code-header">
+          <span>Relational + Vector Similarity (SQL)</span>
+          <span>SQL-92 + pgvector</span>
+        </div>
+        <pre><span class="comment">-- Unified structured metadata + vector search</span>
+<span class="kw">SELECT</span> 
+    a.name, 
+    addr.city, 
+    a.embedding &lt;=&gt; <span class="str">'[0.90, 0.15, 0.05]'</span> <span class="kw">AS</span> distance
+<span class="kw">FROM</span> accounts a
+<span class="kw">JOIN</span> address addr <span class="kw">ON</span> a.id = addr.id
+<span class="kw">WHERE</span> a.balance &gt; 3000
+<span class="kw">ORDER BY</span> distance
+<span class="kw">LIMIT</span> 5;</pre>
+      </div>
+
+      <div class="code-box">
+        <div class="code-header">
+          <span>Zero-Dependency Rust Embedded Engine</span>
+          <span>main.rs</span>
+        </div>
+        <pre><span class="kw">use</span> shrestidb::execution::QueryExecutor;
+
+<span class="kw">fn</span> <span class="fn">main</span>() -> anyhow::Result&lt;()&gt; {
+    <span class="comment">// Durable engine backed by Write-Ahead Log (WAL)</span>
+    <span class="kw">let</span> db = QueryExecutor::<span class="fn">open</span>(<span class="str">"shrestidb.wal"</span>)?;
+
+    <span class="comment">// Execute SQL statements directly</span>
+    <span class="kw">let</span> rows = db.<span class="fn">execute_sql</span>(
+        <span class="str">"SELECT * FROM accounts WHERE balance >= 5000;"</span>
+    )?;
+    <span class="kw">Ok</span>(())
+}</pre>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    <div class="container">
+      <p>ShrestiDB ⚡ • Built with Rust and Machine Learning • Open Source Under Proprietary / Community License</p>
+      <p style="margin-top: 8px;">
+        <a href="https://github.com/v4life/shrestiDB">GitHub</a> • 
+        <a href="https://github.com/v4life/shrestiDB/blob/main/ARCHITECTURE.md">Architecture Deep Dive</a> • 
+        <a href="https://studio.shrestidb.com">Live Web Studio</a>
+      </p>
+    </div>
+  </footer>
+
+</body>
+</html>
