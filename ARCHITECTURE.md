@@ -185,3 +185,22 @@ stateDiagram-v2
 * **Row-Level 2PL**: Exclusive write locks guard mutated records with a 100ms cycle-detection timeout to prevent deadlocks.
 * **Crash Recovery (WAL)**: All table operations log binary records to disk before acknowledgment. On boot, the replay engine rebuilds catalogs, indexes, and row tables deterministically.
 * **Learned Retention GC**: An online linear model predicts version churn, triggering row-chain compaction when reclaimable space exceeds sweep overhead, eliminating manual `VACUUM`.
+
+---
+
+### 2.5 Web Studio & Edge Security Architecture
+
+For cloud and public sandbox deployments, the interface layer provides native protective controls:
+
+```mermaid
+flowchart LR
+    Client(["HTTP Request"]) --> Extractor["Extract Client IP & Method"]
+    Extractor --> RateLimiter{"Sliding-Window Limiter\n(<= N req/min)"}
+    RateLimiter -- Exceeded --> Err429["429 Too Many Requests"]
+    RateLimiter -- Allowed --> DemoCheck{"Demo Mode Active?"}
+    DemoCheck -- Destructive DDL (DROP/TRUNCATE) --> ErrDemo["403 Forbidden / Demo Guard"]
+    DemoCheck -- Safe SQL --> Executor["Async Tokio Query Execution"]
+```
+
+* **Sliding-Window IP Rate Limiter**: Natively tracks request timestamps per client IP in Tokio (`Mutex<HashMap<IpAddr, Vec<Instant>>>`), protecting `/api/query`, `/api/chat`, and `/api/benchmark` against resource exhaustion.
+* **Public Demo Mode (`SHRESTIDB_DEMO_MODE=1`)**: Disallows destructive statements (`DROP TABLE`, `TRUNCATE TABLE`) in public sandbox environments while rendering a visual demo badge in the Web Studio UI.

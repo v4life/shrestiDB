@@ -105,14 +105,17 @@ LIMIT 2;
 
 ## 🐳 Cloud & Docker Deployment
 
-ShrestiDB is container-ready for AWS ECS, GCP Cloud Run, and Kubernetes:
+ShrestiDB is container-ready for AWS ECS, GCP Cloud Run, Fly.io, and Kubernetes with native IP rate limiting and public demo protection:
 
 ```bash
 # Build production Docker image
 docker build -t shrestidb .
 
-# Run with persistent WAL volume on port 8080
-docker run -p 8080:8080 -v shrestidb_data:/data shrestidb
+# Run container with persistent storage and rate limiting (default 60 req/min)
+docker run -p 8080:8080 \
+  -e SHRESTIDB_RATE_LIMIT=60 \
+  -e SHRESTIDB_DEMO_MODE=1 \
+  -v shrestidb_data:/data shrestidb
 ```
 
 Health probes for orchestrators:
