@@ -1,5 +1,5 @@
 # Multi-stage build for ShrestiDB & Web Studio
-FROM rust:1.85-bookworm AS builder
+FROM rust:latest AS builder
 
 WORKDIR /app
 
