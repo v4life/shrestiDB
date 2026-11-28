@@ -1,0 +1,35 @@
+app = "shrestidb-studio"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  SHRESTIDB_DEMO_MODE = "1"
+  SHRESTIDB_RATE_LIMIT = "60"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
+
+[mounts]
+  source = "shrestidb_data"
+  destination = "/data"
+
+[checks]
+  [checks.health]
+    port = 8080
+    type = "http"
+    path = "/health"
+    interval = "15s"
+    timeout = "3s"
